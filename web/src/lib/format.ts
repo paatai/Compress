@@ -1,3 +1,5 @@
+import type { JpegInfo } from './protocol'
+
 export function formatBytes(n: number): string {
   if (n < 1000) return `${n} B`
   if (n < 1e6) return `${(n / 1e3).toFixed(n < 1e4 ? 2 : 1)} KB`
@@ -30,5 +32,16 @@ export function download(data: Uint8Array, name: string, type: string) {
 }
 
 export function stripExt(name: string): string {
-  return name.replace(/\.(png|bmp|komla)$/i, '')
+  return name.replace(/\.(png|bmp|jpe?g|jfif|komla)$/i, '')
+}
+
+/** File name for a restored JPEG: "photo.jpg.komla" -> "photo.jpg". */
+export function jpegName(komlaName: string): string {
+  const base = komlaName.replace(/\.komla$/i, '')
+  return /\.(jpe?g|jfif)$/i.test(base) ? base : `${base}.jpg`
+}
+
+export function describeJpeg(i: JpegInfo): string {
+  const kind = i.sampling === 'gray' ? 'grayscale' : i.components === 3 ? `YCbCr ${i.sampling}` : `${i.components} components (${i.sampling})`
+  return `JPEG, ${kind}${i.progressive ? ', progressive' : ''}`
 }

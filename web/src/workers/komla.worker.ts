@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 import wasmUrl from '../wasm/komla.wasm?url'
-import type { ImageInfo, WorkerRequest } from '../lib/protocol'
+import type { ImageInfo, JpegInfo, WorkerRequest } from '../lib/protocol'
 
 interface KomlaExports {
   memory: WebAssembly.Memory
@@ -79,6 +79,26 @@ function readInfo(v: DataView, o: number): ImageInfo {
   }
 }
 
+/** Reads the JPEG info block written by `jpeg_info_block`; returns it and the next offset. */
+function readJpegInfo(r: Uint8Array, o: number): [JpegInfo, number] {
+  const v = new DataView(r.buffer, r.byteOffset, r.byteLength)
+  const td = new TextDecoder()
+  const width = v.getUint32(o, true)
+  const height = v.getUint32(o + 4, true)
+  const components = r[o + 8]
+  const progressive = r[o + 9] !== 0
+  const mode = r[o + 10]
+  const stripes = v.getUint32(o + 12, true)
+  o += 16
+  const strs: string[] = []
+  for (let i = 0; i < 2; i++) {
+    const n = v.getUint32(o, true)
+    strs.push(td.decode(r.subarray(o + 4, o + 4 + n)))
+    o += 4 + n
+  }
+  return [{ width, height, components, progressive, mode, stripes, sampling: strs[0], note: strs[1] }, o]
+}
+
 async function handle(req: WorkerRequest): Promise<{ result: unknown; transfer: Transferable[] }> {
   const k = await load()
   switch (req.op) {
@@ -135,6 +155,53 @@ async function handle(req: WorkerRequest): Promise<{ result: unknown; transfer: 
       const png = r.slice(4, 4 + pngLen)
       const samples = r.slice(4 + pngLen)
       return { result: { png, samples }, transfer: [png.buffer, samples.buffer] }
+    }
+    case 'jpegPrepare': {
+      const r = call(k, 'komla_jpeg_prepare', [new Uint8Array(req.file)])
+      const v = new DataView(r.buffer)
+      const [info, start] = readJpegInfo(r, 0)
+      let o = start
+      const hl = v.getUint32(o, true)
+      const header = r.slice(o + 4, o + 4 + hl)
+      o += 4 + hl
+      const bl = v.getUint32(o, true)
+      const blob = r.slice(o + 4, o + 4 + bl)
+      o += 4 + bl
+      const n = v.getUint32(o, true)
+      o += 4
+      const stripes: Uint8Array[] = []
+      for (let i = 0; i < n; i++) {
+        const len = v.getUint32(o, true)
+        stripes.push(r.slice(o + 4, o + 4 + len))
+        o += 4 + len
+      }
+      return { result: { info, header, blob, stripes }, transfer: [header.buffer, blob.buffer, ...stripes.map((s) => s.buffer)] }
+    }
+    case 'jpegEncodeStripe': {
+      const s = call(k, 'komla_jpeg_encode_stripe', [req.blob, req.coefs], [req.k])
+      return { result: s, transfer: [s.buffer] }
+    }
+    case 'jpegParse': {
+      const r = call(k, 'komla_jpeg_parse', [req.file])
+      const v = new DataView(r.buffer)
+      const [info, start] = readJpegInfo(r, 0)
+      let o = start
+      const bl = v.getUint32(o, true)
+      const blob = r.slice(o + 4, o + 4 + bl)
+      o += 4 + bl
+      const n = v.getUint32(o, true)
+      o += 4
+      const stripes = []
+      for (let i = 0; i < n; i++, o += 8) stripes.push({ offset: v.getUint32(o, true), length: v.getUint32(o + 4, true) })
+      return { result: { info, blob, stripes }, transfer: [blob.buffer] }
+    }
+    case 'jpegDecodeStripe': {
+      const c = call(k, 'komla_jpeg_decode_stripe', [req.blob, req.data], [req.k])
+      return { result: c, transfer: [c.buffer] }
+    }
+    case 'jpegFinish': {
+      const j = call(k, 'komla_jpeg_finish', [req.file, req.coefs])
+      return { result: j, transfer: [j.buffer] }
     }
     case 'readImage': {
       const r = call(k, 'komla_read_image', [new Uint8Array(req.file)])

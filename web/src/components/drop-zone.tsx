@@ -36,8 +36,8 @@ export function DropZone({ onFiles }: { onFiles: (files: FileList | File[]) => v
         <FileArchive className="size-9" strokeWidth={1.5} />
       </div>
       <div className="space-y-1.5">
-        <p className="text-lg font-medium">Drop a PNG or BMP to compress it</p>
-        <p className="text-sm text-muted-foreground">or drop a .komla file to restore the exact original pixels as PNG</p>
+        <p className="text-lg font-medium">Drop a PNG, BMP or JPG to compress it</p>
+        <p className="text-sm text-muted-foreground">Drop a .komla file to restore the original JPG, or the exact original pixels as PNG</p>
       </div>
       <Button
         type="button"
@@ -53,7 +53,7 @@ export function DropZone({ onFiles }: { onFiles: (files: FileList | File[]) => v
         ref={input}
         type="file"
         multiple
-        accept=".png,.bmp,.komla,image/png,image/bmp"
+        accept=".png,.bmp,.jpg,.jpeg,.jfif,.komla,image/png,image/bmp,image/jpeg"
         className="hidden"
         onChange={(e) => {
           if (e.target.files?.length) onFiles(e.target.files)

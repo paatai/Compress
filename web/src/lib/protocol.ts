@@ -11,6 +11,23 @@ export interface ImageInfo {
   paletteSize: number
 }
 
+/** A JPEG (or .komla file holding one). */
+export interface JpegInfo {
+  width: number
+  height: number
+  components: number
+  progressive: boolean
+  /** 0 stored as is, 1 stored with the byte model, 2 recompressed */
+  mode: number
+  stripes: number
+  /** chroma subsampling, e.g. "4:2:0" or "gray" */
+  sampling: string
+  /** why a file was stored instead of recompressed */
+  note: string
+}
+
+export const JPEG_MODE_RECOMPRESSED = 2
+
 export type WorkerRequest =
   | { op: 'prepare'; file: ArrayBuffer }
   | { op: 'encodeStripe'; header: Uint8Array; rows: Uint8Array; height: number }
@@ -18,6 +35,27 @@ export type WorkerRequest =
   | { op: 'decodeStripe'; header: Uint8Array; data: Uint8Array; height: number }
   | { op: 'finish'; header: Uint8Array; coded: Uint8Array; wantPng: boolean }
   | { op: 'readImage'; file: ArrayBuffer }
+  | { op: 'jpegPrepare'; file: ArrayBuffer }
+  | { op: 'jpegEncodeStripe'; blob: Uint8Array; coefs: Uint8Array; k: number }
+  | { op: 'jpegParse'; file: Uint8Array }
+  | { op: 'jpegDecodeStripe'; blob: Uint8Array; data: Uint8Array; k: number }
+  | { op: 'jpegFinish'; file: Uint8Array; coefs: Uint8Array }
+
+export interface JpegPrepared {
+  info: JpegInfo
+  /** container bytes before the stripe table (the whole .komla file if the JPEG is stored) */
+  header: Uint8Array
+  /** the JPEG's marker segments, needed by every stripe coder */
+  blob: Uint8Array
+  /** coefficients of each stripe (i16 little-endian) */
+  stripes: Uint8Array[]
+}
+
+export interface JpegParsed {
+  info: JpegInfo
+  blob: Uint8Array
+  stripes: { offset: number; length: number }[]
+}
 
 export interface Candidate {
   header: Uint8Array

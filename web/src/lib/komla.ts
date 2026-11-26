@@ -1,4 +1,4 @@
-import type { ImageInfo, ParsedFile, Prepared, WorkerRequest } from './protocol'
+import { JPEG_MODE_RECOMPRESSED, type ImageInfo, type JpegInfo, type JpegParsed, type JpegPrepared, type ParsedFile, type Prepared, type WorkerRequest } from './protocol'
 
 type Pending = {
   resolve: (v: unknown) => void
@@ -195,4 +195,81 @@ export async function decompress(komla: Uint8Array, wantPng: boolean, onProgress
 
 export async function readImage(file: ArrayBuffer): Promise<{ info: { width: number; height: number; channels: number; depth: number }; samples: Uint8Array }> {
   return pool.run({ op: 'readImage', file }, [file])
+}
+
+export function isJpeg(b: Uint8Array): boolean {
+  return b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff
+}
+
+/** A .komla file that holds a JPEG ("KMLA" followed by 'J'). */
+export function isKomlaJpeg(b: Uint8Array): boolean {
+  return b.length >= 6 && b[0] === 0x4b && b[1] === 0x4d && b[2] === 0x4c && b[3] === 0x41 && b[4] === 0x4a
+}
+
+function weightedProgress(weights: number[], stage: string, onProgress: (p: Progress) => void) {
+  const total = Math.max(1, weights.reduce((a, b) => a + b, 0))
+  const done = weights.map(() => 0)
+  return (k: number) => (f: number) => {
+    done[k] = f * weights[k]
+    onProgress({ stage, fraction: done.reduce((a, b) => a + b, 0) / total })
+  }
+}
+
+export interface JpegCompressResult {
+  komla: Uint8Array
+  info: JpegInfo
+  seconds: number
+}
+
+/** Recompresses a JPEG; stripes are coded in parallel workers. */
+export async function compressJpeg(file: ArrayBuffer, onProgress: (p: Progress) => void): Promise<JpegCompressResult> {
+  const t0 = performance.now()
+  onProgress({ stage: 'Reading JPEG', fraction: 0 })
+  const prep = await pool.run<JpegPrepared>({ op: 'jpegPrepare', file }, [file])
+  if (prep.info.mode !== JPEG_MODE_RECOMPRESSED) {
+    return { komla: prep.header, info: prep.info, seconds: (performance.now() - t0) / 1000 }
+  }
+  const progress = weightedProgress(
+    prep.stripes.map((s) => s.length),
+    'Compressing',
+    onProgress,
+  )
+  const streams = await Promise.all(
+    prep.stripes.map((coefs, k) => pool.run<Uint8Array>({ op: 'jpegEncodeStripe', blob: prep.blob, coefs, k }, [coefs.buffer], progress(k))),
+  )
+  return { komla: assemble(prep.header, streams), info: prep.info, seconds: (performance.now() - t0) / 1000 }
+}
+
+export interface JpegDecompressResult {
+  jpeg: Uint8Array
+  info: JpegInfo
+  seconds: number
+}
+
+/** Restores the original JPEG file from a .komla file (checked against its CRC-32). */
+export async function decompressJpeg(komla: Uint8Array, onProgress: (p: Progress) => void, stage = 'Restoring JPEG'): Promise<JpegDecompressResult> {
+  const t0 = performance.now()
+  const parsed = await pool.run<JpegParsed>({ op: 'jpegParse', file: komla })
+  const progress = weightedProgress(
+    parsed.stripes.map((s) => s.length),
+    stage,
+    onProgress,
+  )
+  const parts = await Promise.all(
+    parsed.stripes.map((s, k) => {
+      const data = komla.slice(s.offset, s.offset + s.length)
+      return pool.run<Uint8Array>({ op: 'jpegDecodeStripe', blob: parsed.blob, data, k }, [data.buffer], progress(k))
+    }),
+  )
+  const coefs = new Uint8Array(parts.reduce((a, p) => a + 4 + p.length, 0))
+  const view = new DataView(coefs.buffer)
+  let o = 0
+  for (const p of parts) {
+    view.setUint32(o, p.length, true)
+    coefs.set(p, o + 4)
+    o += 4 + p.length
+  }
+  onProgress({ stage: 'Checking', fraction: 1 })
+  const jpeg = await pool.run<Uint8Array>({ op: 'jpegFinish', file: komla, coefs }, [coefs.buffer])
+  return { jpeg, info: parsed.info, seconds: (performance.now() - t0) / 1000 }
 }

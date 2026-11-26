@@ -5,7 +5,7 @@
 //! Stripes are independent, so the page runs `encode_stripe` / `decode_stripe` in several
 //! workers at once and uses `prepare`, `parse` and `finish` around them.
 
-use komla::{io, Options};
+use komla::{io, jpeg, Options};
 
 static mut RESULT: Vec<u8> = Vec::new();
 static mut ERROR: Vec<u8> = Vec::new();
@@ -264,4 +264,129 @@ pub unsafe extern "C" fn komla_decode_pixels(ptr: *const u8, len: usize) -> i32 
         v.extend_from_slice(&img.sample_bytes());
         v
     }))
+}
+
+// ---- Lossless JPEG recompression -------------------------------------------------------
+//
+// Compression: `komla_jpeg_prepare` parses and verifies the JPEG and returns the container
+// header, the header blob and the coefficients of every stripe; workers code the stripes with
+// `komla_jpeg_encode_stripe`; the page joins header and streams (see `jpeg::assemble`).
+// Restoring: `komla_jpeg_parse`, `komla_jpeg_decode_stripe` per stripe, `komla_jpeg_finish`.
+
+fn jpeg_info_block(v: &mut Vec<u8>, i: &jpeg::JpegInfo) {
+    put32(v, i.width);
+    put32(v, i.height);
+    v.extend_from_slice(&[i.components, i.progressive as u8, i.mode, 0]);
+    put32(v, i.stripes);
+    for s in [&i.sampling, &i.note] {
+        put32(v, s.len() as u32);
+        v.extend_from_slice(s.as_bytes());
+    }
+}
+
+/// Input: JPEG file. Result: info block, u32 header_len, header, u32 blob_len, blob,
+/// u32 n_stripes, then per stripe u32 byte length and the coefficients (i16 LE). Files that
+/// cannot be recompressed come back with mode RAW/CM, no stripes, and the complete .komla file
+/// as the header.
+/// # Safety
+/// `ptr`/`len` must describe a readable buffer.
+#[no_mangle]
+pub unsafe extern "C" fn komla_jpeg_prepare(ptr: *const u8, len: usize) -> i32 {
+    let p = jpeg::prepare(slice(ptr, len));
+    let total: usize = p.stripes.iter().map(|s| s.len() * 2 + 4).sum();
+    let mut v = Vec::with_capacity(64 + p.header.len() + p.blob.len() + total);
+    jpeg_info_block(&mut v, &p.info);
+    put32(&mut v, p.header.len() as u32);
+    v.extend_from_slice(&p.header);
+    put32(&mut v, p.blob.len() as u32);
+    v.extend_from_slice(&p.blob);
+    put32(&mut v, p.stripes.len() as u32);
+    for s in &p.stripes {
+        put32(&mut v, (s.len() * 2) as u32);
+        for c in s {
+            v.extend_from_slice(&c.to_le_bytes());
+        }
+    }
+    set_result(Ok(v))
+}
+
+fn i16s(b: &[u8]) -> Vec<i16> {
+    b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
+}
+
+/// Codes stripe `k`. Result: the stripe stream.
+/// # Safety
+/// Pointers must describe readable buffers.
+#[no_mangle]
+pub unsafe extern "C" fn komla_jpeg_encode_stripe(bp: *const u8, bl: usize, cp: *const u8, cl: usize, k: u32) -> i32 {
+    set_result(jpeg::encode_stripe(slice(bp, bl), k as usize, &i16s(slice(cp, cl)), &mut progress))
+}
+
+/// Input: .komla JPEG file. Result: info block, u32 blob_len, blob, u32 n_stripes,
+/// n x (u32 offset, u32 len).
+/// # Safety
+/// `ptr`/`len` must describe a readable buffer.
+#[no_mangle]
+pub unsafe extern "C" fn komla_jpeg_parse(ptr: *const u8, len: usize) -> i32 {
+    let b = slice(ptr, len);
+    let r = jpeg::parse_container(b).and_then(|c| {
+        let info = jpeg::info(b)?;
+        let mut v = Vec::new();
+        jpeg_info_block(&mut v, &info);
+        put32(&mut v, c.blob.len() as u32);
+        v.extend_from_slice(&c.blob);
+        put32(&mut v, c.stripes.len() as u32);
+        for s in &c.stripes {
+            put32(&mut v, (s.as_ptr() as usize - b.as_ptr() as usize) as u32);
+            put32(&mut v, s.len() as u32);
+        }
+        Ok(v)
+    });
+    set_result(r)
+}
+
+/// Decodes stripe `k`. Result: its coefficients (i16 LE).
+/// # Safety
+/// Pointers must describe readable buffers.
+#[no_mangle]
+pub unsafe extern "C" fn komla_jpeg_decode_stripe(bp: *const u8, bl: usize, dp: *const u8, dl: usize, k: u32) -> i32 {
+    let r = jpeg::decode_stripe(slice(bp, bl), k as usize, slice(dp, dl), &mut progress).map(|c| c.iter().flat_map(|v| v.to_le_bytes()).collect());
+    set_result(r)
+}
+
+/// Input: the .komla file and all decoded stripes (per stripe: u32 byte length, i16 LE values).
+/// Result: the original JPEG file, after checking its CRC-32.
+/// # Safety
+/// Pointers must describe readable buffers.
+#[no_mangle]
+pub unsafe extern "C" fn komla_jpeg_finish(fp: *const u8, fl: usize, cp: *const u8, cl: usize) -> i32 {
+    let b = slice(fp, fl);
+    let coefs = slice(cp, cl);
+    let r = jpeg::parse_container(b).and_then(|c| {
+        let mut stripes = Vec::new();
+        let mut pos = 0usize;
+        while pos + 4 <= coefs.len() {
+            let n = u32::from_le_bytes(coefs[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            stripes.push(i16s(coefs.get(pos..pos + n).ok_or("bad stripe data")?));
+            pos += n;
+        }
+        jpeg::finish(&c, stripes)
+    });
+    set_result(r)
+}
+
+/// Whole-file JPEG entry points (single-threaded), used by the cross-target test.
+/// # Safety
+/// `ptr`/`len` must describe a readable buffer.
+#[no_mangle]
+pub unsafe extern "C" fn komla_jpeg_compress(ptr: *const u8, len: usize) -> i32 {
+    set_result(Ok(jpeg::compress(slice(ptr, len), &mut progress).0))
+}
+
+/// # Safety
+/// `ptr`/`len` must describe a readable buffer.
+#[no_mangle]
+pub unsafe extern "C" fn komla_jpeg_decompress(ptr: *const u8, len: usize) -> i32 {
+    set_result(jpeg::decompress(slice(ptr, len), &mut progress))
 }

@@ -5,7 +5,8 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
 import type { Job } from '@/hooks/use-jobs'
-import { describeChannels, download, formatBpp, formatBytes, formatSeconds, stripExt } from '@/lib/format'
+import { describeChannels, describeJpeg, download, formatBpp, formatBytes, formatSeconds, jpegName, stripExt } from '@/lib/format'
+import { JPEG_MODE_RECOMPRESSED } from '@/lib/protocol'
 import { SizeTable, type SizeRow } from './size-table'
 
 function modeLabel(mode: number, paletteSize: number) {
@@ -38,13 +39,19 @@ export function JobCard({
   onRemove: (id: number) => void
 }) {
   const pick = useRef<HTMLInputElement>(null)
+  const isJpeg = job.format === 'jpeg'
   const info = job.info
-  const pixels = info ? info.width * info.height : 0
+  const jinfo = job.jpegInfo
+  const pixels = info ? info.width * info.height : jinfo ? jinfo.width * jinfo.height : 0
   const komlaBytes = job.kind === 'compress' ? job.komla?.length : job.inputBytes
   const srcLabel = job.kind === 'compress' ? (/\.bmp$/i.test(job.name) ? 'Original BMP file' : 'Original PNG file') : 'PNG (written here)'
+  const what = isJpeg ? 'the original JPEG file' : 'every pixel'
 
   const rows: SizeRow[] = []
-  if (job.kind === 'compress') {
+  if (isJpeg) {
+    if (job.kind === 'compress') rows.push({ label: 'Original JPEG', detail: 'your file', measure: { state: 'done', bytes: job.inputBytes } })
+    else if (job.jpeg) rows.push({ label: 'JPEG', detail: 'restored original file', measure: { state: 'done', bytes: job.jpeg.length } })
+  } else if (job.kind === 'compress') {
     rows.push({ label: srcLabel, measure: { state: 'done', bytes: job.inputBytes } })
     rows.push({ label: 'ZIP −9', detail: 'of the same pixels as BMP', measure: job.zip })
     rows.push({ label: 'WebP lossless', detail: 'libwebp in your browser', measure: job.webp })
@@ -54,7 +61,9 @@ export function JobCard({
   }
   if (komlaBytes) rows.push({ label: 'Komla', detail: '.komla file', measure: job.komla || job.kind === 'decompress' ? { state: 'done', bytes: komlaBytes } : { state: 'running' }, highlight: true })
 
-  const canCompare = job.kind === 'compress' && (job.status === 'done' || job.status === 'verifying') && !!job.samples && job.webp.state === 'idle'
+  const canCompare = !isJpeg && job.kind === 'compress' && (job.status === 'done' || job.status === 'verifying') && !!job.samples && job.webp.state === 'idle'
+  const restored = isJpeg ? job.jpeg : job.png
+  const stored = isJpeg && jinfo && jinfo.mode !== JPEG_MODE_RECOMPRESSED
 
   return (
     <Card className="overflow-hidden">
@@ -77,6 +86,22 @@ export function JobCard({
               {job.stripes && job.stripes > 1 && <div>{job.stripes} stripes coded in parallel</div>}
             </div>
           )}
+          {jinfo && (
+            <div className="space-y-0.5 text-xs text-muted-foreground">
+              {jinfo.mode === JPEG_MODE_RECOMPRESSED ? (
+                <>
+                  <div>
+                    {jinfo.width} × {jinfo.height} px
+                  </div>
+                  <div>{describeJpeg(jinfo)}</div>
+                  <div>Mode: lossless JPEG recompression</div>
+                  {jinfo.stripes > 1 && <div>{jinfo.stripes} stripes coded in parallel</div>}
+                </>
+              ) : (
+                <div>Mode: stored as is</div>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="flex min-w-0 flex-col gap-4">
@@ -87,6 +112,7 @@ export function JobCard({
                   {job.name}
                 </h3>
                 <Badge variant="secondary">{job.kind === 'compress' ? 'Compress' : 'Restore'}</Badge>
+                {isJpeg && <Badge variant="outline">JPEG</Badge>}
               </div>
               <p className="text-sm text-muted-foreground">
                 {formatBytes(job.inputBytes)}
@@ -124,7 +150,17 @@ export function JobCard({
             </div>
           )}
 
-          {job.status !== 'error' && info && rows.length > 0 && <SizeTable rows={rows} pixels={pixels} komlaBytes={komlaBytes} />}
+          {job.status !== 'error' && (info || jinfo) && rows.length > 0 && <SizeTable rows={rows} pixels={pixels} komlaBytes={komlaBytes} />}
+
+          {stored && job.kind === 'compress' && (
+            <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" />
+              <span>
+                This JPEG could not be reproduced exactly from its coefficients{jinfo?.note ? ` (${jinfo.note})` : ''}, so it is stored as it is. The .komla file still restores
+                it byte for byte.
+              </span>
+            </div>
+          )}
 
           {(job.status === 'done' || job.status === 'verifying') && (
             <div className="space-y-3">
@@ -133,10 +169,14 @@ export function JobCard({
                   <ShieldCheck className="mt-0.5 size-4 shrink-0 text-emerald-600" />
                   <div className="min-w-0 space-y-1">
                     <div className="font-medium text-emerald-700 dark:text-emerald-400">Bit-exact round trip verified</div>
-                    <div className="text-xs text-muted-foreground">The .komla file was decoded again here and every pixel matches the original.</div>
+                    <div className="text-xs text-muted-foreground">
+                      {isJpeg
+                        ? 'The .komla file was decoded again here and gives back the original JPEG file, byte for byte.'
+                        : 'The .komla file was decoded again here and every pixel matches the original.'}
+                    </div>
                     <div className="space-y-0.5 text-xs">
-                      <Hash label="SHA-256 original pixels" value={job.originalHash} />
-                      <Hash label="SHA-256 decoded pixels" value={job.decodedHash} />
+                      <Hash label={isJpeg ? 'SHA-256 original file' : 'SHA-256 original pixels'} value={job.originalHash} />
+                      <Hash label={isJpeg ? 'SHA-256 restored file' : 'SHA-256 decoded pixels'} value={job.decodedHash} />
                     </div>
                   </div>
                 </div>
@@ -151,22 +191,28 @@ export function JobCard({
                 <div className="flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm">
                   <ShieldCheck className="mt-0.5 size-4 shrink-0 text-emerald-600" />
                   <div className="min-w-0 space-y-1">
-                    <div className="font-medium text-emerald-700 dark:text-emerald-400">Decoded and checksum verified</div>
+                    <div className="font-medium text-emerald-700 dark:text-emerald-400">{isJpeg ? 'Original JPEG restored, checksum verified' : 'Decoded and checksum verified'}</div>
                     <div className="text-xs text-muted-foreground">
-                      The CRC-32 stored in the file matches the decoded pixels. Check against your original file for a full comparison.
+                      {isJpeg
+                        ? 'The CRC-32 stored in the file matches the restored JPEG. Check against your original file for a full byte-by-byte comparison.'
+                        : 'The CRC-32 stored in the file matches the decoded pixels. Check against your original file for a full comparison.'}
                     </div>
                     <div className="text-xs">
-                      <Hash label="SHA-256 decoded pixels" value={job.decodedHash} />
+                      <Hash label={isJpeg ? 'SHA-256 restored file' : 'SHA-256 decoded pixels'} value={job.decodedHash} />
                     </div>
                     {job.original && (
                       <div className="text-xs">
                         {job.original.state === 'checking' && <span className="text-muted-foreground">Comparing with {job.original.name}…</span>}
                         {job.original.state === 'match' && (
                           <span className="flex items-center gap-1 font-medium text-emerald-700 dark:text-emerald-400">
-                            <CheckCircle2 className="size-3.5" /> Identical pixels to {job.original.name}
+                            <CheckCircle2 className="size-3.5" /> {isJpeg ? 'Byte-for-byte identical to' : 'Identical pixels to'} {job.original.name}
                           </span>
                         )}
-                        {job.original.state === 'differs' && <span className="font-medium text-destructive">Pixels differ from {job.original.name}</span>}
+                        {job.original.state === 'differs' && (
+                          <span className="font-medium text-destructive">
+                            {isJpeg ? 'Differs from' : 'Pixels differ from'} {job.original.name}
+                          </span>
+                        )}
                         {job.original.state === 'error' && <span className="text-destructive">Could not read {job.original.name}: {job.original.message}</span>}
                       </div>
                     )}
@@ -181,9 +227,11 @@ export function JobCard({
                     <span className="opacity-70">({formatBytes(job.komla.length)})</span>
                   </Button>
                 )}
-                {job.kind === 'decompress' && job.png && (
-                  <Button onClick={() => download(job.png!, `${stripExt(stripExt(job.name))}.png`, 'image/png')}>
-                    <Download className="size-4" /> Download PNG
+                {job.kind === 'decompress' && restored && (
+                  <Button
+                    onClick={() => (isJpeg ? download(restored, jpegName(job.name), 'image/jpeg') : download(restored, `${stripExt(stripExt(job.name))}.png`, 'image/png'))}
+                  >
+                    <Download className="size-4" /> {isJpeg ? 'Download JPG' : 'Download PNG'}
                   </Button>
                 )}
                 {canCompare && (
@@ -199,7 +247,7 @@ export function JobCard({
                     <input
                       ref={pick}
                       type="file"
-                      accept=".png,.bmp,image/png,image/bmp"
+                      accept={isJpeg ? '.jpg,.jpeg,.jfif,image/jpeg' : '.png,.bmp,image/png,image/bmp'}
                       className="hidden"
                       onChange={(e) => {
                         const f = e.target.files?.[0]
@@ -214,6 +262,12 @@ export function JobCard({
                 <p className="text-xs text-muted-foreground">
                   {formatBpp(job.komla.length, pixels)} · {((job.komla.length / job.inputBytes) * 100).toFixed(1)}% of the input file · ratio{' '}
                   {((pixels * info.channels * (info.depth / 8)) / job.komla.length).toFixed(2)}:1 versus raw pixels
+                </p>
+              )}
+              {job.kind === 'compress' && job.komla && isJpeg && (
+                <p className="text-xs text-muted-foreground">
+                  {((1 - job.komla.length / job.inputBytes) * 100).toFixed(1)}% smaller than the JPEG ({formatBytes(job.inputBytes - job.komla.length)} saved){pixels ? ` · ${formatBpp(job.komla.length, pixels)}` : ''}
+                  {' · '}restores {what} byte for byte
                 </p>
               )}
             </div>
