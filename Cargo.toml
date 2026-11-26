@@ -14,5 +14,10 @@ codegen-units = 1
 panic = "abort"
 debug = 1
 
+[profile.wasm]
+inherits = "release"
+debug = false
+strip = true
+
 [profile.dev]
 opt-level = 2

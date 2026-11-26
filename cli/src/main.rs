@@ -74,6 +74,7 @@ fn options() -> Options {
                 "ols_on" => t.ols_on = f as u32,
                 "wls_interval" => t.wls_interval = f as u32,
                 "exp_more" => t.exp_more = f as u32,
+                "ctx_mask" => t.ctx_mask = f as u32,
                 _ => panic!("unknown tuning key {k}"),
             }
         }
@@ -163,18 +164,26 @@ fn cmd_decompress(args: &[String]) -> Result<(), String> {
 fn cmd_info(args: &[String]) -> Result<(), String> {
     let (input, _) = split_out(args)?;
     let bytes = read(&input)?;
-    let h = kolmo::read_header(&bytes)?;
+    let (h, hl) = kolmo::parse_header(&bytes)?;
+    let stripes = kolmo::split_stripes(&bytes, &h, hl)?;
+    let mode = if h.mode & kolmo::MODE_PALETTE != 0 {
+        format!("palette ({} colours)", h.palette.as_ref().map_or(0, |p| p.len()))
+    } else if h.mode & kolmo::MODE_PIXFLAGS != 0 {
+        "continuous tone + pixel flags".to_string()
+    } else {
+        "continuous tone".to_string()
+    };
     println!(
-        "{}: Kolmo v{} {} x {} x {}ch {}-bit, source {:?}, reductions {:#x}, mode {}, crc32 {:08x}, {} bytes ({:.3} bpp)",
+        "{}: Kolmo v{} {} x {} x {}ch {}-bit (coded as {}ch), source {:?}, {mode}, {} stripe(s), crc32 {:08x}, {} bytes ({:.3} bpp)",
         input.display(),
         kolmo::VERSION,
         h.width,
         h.height,
         h.channels,
         h.depth,
+        h.coded_channels,
         h.source,
-        h.reductions,
-        h.mode,
+        stripes.len(),
         h.crc,
         bytes.len(),
         bytes.len() as f64 * 8.0 / (h.width as f64 * h.height as f64)

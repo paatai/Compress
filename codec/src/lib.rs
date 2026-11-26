@@ -1,7 +1,13 @@
 //! Kolmo: lossless image compression by context mixing.
 //!
-//! File layout (all multi-byte integers little-endian unless noted):
-//!   "KLMO" | version | layout | varint width | varint height | reductions | mode | crc32 | payload
+//! File layout (multi-byte integers little-endian):
+//!   fixed header:  "KLMO" | version | layout | varint width | varint height | reductions | mode | crc32
+//!                  [palette mode: varint length | arithmetic-coded palette]
+//!   stripe table:  varint stripe count | varint byte length of every stripe but the last
+//!   stripes:       independently coded horizontal bands (decodable in parallel)
+//!
+//! layout = channels (1-4) | 8 if 16-bit | source format << 4. The CRC-32 covers the original
+//! samples and is verified after decoding.
 
 pub mod coder;
 pub mod ct;
@@ -159,33 +165,15 @@ fn expand(img: Image, red: u8, target_channels: u8) -> Image {
     Image { width: img.width, height: img.height, channels: target_channels, depth: img.depth, data }
 }
 
-pub fn compress(img: &Image, src: SourceFormat, opts: &Options, progress: &mut dyn FnMut(f32)) -> Result<Vec<u8>, String> {
-    if img.width == 0 || img.height == 0 {
-        return Err("empty image".into());
-    }
-    if !(1..=4).contains(&img.channels) || !(img.depth == 8 || img.depth == 16) {
-        return Err("unsupported pixel format".into());
-    }
-    if img.data.len() != img.pixels() * img.channels as usize {
-        return Err("pixel buffer size mismatch".into());
-    }
-    let crc = crc32(&img.sample_bytes());
-    let (red_img, red) = reduce(img);
-    let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION);
-    out.push(img.channels | if img.depth == 16 { 8 } else { 0 } | ((src as u8) << 4));
-    put_varint(&mut out, img.width);
-    put_varint(&mut out, img.height);
-    out.push(red);
-    let (mode, payload) = encode_payload(&red_img, &opts.tuning, progress);
-    out.push(mode);
-    out.extend_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(&payload);
-    Ok(out)
-}
 
-pub struct Header {
+pub const MODE_PALETTE: u8 = 1;
+pub const MODE_PIXFLAGS: u8 = 4;
+/// Images are split into independent stripes of about this many pixels so that large
+/// photos can be coded on several cores; images up to this size use a single stripe.
+pub const STRIPE_PIXELS: usize = 1 << 22;
+
+#[derive(Clone, Debug)]
+pub struct StreamInfo {
     pub width: u32,
     pub height: u32,
     pub channels: u8,
@@ -194,61 +182,29 @@ pub struct Header {
     pub reductions: u8,
     pub mode: u8,
     pub crc: u32,
-    pub payload_offset: usize,
+    pub coded_channels: u8,
+    pub palette: Option<Vec<u64>>,
 }
 
-pub fn read_header(b: &[u8]) -> Result<Header, String> {
-    if b.len() < 6 || &b[..4] != MAGIC {
-        return Err("not a Kolmo file".into());
+impl StreamInfo {
+    pub fn stripes(&self) -> Vec<(usize, usize)> {
+        stripe_rows(self.width as usize, self.height as usize)
     }
-    if b[4] != VERSION {
-        return Err(format!("unsupported Kolmo version {}", b[4]));
-    }
-    let layout = b[5];
-    let mut pos = 6;
-    let width = get_varint(b, &mut pos)?;
-    let height = get_varint(b, &mut pos)?;
-    if b.len() < pos + 6 {
-        return Err("truncated header".into());
-    }
-    let reductions = b[pos];
-    let mode = b[pos + 1];
-    let crc = u32::from_le_bytes([b[pos + 2], b[pos + 3], b[pos + 4], b[pos + 5]]);
-    pos += 6;
-    let channels = layout & 7;
-    if !(1..=4).contains(&channels) || width == 0 || height == 0 {
-        return Err("corrupt header".into());
-    }
-    Ok(Header {
-        width,
-        height,
-        channels,
-        depth: if layout & 8 != 0 { 16 } else { 8 },
-        source: SourceFormat::from_u8(layout >> 4),
-        reductions,
-        mode,
-        crc,
-        payload_offset: pos,
-    })
 }
 
-pub fn decompress(b: &[u8], opts: &Options, progress: &mut dyn FnMut(f32)) -> Result<(Image, SourceFormat), String> {
-    let h = read_header(b)?;
-    let nc = h.channels as usize;
+pub fn stripe_rows(w: usize, h: usize) -> Vec<(usize, usize)> {
+    let n = (w * h).div_ceil(STRIPE_PIXELS).clamp(1, h.clamp(1, 64));
+    let rows = h.div_ceil(n);
+    (0..n).map(|k| (k * rows, ((k + 1) * rows).min(h))).filter(|r| r.0 < r.1).collect()
+}
+
+fn coded_channels(channels: u8, reductions: u8) -> u8 {
+    let nc = channels as usize;
     let has_alpha = nc == 2 || nc == 4;
-    let keep_alpha = has_alpha && h.reductions & RED_OPAQUE == 0;
-    let base = if nc >= 3 && h.reductions & RED_GRAY == 0 { 3 } else { 1 };
-    let cnc = base + keep_alpha as usize;
-    let coded = decode_payload(&b[h.payload_offset..], h.mode, h.width, h.height, cnc as u8, h.depth, &opts.tuning, progress);
-    let img = expand(coded, h.reductions, h.channels);
-    if crc32(&img.sample_bytes()) != h.crc {
-        return Err("checksum mismatch: file is corrupt".into());
-    }
-    Ok((img, h.source))
+    let keep_alpha = has_alpha && reductions & RED_OPAQUE == 0;
+    let base = if nc >= 3 && reductions & RED_GRAY == 0 { 3 } else { 1 };
+    (base + keep_alpha as usize) as u8
 }
-
-pub const MODE_PALETTE: u8 = 1;
-pub const MODE_PIXFLAGS: u8 = 4;
 
 fn pack(p: &[u16]) -> u64 {
     let mut k = 0u64;
@@ -271,14 +227,13 @@ fn choose_mode(img: &Image) -> (u8, Option<Vec<u64>>) {
             colors.push(k);
         }
         let x = i % w;
-        if x > 0 && img.data[(i - 1) * nc..i * nc] == *p {
-            eq += 1;
-        } else if i >= w && img.data[(i - w) * nc..(i - w + 1) * nc] == *p {
+        if (x > 0 && img.data[(i - 1) * nc..i * nc] == *p) || (i >= w && img.data[(i - w) * nc..(i - w + 1) * nc] == *p) {
             eq += 1;
         }
     }
     let eq_rate = eq as f64 / img.pixels() as f64;
     if colors.len() <= 256 {
+        sort_palette(&mut colors, nc);
         return (MODE_PALETTE | MODE_PIXFLAGS, Some(colors));
     }
     if eq_rate > 0.25 {
@@ -332,20 +287,156 @@ fn code_palette<C: coder::BitCoder>(c: &mut C, pal: &mut Vec<u64>, nc: usize, de
     }
 }
 
-fn encode_payload(img: &Image, tune: &ct::Tuning, progress: &mut dyn FnMut(f32)) -> (u8, Vec<u8>) {
-    let (w, h, nc) = (img.width as usize, img.height as usize, img.channels as usize);
-    let (mode, pal) = choose_mode(img);
+/// An image ready to be coded stripe by stripe.
+pub struct Prepared {
+    pub info: StreamInfo,
+    /// Fixed header bytes (everything before the stripe table).
+    pub header: Vec<u8>,
+    /// Samples after channel reductions, interleaved, row-major.
+    pub coded: Image,
+}
+
+pub fn prepare(img: &Image, src: SourceFormat) -> Result<Prepared, String> {
+    if img.width == 0 || img.height == 0 {
+        return Err("empty image".into());
+    }
+    if !(1..=4).contains(&img.channels) || !(img.depth == 8 || img.depth == 16) {
+        return Err("unsupported pixel format".into());
+    }
+    if img.data.len() != img.pixels() * img.channels as usize {
+        return Err("pixel buffer size mismatch".into());
+    }
+    let crc = crc32(&img.sample_bytes());
+    let (coded, red) = reduce(img);
+    let (mode, palette) = choose_mode(&coded);
+    let mut header = Vec::new();
+    header.extend_from_slice(MAGIC);
+    header.push(VERSION);
+    header.push(img.channels | if img.depth == 16 { 8 } else { 0 } | ((src as u8) << 4));
+    put_varint(&mut header, img.width);
+    put_varint(&mut header, img.height);
+    header.push(red);
+    header.push(mode);
+    header.extend_from_slice(&crc.to_le_bytes());
+    if let Some(pal) = &palette {
+        let mut e = coder::Encoder::new();
+        let mut p = pal.clone();
+        code_palette(&mut e, &mut p, coded.channels as usize, img.depth, true);
+        let block = e.finish();
+        put_varint(&mut header, block.len() as u32);
+        header.extend_from_slice(&block);
+    }
+    let info = StreamInfo {
+        width: img.width,
+        height: img.height,
+        channels: img.channels,
+        depth: img.depth,
+        source: src,
+        reductions: red,
+        mode,
+        crc,
+        coded_channels: coded.channels,
+        palette,
+    };
+    Ok(Prepared { info, header, coded })
+}
+
+/// Parses the fixed header. Returns the stream description and the header length.
+pub fn parse_header(b: &[u8]) -> Result<(StreamInfo, usize), String> {
+    if b.len() < 6 || &b[..4] != MAGIC {
+        return Err("not a Kolmo file".into());
+    }
+    if b[4] != VERSION {
+        return Err(format!("unsupported Kolmo version {}", b[4]));
+    }
+    let layout = b[5];
+    let mut pos = 6;
+    let width = get_varint(b, &mut pos)?;
+    let height = get_varint(b, &mut pos)?;
+    if b.len() < pos + 6 {
+        return Err("truncated header".into());
+    }
+    let reductions = b[pos];
+    let mode = b[pos + 1];
+    let crc = u32::from_le_bytes([b[pos + 2], b[pos + 3], b[pos + 4], b[pos + 5]]);
+    pos += 6;
+    let channels = layout & 7;
+    if !(1..=4).contains(&channels) || width == 0 || height == 0 || (width as u64 * height as u64) > (1 << 31) {
+        return Err("corrupt header".into());
+    }
+    let depth = if layout & 8 != 0 { 16 } else { 8 };
+    let cnc = coded_channels(channels, reductions);
+    let palette = if mode & MODE_PALETTE != 0 {
+        let len = get_varint(b, &mut pos)? as usize;
+        let block = b.get(pos..pos + len).ok_or("truncated palette")?;
+        pos += len;
+        let mut d = coder::Decoder::new(block);
+        let mut pal = Vec::new();
+        code_palette(&mut d, &mut pal, cnc as usize, depth, false);
+        Some(pal)
+    } else {
+        None
+    };
+    let info = StreamInfo {
+        width,
+        height,
+        channels,
+        depth,
+        source: SourceFormat::from_u8(layout >> 4),
+        reductions,
+        mode,
+        crc,
+        coded_channels: cnc,
+        palette,
+    };
+    Ok((info, pos))
+}
+
+/// Splits a complete file into its stripe streams.
+pub fn split_stripes<'a>(b: &'a [u8], info: &StreamInfo, header_len: usize) -> Result<Vec<&'a [u8]>, String> {
+    let mut pos = header_len;
+    let n = get_varint(b, &mut pos)? as usize;
+    if n != info.stripes().len() {
+        return Err("corrupt stripe table".into());
+    }
+    let mut lens = Vec::with_capacity(n);
+    for _ in 0..n.saturating_sub(1) {
+        lens.push(get_varint(b, &mut pos)? as usize);
+    }
+    let mut out = Vec::with_capacity(n);
+    for l in lens {
+        out.push(b.get(pos..pos + l).ok_or("truncated stripe")?);
+        pos += l;
+    }
+    out.push(b.get(pos..).ok_or("truncated stripe")?);
+    Ok(out)
+}
+
+/// Joins the fixed header and the coded stripes into a file.
+pub fn assemble(header: &[u8], stripes: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = header.to_vec();
+    put_varint(&mut out, stripes.len() as u32);
+    for s in &stripes[..stripes.len().saturating_sub(1)] {
+        put_varint(&mut out, s.len() as u32);
+    }
+    for s in stripes {
+        out.extend_from_slice(s);
+    }
+    out
+}
+
+/// Codes one stripe. `rows` holds the coded samples of exactly this stripe's rows.
+pub fn encode_stripe(info: &StreamInfo, rows: &[u16], stripe_height: usize, tune: &ct::Tuning, progress: &mut dyn FnMut(f32)) -> Vec<u8> {
+    let (w, h, nc) = (info.width as usize, stripe_height, info.coded_channels as usize);
     let mut enc = coder::Encoder::new();
     let mut pix = pix::PixModel::new(w, h);
-    if let Some(mut pal) = pal {
-        sort_palette(&mut pal, nc);
-        code_palette(&mut enc, &mut pal, nc, img.depth, true);
+    if let Some(pal) = &info.palette {
         let map: std::collections::HashMap<u64, u32> = pal.iter().enumerate().map(|(i, &k)| (k, i as u32)).collect();
         let mut pm = pal::PalModel::new(w, h, pal.len());
         for y in 0..h {
             for x in 0..w {
                 let i = y * w + x;
-                let idx = map[&pack(&img.data[i * nc..(i + 1) * nc])];
+                let idx = map[&pack(&rows[i * nc..(i + 1) * nc])];
                 if pix.code(&mut enc, x, y, idx as u64).is_none() {
                     let eqp = pix.eqp();
                     pm.code(&mut enc, &pix.keys, x, y, idx, eqp);
@@ -357,14 +448,14 @@ fn encode_payload(img: &Image, tune: &ct::Tuning, progress: &mut dyn FnMut(f32))
             }
         }
         progress(1.0);
-        return (mode, enc.finish());
+        return enc.finish();
     }
-    let flags = mode & MODE_PIXFLAGS != 0;
+    let flags = info.mode & MODE_PIXFLAGS != 0;
     let plan = ct::Plan::for_channels(nc);
-    let mut model = ct::CtModel::new(w, h, img.depth as u32, plan.clone(), tune.clone());
+    let mut model = ct::CtModel::new(w, h, info.depth as u32, plan.clone(), tune.clone());
     for y in 0..h {
         model.start_row(y);
-        let row = &img.data[y * w * nc..(y + 1) * w * nc];
+        let row = &rows[y * w * nc..(y + 1) * w * nc];
         for x in 0..w {
             let p = &row[x * nc..(x + 1) * nc];
             let key = pack(p);
@@ -385,17 +476,16 @@ fn encode_payload(img: &Image, tune: &ct::Tuning, progress: &mut dyn FnMut(f32))
     if let Some(s) = model.stats.as_ref() {
         eprintln!("{}", s.report());
     }
-    (mode, enc.finish())
+    enc.finish()
 }
 
-fn decode_payload(data: &[u8], mode: u8, width: u32, height: u32, nc: u8, depth: u8, tune: &ct::Tuning, progress: &mut dyn FnMut(f32)) -> Image {
-    let (w, h, ncu) = (width as usize, height as usize, nc as usize);
+/// Decodes one stripe into its coded samples.
+pub fn decode_stripe(info: &StreamInfo, data: &[u8], stripe_height: usize, tune: &ct::Tuning, progress: &mut dyn FnMut(f32)) -> Vec<u16> {
+    let (w, h, nc) = (info.width as usize, stripe_height, info.coded_channels as usize);
     let mut dec = coder::Decoder::new(data);
-    let mut out = vec![0u16; w * h * ncu];
+    let mut out = vec![0u16; w * h * nc];
     let mut pix = pix::PixModel::new(w, h);
-    if mode & MODE_PALETTE != 0 {
-        let mut pal = Vec::new();
-        code_palette(&mut dec, &mut pal, ncu, depth, false);
+    if let Some(pal) = &info.palette {
         let mut pm = pal::PalModel::new(w, h, pal.len());
         for y in 0..h {
             for x in 0..w {
@@ -409,8 +499,8 @@ fn decode_payload(data: &[u8], mode: u8, width: u32, height: u32, nc: u8, depth:
                 pix.finish(x, y, idx as u64);
                 let key = pal.get(idx as usize).copied().unwrap_or(0);
                 let i = y * w + x;
-                for ch in 0..ncu {
-                    out[i * ncu + ch] = ((key >> (16 * ch)) & 0xFFFF) as u16;
+                for ch in 0..nc {
+                    out[i * nc + ch] = ((key >> (16 * ch)) & 0xFFFF) as u16;
                 }
             }
             if y % 16 == 15 {
@@ -418,32 +508,32 @@ fn decode_payload(data: &[u8], mode: u8, width: u32, height: u32, nc: u8, depth:
             }
         }
         progress(1.0);
-        return Image { width, height, channels: nc, depth, data: out };
+        return out;
     }
-    let flags = mode & MODE_PIXFLAGS != 0;
-    let plan = ct::Plan::for_channels(ncu);
-    let mut model = ct::CtModel::new(w, h, depth as u32, plan.clone(), tune.clone());
+    let flags = info.mode & MODE_PIXFLAGS != 0;
+    let plan = ct::Plan::for_channels(nc);
+    let mut model = ct::CtModel::new(w, h, info.depth as u32, plan.clone(), tune.clone());
     for y in 0..h {
         model.start_row(y);
         for x in 0..w {
-            let base = (y * w + x) * ncu;
+            let base = (y * w + x) * nc;
             let found = if flags { pix.code(&mut dec, x, y, 0) } else { None };
             match found {
                 Some(k) => {
-                    for ci in 0..ncu {
+                    for ci in 0..nc {
                         let v = ((k >> (16 * plan.src[ci])) & 0xFFFF) as i32;
                         out[base + plan.src[ci]] = v as u16;
                         model.code_sample(&mut dec, x, ci, v, true);
                     }
                 }
                 None => {
-                    for ci in 0..ncu {
+                    for ci in 0..nc {
                         out[base + plan.src[ci]] = model.code_sample(&mut dec, x, ci, 0, false) as u16;
                     }
                 }
             }
             if flags {
-                pix.finish(x, y, pack(&out[base..base + ncu]));
+                pix.finish(x, y, pack(&out[base..base + nc]));
             }
         }
         model.end_row();
@@ -452,5 +542,62 @@ fn decode_payload(data: &[u8], mode: u8, width: u32, height: u32, nc: u8, depth:
         }
     }
     progress(1.0);
-    Image { width, height, channels: nc, depth, data: out }
+    out
+}
+
+/// Rebuilds the original image from the decoded coded samples and verifies the checksum.
+pub fn finish(info: &StreamInfo, coded: Vec<u16>) -> Result<Image, String> {
+    let img = Image { width: info.width, height: info.height, channels: info.coded_channels, depth: info.depth, data: coded };
+    let img = expand(img, info.reductions, info.channels);
+    if crc32(&img.sample_bytes()) != info.crc {
+        return Err("checksum mismatch: file is corrupt".into());
+    }
+    Ok(img)
+}
+
+fn run_parallel<T: Send, F: Fn(usize) -> T + Sync>(n: usize, f: F) -> Vec<T> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if n > 1 {
+            return std::thread::scope(|s| {
+                let f = &f;
+                let hs: Vec<_> = (0..n).map(|k| s.spawn(move || f(k))).collect();
+                hs.into_iter().map(|h| h.join().expect("worker thread panicked")).collect()
+            });
+        }
+    }
+    (0..n).map(f).collect()
+}
+
+pub fn compress(img: &Image, src: SourceFormat, opts: &Options, progress: &mut dyn FnMut(f32)) -> Result<Vec<u8>, String> {
+    let prep = prepare(img, src)?;
+    let stripes = prep.info.stripes();
+    let w = prep.info.width as usize;
+    let nc = prep.info.coded_channels as usize;
+    let streams = if stripes.len() == 1 {
+        vec![encode_stripe(&prep.info, &prep.coded.data, stripes[0].1, &opts.tuning, progress)]
+    } else {
+        let s = run_parallel(stripes.len(), |k| {
+            let (y0, y1) = stripes[k];
+            encode_stripe(&prep.info, &prep.coded.data[y0 * w * nc..y1 * w * nc], y1 - y0, &opts.tuning, &mut |_| {})
+        });
+        progress(1.0);
+        s
+    };
+    Ok(assemble(&prep.header, &streams))
+}
+
+pub fn decompress(b: &[u8], opts: &Options, progress: &mut dyn FnMut(f32)) -> Result<(Image, SourceFormat), String> {
+    let (info, hl) = parse_header(b)?;
+    let parts = split_stripes(b, &info, hl)?;
+    let stripes = info.stripes();
+    let decoded: Vec<Vec<u16>> = if stripes.len() == 1 {
+        vec![decode_stripe(&info, parts[0], stripes[0].1, &opts.tuning, progress)]
+    } else {
+        let d = run_parallel(stripes.len(), |k| decode_stripe(&info, parts[k], stripes[k].1 - stripes[k].0, &opts.tuning, &mut |_| {}));
+        progress(1.0);
+        d
+    };
+    let coded: Vec<u16> = decoded.into_iter().flatten().collect();
+    Ok((finish(&info, coded)?, info.source))
 }

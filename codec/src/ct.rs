@@ -148,6 +148,7 @@ pub struct Tuning {
     pub ols_on: u32,
     pub wls_interval: u32,
     pub exp_more: u32,
+    pub ctx_mask: u32,
 }
 
 impl Default for Tuning {
@@ -178,6 +179,7 @@ impl Default for Tuning {
             ols_on: 0,
             wls_interval: 1,
             exp_more: 0,
+            ctx_mask: 0,
         }
     }
 }
@@ -230,6 +232,7 @@ pub struct CtModel {
     exp_base: [usize; NEXP],
     nexp: usize,
     side: usize,
+    small_exp: bool,
     tune: Tuning,
     pub stats: Option<Box<Stats>>,
 }
@@ -402,6 +405,7 @@ impl CtModel {
             exp_base: [0; NEXP],
             nexp: 0,
             side: 0,
+            small_exp: std::env::var_os("KOLMO_SMALLEXP").is_some(),
             tune,
             stats: if std::env::var_os("KOLMO_STATS").is_some() { Some(Box::default()) } else { None },
         }
@@ -782,7 +786,7 @@ impl CtModel {
                 let (pj, ej) = if j == usize::MAX { (blend16, blend_err) } else { (p[j], errs[j]) };
                 let conf = (qlog((ej >> 3) >> ds) / 3).min(15) as usize;
                 let qd = qdev(pj - pv * 16, ds);
-                let b = ((ci * NEXP + e) * 16 + conf) * (48 * 2 * SLOTS) + qd * 2 * SLOTS;
+                let b = if self.small_exp { (ci * NEXP + e) * 32 } else { ((ci * NEXP + e) * 16 + conf) * (48 * 2 * SLOTS) + qd * 2 * SLOTS };
                 self.exp_base[e] = b;
                 prefetch(unsafe { self.exp_tab.as_ptr().add(b) });
                 prefetch(unsafe { self.exp_tab.as_ptr().add(b + SLOTS) });
@@ -855,13 +859,21 @@ impl CtModel {
         v
     }
 
-    #[inline(always)]
+    #[inline(never)]
     fn code_bit<C: BitCoder>(&mut self, coder: &mut C, slot: usize, bit: u32) -> u32 {
         let t = self.t;
         for (i, tb) in self.tabs.iter().enumerate() {
             self.x[i] = t.stretch(tb.p(slot));
         }
         let dis = self.tune.disable;
+        let cm = self.tune.ctx_mask;
+        if cm != 0 {
+            for i in 0..NCTX {
+                if cm & (1 << i) != 0 {
+                    self.x[i] = 0;
+                }
+            }
+        }
         if dis & 4 != 0 {
             self.x[6] = 0;
             self.x[7] = 0;
@@ -885,7 +897,7 @@ impl CtModel {
         let d0 = self.m[0].mix(&self.x, self.sel[0] * SLOTS + slot, t);
         let d1 = self.m[1].mix(&self.x, self.sel[1] * SLOTS + slot, t);
         let d2 = self.m[2].mix(&self.x, self.sel[2] * SLOTS + slot, t);
-        let fin = [d0, d1, d2, 256];
+        let fin = if self.tune.disable & 128 != 0 { [d0, d1, 0, 256] } else if self.tune.disable & 256 != 0 { [d0, 0, d2, 256] } else if self.tune.disable & 512 != 0 { [0, d1, d2, 256] } else { [d0, d1, d2, 256] };
         let df = self.mf.mix(&fin, self.self_f * SLOTS + slot, t);
         let pa1 = self.apm1.pp(df, self.actx1 * SLOTS + slot);
         let pa2 = self.apm2.pp(df, self.actx2 * SLOTS + slot);
@@ -916,6 +928,7 @@ impl CtModel {
         bit
     }
 
+    #[inline(never)]
     fn code_residual<C: BitCoder>(&mut self, coder: &mut C, r_enc: i32, pv: i32) -> i32 {
         let maxv = self.maxv;
         let z = self.code_bit(coder, SLOT_ZERO, (r_enc == 0) as u32);
@@ -930,7 +943,7 @@ impl CtModel {
             self.code_bit(coder, SLOT_SIGN, (r_enc > 0) as u32) == 1
         };
         let maxmag = if pos { maxv - pv } else { pv };
-        self.side = pos as usize;
+        self.side = if self.tune.disable & 64 != 0 { 0 } else { pos as usize };
         let mag_enc = r_enc.abs();
         let mut i = 0u32;
         loop {
