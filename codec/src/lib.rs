@@ -620,7 +620,7 @@ pub fn finish(info: &StreamInfo, coded: Vec<u16>) -> Result<Image, String> {
     let img = Image { width: info.width, height: info.height, channels: info.coded_channels, depth: info.depth, data: coded };
     let img = expand(img, info.reductions, info.channels, info.alpha_value);
     if crc32(&img.sample_bytes()) != info.crc {
-        return Err("checksum mismatch: file is corrupt".into());
+        return Err("checksum mismatch: the .kolmo file is damaged or incomplete".into());
     }
     Ok(img)
 }
