@@ -39,7 +39,7 @@ export function HowItWorks() {
       <div className="space-y-2">
         <h2 className="text-2xl font-semibold tracking-tight">How it works</h2>
         <p className="max-w-3xl text-muted-foreground">
-          Kolmo is a context-mixing coder in the tradition of PAQ and the leading lossless photo benchmarks. It is slower than PNG, and much smaller.
+          Komla is a context-mixing coder in the tradition of PAQ and the leading lossless photo benchmarks. It is slower than PNG, and much smaller.
         </p>
       </div>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">

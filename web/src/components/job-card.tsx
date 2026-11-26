@@ -40,7 +40,7 @@ export function JobCard({
   const pick = useRef<HTMLInputElement>(null)
   const info = job.info
   const pixels = info ? info.width * info.height : 0
-  const kolmoBytes = job.kind === 'compress' ? job.kolmo?.length : job.inputBytes
+  const komlaBytes = job.kind === 'compress' ? job.komla?.length : job.inputBytes
   const srcLabel = job.kind === 'compress' ? (/\.bmp$/i.test(job.name) ? 'Original BMP file' : 'Original PNG file') : 'PNG (written here)'
 
   const rows: SizeRow[] = []
@@ -52,7 +52,7 @@ export function JobCard({
   } else if (job.png) {
     rows.push({ label: 'PNG', detail: 'restored file (fast deflate)', measure: { state: 'done', bytes: job.png.length } })
   }
-  if (kolmoBytes) rows.push({ label: 'Kolmo', detail: '.kolmo file', measure: job.kolmo || job.kind === 'decompress' ? { state: 'done', bytes: kolmoBytes } : { state: 'running' }, highlight: true })
+  if (komlaBytes) rows.push({ label: 'Komla', detail: '.komla file', measure: job.komla || job.kind === 'decompress' ? { state: 'done', bytes: komlaBytes } : { state: 'running' }, highlight: true })
 
   const canCompare = job.kind === 'compress' && (job.status === 'done' || job.status === 'verifying') && !!job.samples && job.webp.state === 'idle'
 
@@ -124,7 +124,7 @@ export function JobCard({
             </div>
           )}
 
-          {job.status !== 'error' && info && rows.length > 0 && <SizeTable rows={rows} pixels={pixels} kolmoBytes={kolmoBytes} />}
+          {job.status !== 'error' && info && rows.length > 0 && <SizeTable rows={rows} pixels={pixels} komlaBytes={komlaBytes} />}
 
           {(job.status === 'done' || job.status === 'verifying') && (
             <div className="space-y-3">
@@ -133,7 +133,7 @@ export function JobCard({
                   <ShieldCheck className="mt-0.5 size-4 shrink-0 text-emerald-600" />
                   <div className="min-w-0 space-y-1">
                     <div className="font-medium text-emerald-700 dark:text-emerald-400">Bit-exact round trip verified</div>
-                    <div className="text-xs text-muted-foreground">The .kolmo file was decoded again here and every pixel matches the original.</div>
+                    <div className="text-xs text-muted-foreground">The .komla file was decoded again here and every pixel matches the original.</div>
                     <div className="space-y-0.5 text-xs">
                       <Hash label="SHA-256 original pixels" value={job.originalHash} />
                       <Hash label="SHA-256 decoded pixels" value={job.decodedHash} />
@@ -175,10 +175,10 @@ export function JobCard({
               )}
 
               <div className="flex flex-wrap gap-2">
-                {job.kind === 'compress' && job.kolmo && (
-                  <Button onClick={() => download(job.kolmo!, `${job.name}.kolmo`, 'application/octet-stream')}>
-                    <Download className="size-4" /> Download .kolmo
-                    <span className="opacity-70">({formatBytes(job.kolmo.length)})</span>
+                {job.kind === 'compress' && job.komla && (
+                  <Button onClick={() => download(job.komla!, `${job.name}.komla`, 'application/octet-stream')}>
+                    <Download className="size-4" /> Download .komla
+                    <span className="opacity-70">({formatBytes(job.komla.length)})</span>
                   </Button>
                 )}
                 {job.kind === 'decompress' && job.png && (
@@ -210,10 +210,10 @@ export function JobCard({
                   </>
                 )}
               </div>
-              {job.kind === 'compress' && job.kolmo && info && (
+              {job.kind === 'compress' && job.komla && info && (
                 <p className="text-xs text-muted-foreground">
-                  {formatBpp(job.kolmo.length, pixels)} · {((job.kolmo.length / job.inputBytes) * 100).toFixed(1)}% of the input file · ratio{' '}
-                  {((pixels * info.channels * (info.depth / 8)) / job.kolmo.length).toFixed(2)}:1 versus raw pixels
+                  {formatBpp(job.komla.length, pixels)} · {((job.komla.length / job.inputBytes) * 100).toFixed(1)}% of the input file · ratio{' '}
+                  {((pixels * info.channels * (info.depth / 8)) / job.komla.length).toFixed(2)}:1 versus raw pixels
                 </p>
               )}
             </div>

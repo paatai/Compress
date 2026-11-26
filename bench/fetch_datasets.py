@@ -18,7 +18,7 @@ import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "data")
-UA = {"User-Agent": "kolmo-benchmark/1.0 (lossless image compression benchmark)"}
+UA = {"User-Agent": "komla-benchmark/1.0 (lossless image compression benchmark)"}
 KODAK_URL = "http://r0k.us/graphics/kodak/kodak/{name}"
 DIV2K_URL = "http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_valid_HR.zip"
 

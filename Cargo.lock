@@ -103,25 +103,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "kolmo"
+name = "komla"
 version = "1.0.0"
 dependencies = [
  "png",
 ]
 
 [[package]]
-name = "kolmo-cli"
+name = "komla-cli"
 version = "1.0.0"
 dependencies = [
- "kolmo",
+ "komla",
  "sha2",
 ]
 
 [[package]]
-name = "kolmo-wasm"
+name = "komla-wasm"
 version = "1.0.0"
 dependencies = [
- "kolmo",
+ "komla",
 ]
 
 [[package]]

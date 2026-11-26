@@ -5,12 +5,12 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
-execFileSync('cargo', ['build', '-p', 'kolmo-wasm', '--target', 'wasm32-unknown-unknown', '--profile', 'wasm'], {
+execFileSync('cargo', ['build', '-p', 'komla-wasm', '--target', 'wasm32-unknown-unknown', '--profile', 'wasm'], {
   cwd: root,
   stdio: 'inherit',
   env: { ...process.env, RUSTFLAGS: '-C target-feature=+simd128' },
 })
-const out = join(root, 'web', 'src', 'wasm', 'kolmo.wasm')
+const out = join(root, 'web', 'src', 'wasm', 'komla.wasm')
 mkdirSync(dirname(out), { recursive: true })
-copyFileSync(join(root, 'target', 'wasm32-unknown-unknown', 'wasm', 'kolmo_wasm.wasm'), out)
-console.log(`kolmo.wasm: ${(statSync(out).size / 1024).toFixed(0)} KiB`)
+copyFileSync(join(root, 'target', 'wasm32-unknown-unknown', 'wasm', 'komla_wasm.wasm'), out)
+console.log(`komla.wasm: ${(statSync(out).size / 1024).toFixed(0)} KiB`)

@@ -1,29 +1,29 @@
 /// <reference lib="webworker" />
-import wasmUrl from '../wasm/kolmo.wasm?url'
+import wasmUrl from '../wasm/komla.wasm?url'
 import type { ImageInfo, WorkerRequest } from '../lib/protocol'
 
-interface KolmoExports {
+interface KomlaExports {
   memory: WebAssembly.Memory
-  kolmo_alloc(len: number): number
-  kolmo_free(ptr: number, len: number): void
-  kolmo_result_ptr(): number
-  kolmo_result_len(): number
-  kolmo_result_clear(): void
-  kolmo_error_ptr(): number
-  kolmo_error_len(): number
+  komla_alloc(len: number): number
+  komla_free(ptr: number, len: number): void
+  komla_result_ptr(): number
+  komla_result_len(): number
+  komla_result_clear(): void
+  komla_error_ptr(): number
+  komla_error_len(): number
   [name: string]: unknown
 }
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope
 let currentId = 0
 let lastProgress = 0
-let exportsPromise: Promise<KolmoExports> | null = null
+let exportsPromise: Promise<KomlaExports> | null = null
 
-function load(): Promise<KolmoExports> {
+function load(): Promise<KomlaExports> {
   exportsPromise ??= (async () => {
     const imports = {
       env: {
-        kolmo_progress: (fraction: number) => {
+        komla_progress: (fraction: number) => {
           const now = performance.now()
           if (fraction >= 1 || now - lastProgress > 80) {
             lastProgress = now
@@ -40,29 +40,29 @@ function load(): Promise<KolmoExports> {
       const bytes = await (await fetch(wasmUrl)).arrayBuffer()
       instance = (await WebAssembly.instantiate(bytes, imports)).instance
     }
-    return instance.exports as unknown as KolmoExports
+    return instance.exports as unknown as KomlaExports
   })()
   return exportsPromise
 }
 
 /** Copies inputs into WASM memory, calls `fn(ptr, len, ..., extra...)`, returns a copy of the result. */
-function call(k: KolmoExports, fn: string, inputs: Uint8Array[], extra: number[] = []): Uint8Array {
+function call(k: KomlaExports, fn: string, inputs: Uint8Array[], extra: number[] = []): Uint8Array {
   const args: number[] = []
   const allocs: [number, number][] = []
   for (const b of inputs) {
-    const p = k.kolmo_alloc(b.length)
+    const p = k.komla_alloc(b.length)
     new Uint8Array(k.memory.buffer, p, b.length).set(b)
     allocs.push([p, b.length])
     args.push(p, b.length)
   }
   const rc = (k[fn] as (...a: number[]) => number)(...args, ...extra)
-  for (const [p, n] of allocs) k.kolmo_free(p, n)
+  for (const [p, n] of allocs) k.komla_free(p, n)
   if (rc !== 0) {
-    const msg = new TextDecoder().decode(new Uint8Array(k.memory.buffer, k.kolmo_error_ptr(), k.kolmo_error_len()))
+    const msg = new TextDecoder().decode(new Uint8Array(k.memory.buffer, k.komla_error_ptr(), k.komla_error_len()))
     throw new Error(msg)
   }
-  const out = new Uint8Array(k.memory.buffer, k.kolmo_result_ptr(), k.kolmo_result_len()).slice()
-  k.kolmo_result_clear()
+  const out = new Uint8Array(k.memory.buffer, k.komla_result_ptr(), k.komla_result_len()).slice()
+  k.komla_result_clear()
   return out
 }
 
@@ -83,7 +83,7 @@ async function handle(req: WorkerRequest): Promise<{ result: unknown; transfer: 
   const k = await load()
   switch (req.op) {
     case 'prepare': {
-      const r = call(k, 'kolmo_prepare', [new Uint8Array(req.file)])
+      const r = call(k, 'komla_prepare', [new Uint8Array(req.file)])
       const v = new DataView(r.buffer)
       let o = 0
       const nCand = v.getUint32(o, true)
@@ -110,11 +110,11 @@ async function handle(req: WorkerRequest): Promise<{ result: unknown; transfer: 
       return { result: { candidates, samples, coded }, transfer: [samples.buffer, coded.buffer] }
     }
     case 'encodeStripe': {
-      const s = call(k, 'kolmo_encode_stripe', [req.header, req.rows], [req.height])
+      const s = call(k, 'komla_encode_stripe', [req.header, req.rows], [req.height])
       return { result: s, transfer: [s.buffer] }
     }
     case 'parse': {
-      const r = call(k, 'kolmo_parse', [req.file])
+      const r = call(k, 'komla_parse', [req.file])
       const v = new DataView(r.buffer)
       const headerLen = v.getUint32(0, true)
       const n = v.getUint32(4, true)
@@ -126,18 +126,18 @@ async function handle(req: WorkerRequest): Promise<{ result: unknown; transfer: 
       return { result: { headerLen, stripes, info: readInfo(v, o) }, transfer: [] }
     }
     case 'decodeStripe': {
-      const c = call(k, 'kolmo_decode_stripe', [req.header, req.data], [req.height])
+      const c = call(k, 'komla_decode_stripe', [req.header, req.data], [req.height])
       return { result: c, transfer: [c.buffer] }
     }
     case 'finish': {
-      const r = call(k, 'kolmo_finish', [req.header, req.coded], [req.wantPng ? 1 : 0])
+      const r = call(k, 'komla_finish', [req.header, req.coded], [req.wantPng ? 1 : 0])
       const pngLen = new DataView(r.buffer).getUint32(0, true)
       const png = r.slice(4, 4 + pngLen)
       const samples = r.slice(4 + pngLen)
       return { result: { png, samples }, transfer: [png.buffer, samples.buffer] }
     }
     case 'readImage': {
-      const r = call(k, 'kolmo_read_image', [new Uint8Array(req.file)])
+      const r = call(k, 'komla_read_image', [new Uint8Array(req.file)])
       const v = new DataView(r.buffer)
       const info = { width: v.getUint32(0, true), height: v.getUint32(4, true), channels: r[8], depth: r[9] }
       const samples = r.slice(12)

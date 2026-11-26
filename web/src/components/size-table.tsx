@@ -10,7 +10,7 @@ export interface SizeRow {
   highlight?: boolean
 }
 
-export function SizeTable({ rows, pixels, kolmoBytes }: { rows: SizeRow[]; pixels: number; kolmoBytes?: number }) {
+export function SizeTable({ rows, pixels, komlaBytes }: { rows: SizeRow[]; pixels: number; komlaBytes?: number }) {
   const done = rows.flatMap((r) => (r.measure.state === 'done' ? [r.measure.bytes] : []))
   const max = Math.max(1, ...done)
   return (
@@ -18,7 +18,7 @@ export function SizeTable({ rows, pixels, kolmoBytes }: { rows: SizeRow[]; pixel
       {rows.map((r) => {
         const m = r.measure
         const bytes = m.state === 'done' ? m.bytes : undefined
-        const saving = bytes && kolmoBytes && !r.highlight ? 1 - kolmoBytes / bytes : undefined
+        const saving = bytes && komlaBytes && !r.highlight ? 1 - komlaBytes / bytes : undefined
         return (
           <div key={r.label} className="grid grid-cols-[minmax(0,9.5rem)_1fr] items-center gap-3 sm:grid-cols-[12rem_1fr_9rem]">
             <div className="min-w-0">
@@ -28,7 +28,7 @@ export function SizeTable({ rows, pixels, kolmoBytes }: { rows: SizeRow[]; pixel
               )}
               {saving !== undefined && (
                 <div className={cn('text-xs font-medium', saving > 0 ? 'text-emerald-600' : 'text-amber-600')}>
-                  Kolmo is {(Math.abs(saving) * 100).toFixed(1)}% {saving > 0 ? 'smaller' : 'larger'}
+                  Komla is {(Math.abs(saving) * 100).toFixed(1)}% {saving > 0 ? 'smaller' : 'larger'}
                 </div>
               )}
             </div>

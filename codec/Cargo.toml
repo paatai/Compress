@@ -1,6 +1,6 @@
 [package]
-name = "kolmo"
-description = "Kolmo: lossless image compression by context mixing"
+name = "komla"
+description = "Komla: lossless image compression by context mixing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

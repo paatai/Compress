@@ -1,4 +1,4 @@
-use kolmo::{compress, decompress, Image, Options, SourceFormat};
+use komla::{compress, decompress, Image, Options, SourceFormat};
 
 fn lcg(state: &mut u32) -> u32 {
     *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -63,8 +63,8 @@ fn tiny_images() {
 #[test]
 fn stripes() {
     // tall enough that the stripe rule splits it
-    let img = synth(8, (kolmo::STRIPE_PIXELS / 8 + 100) as u32, 1, 8, 4, 11);
-    assert!(kolmo::stripe_rows(img.width as usize, img.height as usize).len() > 1);
+    let img = synth(8, (komla::STRIPE_PIXELS / 8 + 100) as u32, 1, 8, 4, 11);
+    assert!(komla::stripe_rows(img.width as usize, img.height as usize).len() > 1);
     roundtrip(&img);
 }
 
@@ -76,6 +76,6 @@ fn corrupt_input_is_rejected() {
     let n = packed.len();
     packed[n / 2] ^= 0x55;
     assert!(decompress(&packed, &opts, &mut |_| {}).is_err());
-    assert!(decompress(b"KLMO", &opts, &mut |_| {}).is_err());
-    assert!(decompress(b"not a kolmo file", &opts, &mut |_| {}).is_err());
+    assert!(decompress(b"KMLA", &opts, &mut |_| {}).is_err());
+    assert!(decompress(b"not a komla file", &opts, &mut |_| {}).is_err());
 }

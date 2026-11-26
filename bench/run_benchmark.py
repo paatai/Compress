@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Runs Kolmo and the baseline compressors over a benchmark set and reports bits per pixel.
+"""Runs Komla and the baseline compressors over a benchmark set and reports bits per pixel.
 
 Every image-format result is decoded again and compared with the original by a SHA-256 of the
-pixels normalised to RGBA (`kolmo pixhash`); general-purpose archivers compress a BMP of the
+pixels normalised to RGBA (`komla pixhash`); general-purpose archivers compress a BMP of the
 image and are checked by extracting the archive and comparing bytes.
 
 usage: run_benchmark.py --set dev|test [--codecs a,b,...] [--force a,b] [--jobs N]
@@ -20,7 +20,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TOOLS = os.environ.get("TOOLS", os.path.join(HERE, ".tools", "bin"))
-KOLMO = os.environ.get("KOLMO", os.path.join(ROOT, "target", "release", "kolmo"))
+KOMLA = os.environ.get("KOMLA", os.path.join(ROOT, "target", "release", "komla"))
 
 
 def t(name):
@@ -41,9 +41,9 @@ CODECS = {
     "webp": ("png", [t("cwebp"), "-lossless", "-z", "9", "-exact", "-metadata", "none", "-quiet", "{inp}", "-o", "{out}"], "webp", [t("dwebp"), "-quiet", "{out}", "-o", "{dec}"], None),
     "jxl-e9": ("png", [t("cjxl"), "-d", "0", "-e", "9", "--num_threads=0", "--quiet", "{inp}", "{out}"], "jxl", [t("djxl"), "--quiet", "{out}", "{dec}"], None),
     "jxl-e10": ("png", [t("cjxl"), "-d", "0", "-e", "10", "--num_threads=0", "--quiet", "{inp}", "{out}"], "jxl", [t("djxl"), "--quiet", "{out}", "{dec}"], None),
-    "kolmo": ("png", [KOLMO, "compress", "{inp}", "-o", "{out}"], "kolmo", [KOLMO, "decompress", "{out}", "-o", "{dec}"], None),
+    "komla": ("png", [KOMLA, "compress", "{inp}", "-o", "{out}"], "komla", [KOMLA, "decompress", "{out}", "-o", "{dec}"], None),
 }
-ORDER = ["zip", "rar", "7z", "xz", "qoi", "png-oxipng", "png-zopfli", "flif", "avif", "webp", "jxl-e9", "jxl-e10", "kolmo"]
+ORDER = ["zip", "rar", "7z", "xz", "qoi", "png-oxipng", "png-zopfli", "flif", "avif", "webp", "jxl-e9", "jxl-e10", "komla"]
 CATEGORIES = ["photo_kodak", "photo_div2k", "screenshot", "graphics"]
 
 
@@ -57,7 +57,7 @@ def run(cmd, **kw):
 
 
 def pixhash(path):
-    out, _ = run([KOLMO, "pixhash", path])
+    out, _ = run([KOMLA, "pixhash", path])
     return out.split()[0].decode()
 
 
@@ -155,7 +155,7 @@ def main():
     results = load(rpath)
     meta = {}
     for img, c in imgs:
-        out, _ = run([KOLMO, "pixhash", img])
+        out, _ = run([KOMLA, "pixhash", img])
         h, dims = out.split()[:2]
         w, rest = dims.decode().split("x", 1)
         hh = rest.split("x")[0]

@@ -25,14 +25,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release -p kolmo-cli --target ${{ matrix.target }}
+      - run: cargo build --release -p komla-cli --target ${{ matrix.target }}
       - name: Package
         run: |
           mkdir dist
-          tar -C target/${{ matrix.target }}/release -czf dist/kolmo-${{ matrix.target }}.tar.gz kolmo
+          tar -C target/${{ matrix.target }}/release -czf dist/komla-${{ matrix.target }}.tar.gz komla
       - uses: actions/upload-artifact@v7
         with:
-          name: kolmo-${{ matrix.target }}
+          name: komla-${{ matrix.target }}
           path: dist/*.tar.gz
       - if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3

@@ -1,7 +1,7 @@
-//! Kolmo: lossless image compression by context mixing.
+//! Komla: lossless image compression by context mixing.
 //!
 //! File layout (multi-byte integers little-endian):
-//!   fixed header:  "KLMO" | version | layout | varint width | varint height | reductions | mode | crc32
+//!   fixed header:  "KMLA" | version | layout | varint width | varint height | reductions | mode | crc32
 //!                  [palette mode: varint length | arithmetic-coded palette]
 //!   stripe table:  varint stripe count | varint byte length of every stripe but the last
 //!   stripes:       independently coded horizontal bands (decodable in parallel)
@@ -21,7 +21,7 @@ pub mod wls;
 
 pub use io::SourceFormat;
 
-pub const MAGIC: &[u8; 4] = b"KLMO";
+pub const MAGIC: &[u8; 4] = b"KMLA";
 pub const VERSION: u8 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,7 +242,7 @@ fn choose_modes(img: &Image) -> Vec<(u8, Option<Vec<u64>>)> {
     if colors.len() <= PALETTE_MAX && (colors.len() <= 256 || single_stripe) {
         sort_palette(&mut colors, nc);
         let pal = (MODE_PALETTE, Some(colors));
-        return match std::env::var("KOLMO_MODE").as_deref() {
+        return match std::env::var("KOMLA_MODE").as_deref() {
             Ok("ct") => vec![ct],
             Ok("pal") => vec![pal],
             _ if pal.1.as_ref().is_some_and(|c| c.len() <= 256) => vec![pal],
@@ -365,10 +365,10 @@ pub fn prepare(img: &Image, src: SourceFormat) -> Result<Prepared, String> {
 /// Parses the fixed header. Returns the stream description and the header length.
 pub fn parse_header(b: &[u8]) -> Result<(StreamInfo, usize), String> {
     if b.len() < 6 || &b[..4] != MAGIC {
-        return Err("not a Kolmo file".into());
+        return Err("not a Komla file".into());
     }
     if b[4] != VERSION {
-        return Err(format!("unsupported Kolmo version {}", b[4]));
+        return Err(format!("unsupported Komla version {}", b[4]));
     }
     let layout = b[5];
     let mut pos = 6;
@@ -620,7 +620,7 @@ pub fn finish(info: &StreamInfo, coded: Vec<u16>) -> Result<Image, String> {
     let img = Image { width: info.width, height: info.height, channels: info.coded_channels, depth: info.depth, data: coded };
     let img = expand(img, info.reductions, info.channels, info.alpha_value);
     if crc32(&img.sample_bytes()) != info.crc {
-        return Err("checksum mismatch: the .kolmo file is damaged or incomplete".into());
+        return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
     }
     Ok(img)
 }

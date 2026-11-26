@@ -1,6 +1,6 @@
-# Kolmo — lossless image compression by context mixing
+# Komla — lossless image compression by context mixing
 
-Kolmo turns a PNG or BMP into a `.kolmo` file that decodes back to exactly the same pixels,
+Komla turns a PNG or BMP into a `.komla` file that decodes back to exactly the same pixels,
 bit for bit, and is smaller than every standard lossless format we compared against:
 **6.4% smaller than JPEG XL at its slowest setting (`-e 10`), 15.7% smaller than lossless
 WebP and 34.8% smaller than optimized PNG** on the held-out test set below (photos,
@@ -18,7 +18,7 @@ Bits per pixel on the test set (lower is better). The test images were never use
 the final codec was run on them once. Every output was decoded again and compared with the
 original pixels by SHA-256 (archives: byte comparison).
 
-| Codec | Kodak photos<br>24 images, 9.4 MP | DIV2K photos<br>10 images, 28.0 MP | Screenshots<br>12 images, 9.3 MP | Charts, diagrams, maps<br>12 images, 10.7 MP | **Total**<br>57.4 MP | Kolmo is smaller by |
+| Codec | Kodak photos<br>24 images, 9.4 MP | DIV2K photos<br>10 images, 28.0 MP | Screenshots<br>12 images, 9.3 MP | Charts, diagrams, maps<br>12 images, 10.7 MP | **Total**<br>57.4 MP | Komla is smaller by |
 |---|---|---|---|---|---|---|
 | ZIP -9 (of BMP) | 15.0152 | 19.8078 | 2.4528 | 0.5515 | 12.6254 | 56.5% |
 | RAR -m5 (of BMP) | 15.2376 | 14.9942 | 2.0440 | 0.4764 | 10.2351 | 46.3% |
@@ -32,12 +32,12 @@ original pixels by SHA-256 (archives: byte comparison).
 | WebP lossless | 9.4978 | 9.7087 | 1.0925 | 0.2547 | 6.5193 | 15.7% |
 | JPEG XL e9 | 8.4851 | 8.9105 | 1.3363 | 0.3353 | 6.0180 | 8.7% |
 | JPEG XL e10 | 8.4393 | 8.7340 | 1.1125 | 0.2501 | 5.8723 | 6.4% |
-| **Kolmo** | **7.9843** | **8.2389** | **0.8325** | **0.1669** | **5.4954** | — |
+| **Komla** | **7.9843** | **8.2389** | **0.8325** | **0.1669** | **5.4954** | — |
 
 | | Kodak | DIV2K | Screenshots | Graphics | Total |
 |---|---|---|---|---|---|
 | Best standard format | JPEG XL e10 | JPEG XL e10 | WebP lossless | JPEG XL e10 | JPEG XL e10 |
-| Kolmo versus it | 5.4% smaller | 5.7% smaller | 23.8% smaller | 33.3% smaller | **6.4% smaller** |
+| Komla versus it | 5.4% smaller | 5.7% smaller | 23.8% smaller | 33.3% smaller | **6.4% smaller** |
 
 So the "at least 1% better than the best standard format" target holds on the total and in
 every category. On the development set (used for tuning) the margins are similar: 5.0% below
@@ -61,7 +61,7 @@ get when you zip a BMP; zipping a PNG barely changes its size). Image formats st
 | WebP | libwebp 1.6.0: `cwebp -lossless -z 9 -exact` |
 | JPEG XL | libjxl 0.13.0: `cjxl -d 0 -e 9` and `cjxl -d 0 -e 10` |
 
-**Speed.** Kolmo is a symmetric context-mixing coder: it encodes and decodes at about
+**Speed.** Komla is a symmetric context-mixing coder: it encodes and decodes at about
 0.14 megapixels per second per core on this machine (an 8-core Xeon), similar to `cwebp -z 9`,
 2 to 3.5 times faster than `cjxl -e 10` and `avifenc -s 0` at encoding, but decoding is just as
 slow, far slower than every other format here. Images above 4 megapixels are split into
@@ -77,19 +77,19 @@ in the browser on 8 cores (measured in headless Chrome while other jobs were run
   0.25–4 megapixels in a few screenshot and graphics categories, sorted by the file's SHA-1;
   even positions go to the test set, odd positions to the dev set. One file whose title names a
   commercial product is excluded by its SHA-1.
-- All images are 8-bit RGB or RGBA (several graphics have alpha). Kolmo also supports 8- and
+- All images are 8-bit RGB or RGBA (several graphics have alpha). Komla also supports 8- and
   16-bit grayscale, gray+alpha, RGB and RGBA; 16-bit images are not part of this benchmark
-  (WebP cannot store them losslessly); on small 16-bit tests Kolmo was on par with JPEG XL.
+  (WebP cannot store them losslessly); on small 16-bit tests Komla was on par with JPEG XL.
 
 ## Using it
 
 ### Web app
 
-Drop PNG or BMP files on the page. Each file is compressed, then the `.kolmo` file is decoded
+Drop PNG or BMP files on the page. Each file is compressed, then the `.komla` file is decoded
 again in the browser and its pixels are compared with the original by SHA-256 before it is
 offered as verified. The page also shows the size of the original file, ZIP -9 of the same
 pixels, and (one click) lossless WebP and JPEG XL computed in your browser with WebAssembly
-builds of libwebp and libjxl. Drop a `.kolmo` file to get a PNG with the exact original pixels;
+builds of libwebp and libjxl. Drop a `.komla` file to get a PNG with the exact original pixels;
 "Check against original…" compares it with the file you started from.
 
 Run locally:
@@ -107,15 +107,15 @@ npm run build    # static site in web/dist (relative paths, works from any sub-p
 ### Command line
 
 ```bash
-cargo install --path cli          # or: cargo build --release  (binary in target/release/kolmo)
+cargo install --path cli          # or: cargo build --release  (binary in target/release/komla)
 
-kolmo compress photo.png          # writes photo.png.kolmo
-kolmo compress scan.bmp -o scan.kolmo
-kolmo decompress photo.png.kolmo  # restores photo.png (BMP sources restore to .bmp)
-kolmo decompress scan.kolmo -o scan.png
-kolmo info photo.png.kolmo        # mode, stripes, checksum, bits per pixel
-kolmo bench *.png                 # compress, decompress and verify, with timings
-kolmo pixhash a.png b.png         # SHA-256 of the pixels, independent of the file format
+komla compress photo.png          # writes photo.png.komla
+komla compress scan.bmp -o scan.komla
+komla decompress photo.png.komla  # restores photo.png (BMP sources restore to .bmp)
+komla decompress scan.komla -o scan.png
+komla info photo.png.komla        # mode, stripes, checksum, bits per pixel
+komla bench *.png                 # compress, decompress and verify, with timings
+komla pixhash a.png b.png         # SHA-256 of the pixels, independent of the file format
 ```
 
 Decompression always checks the CRC-32 of the pixels stored in the file and fails loudly on any
@@ -129,7 +129,7 @@ profile, gamma), animation frames after the first, and the original PNG/BMP byte
 
 ## How it works
 
-Kolmo predicts every sample from the pixels already coded and codes the prediction error with
+Komla predicts every sample from the pixels already coded and codes the prediction error with
 a binary arithmetic coder whose probabilities come from mixing many adaptive models.
 Everything the decoder needs is recomputed from already decoded pixels, so the file contains
 only the arithmetic-coded decisions plus a small header.
@@ -202,7 +202,7 @@ only used above 4 megapixels.
 
 **Headroom.** paq8px (`-8`), a general context-mixing compressor that is roughly 65 times
 slower, is still 4.8% smaller on 768×512 crops of the development photos and 34% smaller on the
-development screenshots and graphics. Kolmo trades that last bit of compression for being
+development screenshots and graphics. Komla trades that last bit of compression for being
 practical in a browser.
 
 ## Reproducing the benchmark
@@ -210,13 +210,13 @@ practical in a browser.
 ```bash
 bench/install-baselines.sh          # downloads/builds the exact baseline encoders into bench/.tools
 python3 bench/fetch_datasets.py     # downloads and hash-checks all images into bench/data
-cargo build --release -p kolmo-cli
+cargo build --release -p komla-cli
 python3 bench/run_benchmark.py --set test   # every codec, every image, with lossless checks
 python3 bench/run_benchmark.py --set dev
 python3 bench/make_report.py        # writes bench/results/REPORT.md and the site's table
 ```
 
-`run_benchmark.py` caches results in `bench/results/<set>.jsonl`; `--force kolmo` re-runs one
+`run_benchmark.py` caches results in `bench/results/<set>.jsonl`; `--force komla` re-runs one
 codec. Tests: `cargo test --release` (round trips, corrupt input), `node tests/cross_target.mjs`
 (native and WebAssembly give identical files), `python3 tests/make_edge_cases.py` (1×1 images,
 16-bit, palettes with transparency, interlaced PNG, BMP variants).
@@ -238,7 +238,7 @@ headers (it does not use SharedArrayBuffer); parallelism comes from one Web Work
 
 ```
 codec/   the codec library (Rust): models, range coder, container, PNG/BMP I/O
-cli/     the kolmo command-line tool
+cli/     the komla command-line tool
 wasm/    C-ABI WebAssembly bindings used by the web app
 web/     Vite + React + Tailwind + shadcn/ui app (workers in web/src/workers)
 bench/   baseline installer, dataset manifests and fetcher, benchmark runner, results

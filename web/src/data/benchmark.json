@@ -115,8 +115,8 @@
    }
   },
   {
-   "id": "kolmo",
-   "label": "Kolmo",
+   "id": "komla",
+   "label": "Komla",
    "bpp": {
     "photo_kodak": 7.9843,
     "photo_div2k": 8.2389,
@@ -124,12 +124,12 @@
     "graphics": 0.1669,
     "total": 5.4954
    },
-   "kolmo": true
+   "komla": true
   }
  ],
  "notes": [
   "Test set: the 24 Kodak images, DIV2K validation images 0801-0810, and 24 screenshots and graphics selected deterministically from Wikimedia Commons; a disjoint development set was used for tuning.",
   "ZIP and xz compress an uncompressed BMP of the same pixels. Baselines: libjxl 0.13.0, libwebp 1.6.0, libavif 1.4.2 (aom 3.14.1), FLIF 0.4, zopflipng 1.0.3, Info-ZIP 3.0, XZ Utils 5.4.5. RAR, 7-Zip, QOI and oxipng results are in the README.",
-  "Kolmo decodes at about the same speed as it encodes (roughly 0.15 megapixels per second per core), much slower than the other image formats."
+  "Komla decodes at about the same speed as it encodes (roughly 0.15 megapixels per second per core), much slower than the other image formats."
  ]
 }

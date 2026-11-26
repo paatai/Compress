@@ -20,7 +20,7 @@ CODECS = [
     ("webp", "WebP lossless", "libwebp 1.6.0: cwebp -lossless -z 9 -exact"),
     ("jxl-e9", "JPEG XL e9", "libjxl 0.13.0: cjxl -d 0 -e 9"),
     ("jxl-e10", "JPEG XL e10", "libjxl 0.13.0: cjxl -d 0 -e 10"),
-    ("kolmo", "Kolmo", "this repository"),
+    ("komla", "Komla", "this repository"),
 ]
 CATS = {
     "photo_kodak": "Kodak photos",
@@ -58,12 +58,12 @@ def summarize(rows):
 
 def md_table(name, rows):
     cats, table, info, total_px = summarize(rows)
-    k = table["kolmo"]
+    k = table["komla"]
     out = []
-    head = "| Codec | " + " | ".join(f"{CATS[c]}<br>{info[c][0]} images, {info[c][1] / 1e6:.1f} MP" for c in cats) + f" | **Total**<br>{total_px / 1e6:.1f} MP | Total bytes | Kolmo is smaller by |"
+    head = "| Codec | " + " | ".join(f"{CATS[c]}<br>{info[c][0]} images, {info[c][1] / 1e6:.1f} MP" for c in cats) + f" | **Total**<br>{total_px / 1e6:.1f} MP | Total bytes | Komla is smaller by |"
     out.append(head)
     out.append("|" + "---|" * (len(cats) + 4))
-    best = {c: min(v[c] for cid, v in table.items() if cid != "kolmo") for c in cats + ["total"]}
+    best = {c: min(v[c] for cid, v in table.items() if cid != "komla") for c in cats + ["total"]}
     for cid, label, _ in CODECS:
         if cid not in table:
             continue
@@ -71,16 +71,16 @@ def md_table(name, rows):
         cells = []
         for c in cats + ["total"]:
             s = f"{v[c]:.4f}"
-            if cid == "kolmo" or v[c] == best[c]:
+            if cid == "komla" or v[c] == best[c]:
                 s = f"**{s}**"
             cells.append(s)
-        saving = "—" if cid == "kolmo" else f"{(1 - k['bytes'] / v['bytes']) * 100:.1f}%"
-        out.append(f"| {'**' + label + '**' if cid == 'kolmo' else label} | " + " | ".join(cells) + f" | {v['bytes']:,} | {saving} |")
+        saving = "—" if cid == "komla" else f"{(1 - k['bytes'] / v['bytes']) * 100:.1f}%"
+        out.append(f"| {'**' + label + '**' if cid == 'komla' else label} | " + " | ".join(cells) + f" | {v['bytes']:,} | {saving} |")
     out.append("")
     out.append("| | " + " | ".join(CATS[c] for c in cats) + " | Total |")
     out.append("|" + "---|" * (len(cats) + 2))
-    out.append("| Best other format | " + " | ".join(next(l for cid, l, _ in CODECS if cid != "kolmo" and cid in table and table[cid][c] == best[c]) for c in cats + ["total"]) + " |")
-    out.append("| Kolmo vs that format | " + " | ".join(f"{(1 - k[c] / best[c]) * 100:.1f}% smaller" for c in cats + ["total"]) + " |")
+    out.append("| Best other format | " + " | ".join(next(l for cid, l, _ in CODECS if cid != "komla" and cid in table and table[cid][c] == best[c]) for c in cats + ["total"]) + " |")
+    out.append("| Komla vs that format | " + " | ".join(f"{(1 - k[c] / best[c]) * 100:.1f}% smaller" for c in cats + ["total"]) + " |")
     return "\n".join(out), cats, table, info, total_px
 
 
@@ -109,14 +109,14 @@ def main():
         data = {
             "categories": [{"id": c, "label": CATS[c], "images": info[c][0], "megapixels": info[c][1] / 1e6} for c in cats],
             "codecs": [
-                {"id": cid, "label": label, "bpp": {c: round(table[cid][c], 4) for c in cats + ["total"]}, **({"kolmo": True} if cid == "kolmo" else {})}
+                {"id": cid, "label": label, "bpp": {c: round(table[cid][c], 4) for c in cats + ["total"]}, **({"komla": True} if cid == "komla" else {})}
                 for cid, label, _ in CODECS
                 if cid in table and cid not in ("rar", "7z", "qoi", "png-oxipng")
             ],
             "notes": [
                 "Test set: the 24 Kodak images, DIV2K validation images 0801-0810, and 24 screenshots and graphics selected deterministically from Wikimedia Commons; a disjoint development set was used for tuning.",
                 "ZIP and xz compress an uncompressed BMP of the same pixels. Baselines: libjxl 0.13.0, libwebp 1.6.0, libavif 1.4.2 (aom 3.14.1), FLIF 0.4, zopflipng 1.0.3, Info-ZIP 3.0, XZ Utils 5.4.5. RAR, 7-Zip, QOI and oxipng results are in the README.",
-                "Kolmo decodes at about the same speed as it encodes (roughly 0.15 megapixels per second per core), much slower than the other image formats.",
+                "Komla decodes at about the same speed as it encodes (roughly 0.15 megapixels per second per core), much slower than the other image formats.",
             ],
         }
         with open(os.path.join(ROOT, "web", "src", "data", "benchmark.json"), "w") as f:

@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react'
 import { jxlSize, toRgba, webpSize, zipSize } from '@/lib/baselines'
-import { compress, decompress, readImage, sha256 } from '@/lib/kolmo'
+import { compress, decompress, readImage, sha256 } from '@/lib/komla'
 import type { ImageInfo } from '@/lib/protocol'
 
 export type Measure = { state: 'idle' } | { state: 'running' } | { state: 'done'; bytes: number; note?: string } | { state: 'error'; message: string }
@@ -11,7 +11,7 @@ export interface Job {
   name: string
   inputBytes: number
   previewUrl?: string
-  /** 'verifying': the .kolmo file is ready; the round-trip check is still running */
+  /** 'verifying': the .komla file is ready; the round-trip check is still running */
   status: 'running' | 'verifying' | 'done' | 'error'
   stage: string
   fraction: number
@@ -20,7 +20,7 @@ export interface Job {
   stripes?: number
   seconds?: number
   verifySeconds?: number
-  kolmo?: Uint8Array
+  komla?: Uint8Array
   png?: Uint8Array
   originalHash?: string
   decodedHash?: string
@@ -51,7 +51,7 @@ export function useJobs() {
         update(id, {
           status: 'verifying',
           info: res.info,
-          kolmo: res.kolmo,
+          komla: res.komla,
           stripes: res.stripes,
           seconds: res.seconds,
           originalHash,
@@ -66,7 +66,7 @@ export function useJobs() {
             .then((bytes) => update(id, { zip: { state: 'done', bytes } }))
             .catch((e: Error) => update(id, { zip: { state: 'error', message: e.message } }))
         }
-        const dec = await decompress(res.kolmo, false, (p) => update(id, { stage: 'Verifying round trip', fraction: p.fraction }), 'Verifying round trip')
+        const dec = await decompress(res.komla, false, (p) => update(id, { stage: 'Verifying round trip', fraction: p.fraction }), 'Verifying round trip')
         const decodedHash = await sha256(dec.samples)
         update(id, {
           status: 'done',
@@ -96,7 +96,7 @@ export function useJobs() {
           fraction: 1,
           info: res.info,
           png: res.png,
-          kolmo: bytes,
+          komla: bytes,
           stripes: res.stripes,
           seconds: res.seconds,
           decodedHash,
@@ -116,15 +116,15 @@ export function useJobs() {
       const created: Job[] = []
       for (const file of list) {
         const id = nextId.current++
-        const isKolmo = /\.kolmo$/i.test(file.name)
+        const isKomla = /\.komla$/i.test(file.name)
         const job: Job = {
           id,
-          kind: isKolmo ? 'decompress' : 'compress',
+          kind: isKomla ? 'decompress' : 'compress',
           name: file.name,
           inputBytes: file.size,
-          previewUrl: isKolmo ? undefined : URL.createObjectURL(file),
+          previewUrl: isKomla ? undefined : URL.createObjectURL(file),
           status: 'running',
-          stage: isKolmo ? 'Decompressing' : 'Reading image',
+          stage: isKomla ? 'Decompressing' : 'Reading image',
           fraction: 0,
           zip: { state: 'idle' },
           webp: { state: 'idle' },

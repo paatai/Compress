@@ -11,7 +11,7 @@ interface Codec {
   id: string
   label: string
   bpp: Record<string, number>
-  kolmo?: boolean
+  komla?: boolean
 }
 interface BenchData {
   categories: Category[]
@@ -25,14 +25,14 @@ export function Benchmark() {
   if (!bench.codecs.length) return null
   const cols = [...bench.categories.map((c) => c.id), 'total']
   const best: Record<string, number> = {}
-  for (const c of cols) best[c] = Math.min(...bench.codecs.filter((x) => !x.kolmo && x.bpp[c] !== undefined).map((x) => x.bpp[c]))
-  const kolmo = bench.codecs.find((c) => c.kolmo)
+  for (const c of cols) best[c] = Math.min(...bench.codecs.filter((x) => !x.komla && x.bpp[c] !== undefined).map((x) => x.bpp[c]))
+  const komla = bench.codecs.find((c) => c.komla)
   return (
     <section id="benchmark" className="scroll-mt-20 space-y-6">
       <div className="space-y-2">
         <h2 className="text-2xl font-semibold tracking-tight">Benchmark</h2>
         <p className="max-w-3xl text-muted-foreground">
-          Bits per pixel on a public test set (lower is better). Every result was decoded again and hash-checked against the original pixels. Kolmo was tuned
+          Bits per pixel on a public test set (lower is better). Every result was decoded again and hash-checked against the original pixels. Komla was tuned
           only on a separate set of images.
         </p>
       </div>
@@ -54,12 +54,12 @@ export function Benchmark() {
           </thead>
           <tbody>
             {bench.codecs.map((codec) => (
-              <tr key={codec.id} className={cn('border-t', codec.kolmo && 'bg-emerald-500/5 font-semibold')}>
+              <tr key={codec.id} className={cn('border-t', codec.komla && 'bg-emerald-500/5 font-semibold')}>
                 <td className="px-4 py-2.5">{codec.label}</td>
                 {cols.map((c) => {
                   const v = codec.bpp[c]
                   return (
-                    <td key={c} className={cn('px-4 py-2.5 text-right tabular-nums', !codec.kolmo && v === best[c] && 'font-semibold')}>
+                    <td key={c} className={cn('px-4 py-2.5 text-right tabular-nums', !codec.komla && v === best[c] && 'font-semibold')}>
                       {v === undefined ? '—' : v.toFixed(3)}
                     </td>
                   )
@@ -67,13 +67,13 @@ export function Benchmark() {
               </tr>
             ))}
           </tbody>
-          {kolmo && (
+          {komla && (
             <tfoot>
               <tr className="border-t bg-muted/30 text-xs text-muted-foreground">
-                <td className="px-4 py-2.5">Kolmo vs best other</td>
+                <td className="px-4 py-2.5">Komla vs best other</td>
                 {cols.map((c) => (
                   <td key={c} className="px-4 py-2.5 text-right tabular-nums">
-                    {kolmo.bpp[c] !== undefined ? `${((1 - kolmo.bpp[c] / best[c]) * 100).toFixed(1)}% smaller` : '—'}
+                    {komla.bpp[c] !== undefined ? `${((1 - komla.bpp[c] / best[c]) * 100).toFixed(1)}% smaller` : '—'}
                   </td>
                 ))}
               </tr>

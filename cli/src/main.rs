@@ -1,20 +1,20 @@
-use kolmo::{ct::Tuning, io, Options};
+use komla::{ct::Tuning, io, Options};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
 const USAGE: &str = "\
-Kolmo - lossless image compression by context mixing
+Komla - lossless image compression by context mixing
 
 USAGE:
-  kolmo compress   <input.png|input.bmp> [-o output.kolmo]
-  kolmo decompress <input.kolmo> [-o output.png|output.bmp]
-  kolmo info       <input.kolmo>
-  kolmo bench      [-j threads] [--no-verify] <images...>
-  kolmo pixhash    <images...>   (SHA-256 of pixels normalised to RGBA)
+  komla compress   <input.png|input.bmp> [-o output.komla]
+  komla decompress <input.komla> [-o output.png|output.bmp]
+  komla info       <input.komla>
+  komla bench      [-j threads] [--no-verify] <images...>
+  komla pixhash    <images...>   (SHA-256 of pixels normalised to RGBA)
 
-compress writes <input>.kolmo by default; decompress restores the original
+compress writes <input>.komla by default; decompress restores the original
 file type (PNG or BMP) unless -o names another extension. Decompression checks
 the embedded CRC-32 of the pixels and fails loudly on any mismatch.";
 
@@ -31,7 +31,7 @@ fn main() {
         "bench" => cmd_bench(&args[1..]),
         "pixhash" => cmd_pixhash(&args[1..]),
         "--version" | "-V" => {
-            println!("kolmo {}", env!("CARGO_PKG_VERSION"));
+            println!("komla {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
@@ -44,9 +44,9 @@ fn main() {
 
 fn options() -> Options {
     let mut t = Tuning::default();
-    if let Ok(s) = std::env::var("KOLMO_TUNE") {
+    if let Ok(s) = std::env::var("KOMLA_TUNE") {
         for kv in s.split(',').filter(|s| !s.is_empty()) {
-            let (k, v) = kv.split_once('=').expect("KOLMO_TUNE expects key=value pairs");
+            let (k, v) = kv.split_once('=').expect("KOMLA_TUNE expects key=value pairs");
             let f: f64 = v.parse().expect("numeric tuning value");
             match k {
                 "mixer_lr" => t.mixer_lr = f as i32,
@@ -96,11 +96,11 @@ fn cmd_compress(args: &[String]) -> Result<(), String> {
     let bytes = read(&input)?;
     let (img, src) = io::read_image(&bytes)?;
     let t0 = Instant::now();
-    let out = kolmo::compress(&img, src, &options(), &mut |_| {})?;
+    let out = komla::compress(&img, src, &options(), &mut |_| {})?;
     let dt = t0.elapsed().as_secs_f64();
     let output = output.unwrap_or_else(|| {
         let mut s = input.as_os_str().to_owned();
-        s.push(".kolmo");
+        s.push(".komla");
         PathBuf::from(s)
     });
     std::fs::write(&output, &out).map_err(|e| format!("{}: {e}", output.display()))?;
@@ -125,11 +125,11 @@ fn cmd_decompress(args: &[String]) -> Result<(), String> {
     let (input, output) = split_out(args)?;
     let bytes = read(&input)?;
     let t0 = Instant::now();
-    let (img, src) = kolmo::decompress(&bytes, &options(), &mut |_| {})?;
+    let (img, src) = komla::decompress(&bytes, &options(), &mut |_| {})?;
     let dt = t0.elapsed().as_secs_f64();
     let output = output.unwrap_or_else(|| {
         let stem = input.to_string_lossy();
-        let stem = stem.strip_suffix(".kolmo").map(str::to_string).unwrap_or_else(|| {
+        let stem = stem.strip_suffix(".komla").map(str::to_string).unwrap_or_else(|| {
             format!("{}.{}", stem, if src == io::SourceFormat::Bmp { "bmp" } else { "png" })
         });
         PathBuf::from(stem)
@@ -153,19 +153,19 @@ fn cmd_decompress(args: &[String]) -> Result<(), String> {
 fn cmd_info(args: &[String]) -> Result<(), String> {
     let (input, _) = split_out(args)?;
     let bytes = read(&input)?;
-    let (h, hl) = kolmo::parse_header(&bytes)?;
-    let stripes = kolmo::split_stripes(&bytes, &h, hl)?;
-    let mode = if h.mode & kolmo::MODE_PALETTE != 0 {
+    let (h, hl) = komla::parse_header(&bytes)?;
+    let stripes = komla::split_stripes(&bytes, &h, hl)?;
+    let mode = if h.mode & komla::MODE_PALETTE != 0 {
         format!("palette ({} colours)", h.palette.as_ref().map_or(0, |p| p.len()))
-    } else if h.mode & kolmo::MODE_PIXFLAGS != 0 {
+    } else if h.mode & komla::MODE_PIXFLAGS != 0 {
         "continuous tone + pixel flags".to_string()
     } else {
         "continuous tone".to_string()
     };
     println!(
-        "{}: Kolmo v{} {} x {} x {}ch {}-bit (coded as {}ch), source {:?}, {mode}, {} stripe(s), crc32 {:08x}, {} bytes ({:.3} bpp)",
+        "{}: Komla v{} {} x {} x {}ch {}-bit (coded as {}ch), source {:?}, {mode}, {} stripe(s), crc32 {:08x}, {} bytes ({:.3} bpp)",
         input.display(),
-        kolmo::VERSION,
+        komla::VERSION,
         h.width,
         h.height,
         h.channels,
@@ -182,7 +182,7 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
 
 /// SHA-256 of the pixels expanded to RGBA at the image's bit depth, so that files with
 /// different colour types (palette, gray, RGB) but identical pixels hash the same.
-fn canonical_hash(img: &kolmo::Image) -> String {
+fn canonical_hash(img: &komla::Image) -> String {
     use sha2::{Digest, Sha256};
     let nc = img.channels as usize;
     let maxv = img.maxv();
@@ -211,8 +211,8 @@ fn canonical_hash(img: &kolmo::Image) -> String {
 fn cmd_pixhash(args: &[String]) -> Result<(), String> {
     for a in args {
         let bytes = read(Path::new(a))?;
-        let img = if bytes.starts_with(kolmo::MAGIC) {
-            kolmo::decompress(&bytes, &options(), &mut |_| {})?.0
+        let img = if bytes.starts_with(komla::MAGIC) {
+            komla::decompress(&bytes, &options(), &mut |_| {})?.0
         } else {
             io::read_image(&bytes)?.0
         };
@@ -265,11 +265,11 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
                     let bytes = read(f)?;
                     let (img, src) = io::read_image(&bytes)?;
                     let t0 = Instant::now();
-                    let c = kolmo::compress(&img, src, &opts, &mut |_| {})?;
+                    let c = komla::compress(&img, src, &opts, &mut |_| {})?;
                     let enc_s = t0.elapsed().as_secs_f64();
                     let (dec_s, ok) = if verify {
                         let t1 = Instant::now();
-                        let d = kolmo::decompress(&c, &opts, &mut |_| {});
+                        let d = komla::decompress(&c, &opts, &mut |_| {});
                         let dec_s = t1.elapsed().as_secs_f64();
                         (dec_s, Some(matches!(d, Ok((ref di, _)) if *di == img)))
                     } else {

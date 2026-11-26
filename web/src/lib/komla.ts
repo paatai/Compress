@@ -20,7 +20,7 @@ class Pool {
   }
 
   private spawn(): Worker {
-    const w = new Worker(new URL('../workers/kolmo.worker.ts', import.meta.url), { type: 'module' })
+    const w = new Worker(new URL('../workers/komla.worker.ts', import.meta.url), { type: 'module' })
     w.onmessage = (ev) => {
       const msg = ev.data as { id: number; type: string; fraction?: number; result?: unknown; message?: string }
       const entry = this.pending.get(msg.id)
@@ -122,7 +122,7 @@ export async function sha256(data: Uint8Array): Promise<string> {
 }
 
 export interface CompressResult {
-  kolmo: Uint8Array
+  komla: Uint8Array
   info: ImageInfo
   stripes: number
   samples: Uint8Array
@@ -149,17 +149,17 @@ export async function compress(file: ArrayBuffer, onProgress: (p: Progress) => v
       return pool.run<Uint8Array>({ op: 'encodeStripe', header: c.header, rows, height: y1 - y0 }, [rows.buffer], progress(k))
     }),
   )
-  let best: { kolmo: Uint8Array; ci: number } | null = null
+  let best: { komla: Uint8Array; ci: number } | null = null
   candidates.forEach((c, ci) => {
-    const kolmo = assemble(
+    const komla = assemble(
       c.header,
       jobs.flatMap((j, k) => (j.ci === ci ? [streams[k]] : [])),
     )
-    if (!best || kolmo.length < best.kolmo.length) best = { kolmo, ci }
+    if (!best || komla.length < best.komla.length) best = { komla, ci }
   })
   const chosen = best!
   const cand = candidates[chosen.ci]
-  return { kolmo: chosen.kolmo, info: cand.info, stripes: cand.stripes.length, samples: prep.samples, seconds: (performance.now() - t0) / 1000 }
+  return { komla: chosen.komla, info: cand.info, stripes: cand.stripes.length, samples: prep.samples, seconds: (performance.now() - t0) / 1000 }
 }
 
 export interface DecompressResult {
@@ -170,15 +170,15 @@ export interface DecompressResult {
   seconds: number
 }
 
-export async function decompress(kolmo: Uint8Array, wantPng: boolean, onProgress: (p: Progress) => void, stage = 'Decompressing'): Promise<DecompressResult> {
+export async function decompress(komla: Uint8Array, wantPng: boolean, onProgress: (p: Progress) => void, stage = 'Decompressing'): Promise<DecompressResult> {
   const t0 = performance.now()
-  const parsed = await pool.run<ParsedFile>({ op: 'parse', file: kolmo })
-  const header = kolmo.slice(0, parsed.headerLen)
+  const parsed = await pool.run<ParsedFile>({ op: 'parse', file: komla })
+  const header = komla.slice(0, parsed.headerLen)
   const rows = parsed.stripes.map((s) => [s.y0, s.y1] as [number, number])
   const progress = stripeProgress(rows, stage, onProgress)
   const parts = await Promise.all(
     parsed.stripes.map((s, k) => {
-      const data = kolmo.slice(s.offset, s.offset + s.length)
+      const data = komla.slice(s.offset, s.offset + s.length)
       return pool.run<Uint8Array>({ op: 'decodeStripe', header, data, height: s.y1 - s.y0 }, [data.buffer], progress(k))
     }),
   )

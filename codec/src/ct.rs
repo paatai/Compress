@@ -344,7 +344,7 @@ impl CtModel {
             nexp: 0,
             side: 0,
             tune,
-            stats: if std::env::var_os("KOLMO_STATS").is_some() { Some(Box::default()) } else { None },
+            stats: if std::env::var_os("KOMLA_STATS").is_some() { Some(Box::default()) } else { None },
         }
     }
 

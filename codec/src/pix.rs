@@ -81,7 +81,7 @@ impl PixModel {
             cands: [(NONE, 0); NCAND],
             ncand: 0,
             flags_off: !flags,
-            stats: std::env::var_os("KOLMO_STATS").is_some(),
+            stats: std::env::var_os("KOMLA_STATS").is_some(),
             cost: 0.0,
             cost_by: [[0.0; 2]; 8],
             cnt_by: [[0; 2]; 8],

@@ -32,7 +32,7 @@ export default function App() {
         <div className="mx-auto flex h-14 max-w-5xl items-center justify-between px-4 sm:px-6">
           <a href="#" className="flex items-center gap-2.5 font-semibold tracking-tight">
             <Logo />
-            Kolmo
+            Komla
           </a>
           <nav className="flex items-center gap-1 text-sm text-muted-foreground sm:gap-4">
             <a className="rounded px-2 py-1 hover:text-foreground" href="#how">
@@ -56,7 +56,7 @@ export default function App() {
           <div className="max-w-3xl space-y-4">
             <h1 className="text-3xl font-semibold tracking-tight text-balance sm:text-5xl">Lossless image compression, smaller than WebP and JPEG XL.</h1>
             <p className="text-lg text-pretty text-muted-foreground">
-              Drop a PNG or BMP and get a <code className="rounded bg-muted px-1 py-0.5 text-base">.kolmo</code> file that decodes back to exactly the same
+              Drop a PNG or BMP and get a <code className="rounded bg-muted px-1 py-0.5 text-base">.komla</code> file that decodes back to exactly the same
               pixels, bit for bit. Everything runs here in your browser; your images never leave your computer.
             </p>
             <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm text-muted-foreground">
@@ -99,11 +99,11 @@ export default function App() {
             <code>
               <span className="text-muted-foreground"># build once (needs Rust from rustup.rs)</span>
               {'\n'}git clone https://github.com/paatai/Compress && cd Compress{'\n'}cargo install --path cli{'\n\n'}
-              kolmo compress photo.png{'           '}
-              <span className="text-muted-foreground"># writes photo.png.kolmo</span>
-              {'\n'}kolmo decompress photo.png.kolmo{'   '}
+              komla compress photo.png{'           '}
+              <span className="text-muted-foreground"># writes photo.png.komla</span>
+              {'\n'}komla decompress photo.png.komla{'   '}
               <span className="text-muted-foreground"># restores photo.png, checks the CRC</span>
-              {'\n'}kolmo info photo.png.kolmo
+              {'\n'}komla info photo.png.komla
             </code>
           </pre>
           <p className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -114,7 +114,7 @@ export default function App() {
 
       <footer className="border-t">
         <div className="mx-auto flex max-w-5xl flex-col gap-2 px-4 py-6 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between sm:px-6">
-          <span>Kolmo 1.0 · lossless image compression by context mixing</span>
+          <span>Komla 1.0 · lossless image compression by context mixing</span>
           <span>Runs locally in WebAssembly. Nothing is uploaded or stored.</span>
         </div>
       </footer>

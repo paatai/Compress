@@ -14,7 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-UA = {"User-Agent": "kolmo-benchmark/1.0 (lossless image compression benchmark)"}
+UA = {"User-Agent": "komla-benchmark/1.0 (lossless image compression benchmark)"}
 GROUPS = {
     "screenshot": ["Category:Screenshots of Linux software", "Category:Screenshots of web browsers"],
     "graphics": ["Category:Charts", "Category:PNG diagrams", "Category:Maps of the world"],

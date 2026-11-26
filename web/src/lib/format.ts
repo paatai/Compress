@@ -30,5 +30,5 @@ export function download(data: Uint8Array, name: string, type: string) {
 }
 
 export function stripExt(name: string): string {
-  return name.replace(/\.(png|bmp|kolmo)$/i, '')
+  return name.replace(/\.(png|bmp|komla)$/i, '')
 }

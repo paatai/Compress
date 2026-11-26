@@ -4,7 +4,7 @@ Bits per pixel (file size in bits divided by the number of pixels; lower is bett
 
 ## Test set (held out: never used for tuning, run once with the final codec)
 
-| Codec | Kodak photos<br>24 images, 9.4 MP | DIV2K photos<br>10 images, 28.0 MP | Screenshots<br>12 images, 9.3 MP | Charts, diagrams, maps<br>12 images, 10.7 MP | **Total**<br>57.4 MP | Total bytes | Kolmo is smaller by |
+| Codec | Kodak photos<br>24 images, 9.4 MP | DIV2K photos<br>10 images, 28.0 MP | Screenshots<br>12 images, 9.3 MP | Charts, diagrams, maps<br>12 images, 10.7 MP | **Total**<br>57.4 MP | Total bytes | Komla is smaller by |
 |---|---|---|---|---|---|---|---|
 | ZIP -9 (of BMP) | 15.0152 | 19.8078 | 2.4528 | 0.5515 | 12.6254 | 90,572,201 | 56.5% |
 | RAR -m5 (of BMP) | 15.2376 | 14.9942 | 2.0440 | 0.4764 | 10.2351 | 73,424,516 | 46.3% |
@@ -18,12 +18,12 @@ Bits per pixel (file size in bits divided by the number of pixels; lower is bett
 | WebP lossless | 9.4978 | 9.7087 | **1.0925** | 0.2547 | 6.5193 | 46,767,932 | 15.7% |
 | JPEG XL e9 | 8.4851 | 8.9105 | 1.3363 | 0.3353 | 6.0180 | 43,171,882 | 8.7% |
 | JPEG XL e10 | **8.4393** | **8.7340** | 1.1125 | **0.2501** | **5.8723** | 42,126,828 | 6.4% |
-| **Kolmo** | **7.9843** | **8.2389** | **0.8325** | **0.1669** | **5.4954** | 39,422,797 | — |
+| **Komla** | **7.9843** | **8.2389** | **0.8325** | **0.1669** | **5.4954** | 39,422,797 | — |
 
 | | Kodak photos | DIV2K photos | Screenshots | Charts, diagrams, maps | Total |
 |---|---|---|---|---|---|
 | Best other format | JPEG XL e10 | JPEG XL e10 | WebP lossless | JPEG XL e10 | JPEG XL e10 |
-| Kolmo vs that format | 5.4% smaller | 5.7% smaller | 23.8% smaller | 33.3% smaller | 6.4% smaller |
+| Komla vs that format | 5.4% smaller | 5.7% smaller | 23.8% smaller | 33.3% smaller | 6.4% smaller |
 
 Speed on this set (one image per core, 8 jobs on an 8-core Xeon, single-threaded encoders):
 
@@ -37,11 +37,11 @@ Speed on this set (one image per core, 8 jobs on an 8-core Xeon, single-threaded
 | WebP lossless | 0.145 | 4.65 |
 | JPEG XL e9 | 0.299 | 9.75 |
 | JPEG XL e10 | 0.066 | 8.15 |
-| Kolmo | 0.142 | 0.14 |
+| Komla | 0.142 | 0.14 |
 
 ## Development set (used for tuning)
 
-| Codec | DIV2K photos<br>10 images, 28.8 MP | Screenshots<br>12 images, 6.9 MP | Charts, diagrams, maps<br>12 images, 8.2 MP | **Total**<br>43.9 MP | Total bytes | Kolmo is smaller by |
+| Codec | DIV2K photos<br>10 images, 28.8 MP | Screenshots<br>12 images, 6.9 MP | Charts, diagrams, maps<br>12 images, 8.2 MP | **Total**<br>43.9 MP | Total bytes | Komla is smaller by |
 |---|---|---|---|---|---|---|
 | ZIP -9 (of BMP) | 16.8011 | 0.8293 | 0.5708 | 11.2557 | 61,707,139 | 57.7% |
 | RAR -m5 (of BMP) | 13.3660 | 0.5925 | 0.4324 | 8.9398 | 49,010,445 | 46.8% |
@@ -55,12 +55,12 @@ Speed on this set (one image per core, 8 jobs on an 8-core Xeon, single-threaded
 | WebP lossless | 8.5542 | **0.4330** | **0.2933** | 5.7330 | 31,429,878 | 17.0% |
 | JPEG XL e9 | 7.6717 | 0.6870 | 0.4296 | 5.2195 | 28,614,840 | 8.9% |
 | JPEG XL e10 | **7.4936** | 0.5033 | 0.3454 | **5.0582** | 27,730,571 | 6.0% |
-| **Kolmo** | **7.1174** | **0.3002** | **0.2179** | **4.7557** | 26,072,429 | — |
+| **Komla** | **7.1174** | **0.3002** | **0.2179** | **4.7557** | 26,072,429 | — |
 
 | | DIV2K photos | Screenshots | Charts, diagrams, maps | Total |
 |---|---|---|---|---|
 | Best other format | JPEG XL e10 | WebP lossless | WebP lossless | JPEG XL e10 |
-| Kolmo vs that format | 5.0% smaller | 30.7% smaller | 25.7% smaller | 6.0% smaller |
+| Komla vs that format | 5.0% smaller | 30.7% smaller | 25.7% smaller | 6.0% smaller |
 
 Speed on this set (one image per core, 8 jobs on an 8-core Xeon, single-threaded encoders):
 
@@ -74,7 +74,7 @@ Speed on this set (one image per core, 8 jobs on an 8-core Xeon, single-threaded
 | WebP lossless | 0.187 | 3.43 |
 | JPEG XL e9 | 0.220 | 6.17 |
 | JPEG XL e10 | 0.068 | 8.24 |
-| Kolmo | 0.153 | 0.16 |
+| Komla | 0.153 | 0.16 |
 
 ## Exact tools and flags
 
@@ -92,4 +92,4 @@ Speed on this set (one image per core, 8 jobs on an 8-core Xeon, single-threaded
 | WebP lossless | libwebp 1.6.0: cwebp -lossless -z 9 -exact |
 | JPEG XL e9 | libjxl 0.13.0: cjxl -d 0 -e 9 |
 | JPEG XL e10 | libjxl 0.13.0: cjxl -d 0 -e 10 |
-| Kolmo | this repository |
+| Komla | this repository |

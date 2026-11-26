@@ -3,7 +3,7 @@ bench/.tools/
 bench/out/
 node_modules/
 web/dist/
-web/src/wasm/kolmo.wasm
-*.kolmo
+web/src/wasm/komla.wasm
+*.komla
 .DS_Store
 bench/data/
