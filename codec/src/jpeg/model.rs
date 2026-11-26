@@ -33,7 +33,7 @@ const S_M2: usize = 11;
 const S_M3: usize = 14;
 
 const NCTX: usize = 16;
-const NIN: usize = NCTX + 2;
+const NIN: usize = NCTX + 3;
 
 const PART_INTERIOR: usize = 0;
 const PART_EDGE: usize = 1;
@@ -42,7 +42,7 @@ const DYN_B: usize = 24;
 const DYN_C: usize = 8;
 
 /// Model parameters; KOMLA_JTUNE="i=v,..." overrides them for experiments (both sides must agree).
-const TUNE_DEFAULT: [i32; 16] = [255, 400, 300, 6, 255, 400, 4, 0, 0, 1, 8192, 800, 4000, 0, 0, 0];
+const TUNE_DEFAULT: [i32; 16] = [255, 400, 300, 6, 255, 400, 0, 0, 0, 1, 8192, 800, 4000, 12, 12, -90];
 
 fn tune() -> &'static [i32; 16] {
     static T: std::sync::OnceLock<[i32; 16]> = std::sync::OnceLock::new();
@@ -225,7 +225,7 @@ pub struct Model {
     b: [[i32; 8]; 8],
     tabs: Vec<CtxTable>,
     nzt: Vec<CtxTable>,
-    m: [Mixer; 3],
+    m: [Mixer; 4],
     mf: Mixer,
     apm1: Apm,
     apm2: Apm,
@@ -238,6 +238,14 @@ pub struct Model {
     dyn_base: usize,
     dyn_idx: usize,
     pred8: i32,
+    /// parametric model of the current value: logistic with centre `pmu8` and scale `ps8`
+    /// (1/8 quantization steps); `ps8 == 0` disables it
+    pmu8: i32,
+    ps8: i32,
+    /// stretched probability of the current decision under the parametric model
+    pin: i32,
+    /// running mean of |value| x 64 per (class, position, nonzeros left, neighbour magnitude)
+    emag: Vec<i32>,
     edge_err: Vec<[i32; 6]>,
     dc_err: [[i32; 5]; 2],
     gcfl: [[i64; 4]; 4],
@@ -310,8 +318,13 @@ impl Model {
             b: basis(),
             tabs,
             nzt,
-            m: [Mixer::new(NIN, SLOTS * 8, tu[1], tu[10]), Mixer::new(NIN, SLOTS * 130, tu[1], tu[10]), Mixer::new(NIN, SLOTS * 80, tu[1], tu[10])],
-            mf: Mixer::new(4, SLOTS * 8, tu[2], 22000),
+            m: [
+                Mixer::new(NIN, SLOTS * 8, tu[1], tu[10]),
+                Mixer::new(NIN, SLOTS * 130, tu[1], tu[10]),
+                Mixer::new(NIN, SLOTS * 80, tu[1], tu[10]),
+                Mixer::new(NIN, SLOTS * 3 * 16, tu[1], tu[10]),
+            ],
+            mf: Mixer::new(5, SLOTS * 8, tu[2], 18000),
             apm1: Apm::new(SLOTS * 256, tu[3] as u32, t),
             apm2: Apm::new(SLOTS * 512, tu[3] as u32, t),
             x: [0; NIN],
@@ -323,6 +336,10 @@ impl Model {
             dyn_base: 0,
             dyn_idx: 0,
             pred8: 0,
+            pmu8: 0,
+            ps8: 0,
+            pin: 0,
+            emag: vec![64; 2 * 64 * 12 * 16],
             edge_err: vec![[256; 6]; 3 * 2 * 8],
             dc_err: [[256; 5]; 2],
             gcfl: [[0; 4]; 4],
@@ -372,10 +389,13 @@ impl Model {
         }
         self.x[NCTX] = t.stretch(ctr_p16(self.dyn_t[self.dyn_idx]));
         self.x[NCTX + 1] = 256;
+        self.x[NCTX + 2] = self.pin;
         let d0 = self.m[0].mix(&self.x, self.sel[0] * SLOTS + slot, t);
         let d1 = self.m[1].mix(&self.x, self.sel[1] * SLOTS + slot, t);
         let d2 = self.m[2].mix(&self.x, self.sel[2] * SLOTS + slot, t);
-        let y = [d0, d1, d2, 256];
+        let s3 = (self.dyn_base / (SLOTS * DYN_B * DYN_C)) * 16 + ((self.pin + 2048) >> 8).clamp(0, 15) as usize;
+        let d3 = self.m[3].mix(&self.x, s3 * SLOTS + slot, t);
+        let y = [d0, d1, d2, d3, 256];
         let df = self.mf.mix(&y, slot * 8 + self.sel[0], t);
         let p0 = t.squash(df);
         let pa = self.apm1.pp(df, self.actx[0] * SLOTS + slot);
@@ -399,20 +419,54 @@ impl Model {
         self.m[0].update(&self.x, b);
         self.m[1].update(&self.x, b);
         self.m[2].update(&self.x, b);
+        self.m[3].update(&self.x, b);
         self.mf.update(&y, b);
         self.apm1.update(b);
         self.apm2.update(b);
         b
     }
 
+    /// Logistic CDF of the parametric model at x8 (1/8 units), 16-bit.
+    #[inline(always)]
+    fn cdf(&self, x8: i64) -> i64 {
+        let d = ((x8 - self.pmu8 as i64) * 256 / self.ps8 as i64).clamp(-2047, 2047) as i32;
+        self.t.squash(d) as i64
+    }
+
+    /// Parametric probability mass of |value| in [a, b) (b = None: unbounded), a >= 1.
+    #[inline(always)]
+    fn mass(&self, a: i64, b: Option<i64>) -> i64 {
+        let (hp, ln) = match b {
+            Some(b) => (self.cdf(8 * b - 4), self.cdf(-8 * b + 4)),
+            None => (65536, 0),
+        };
+        (hp - self.cdf(8 * a - 4)) + (self.cdf(-8 * a + 4) - ln)
+    }
+
+    /// Sets the parametric input for a decision with probability num/den of a 1 bit.
+    #[inline(always)]
+    fn set_param(&mut self, num: i64, den: i64) {
+        self.pin = if self.ps8 == 0 || den <= 0 {
+            0
+        } else {
+            self.t.stretch(((num << 16) / den).clamp(32, 65504) as u32)
+        };
+    }
+
     /// Codes a value given contexts already selected in all tables. `self.pred8` is the
-    /// prediction (1/8 units; for magnitudes only its absolute value matters).
+    /// prediction (1/8 units; for magnitudes only its absolute value matters); `pmu8`/`ps8`
+    /// describe the parametric model.
     fn value<C: BitCoder>(&mut self, coder: &mut C, v: i32, may_be_zero: bool) -> i32 {
         let a = v.unsigned_abs();
         let pa = self.pred8.unsigned_abs() as i64;
+        let on = self.ps8 != 0;
         if may_be_zero {
             self.set_dyn(S_ZERO, pa - 4);
+            if on {
+                self.set_param(self.mass(1, None), 65536);
+            }
             if self.bit(coder, S_ZERO, (a != 0) as u32) == 0 {
+                self.pin = 0;
                 return 0;
             }
         }
@@ -421,6 +475,9 @@ impl Model {
         while e < 14 {
             let slot = S_EXP + (e as usize).min(7);
             self.set_dyn(slot, pa - ((16i64 << e) - 4));
+            if on {
+                self.set_param(self.mass(2 << e, None), self.mass(1 << e, None));
+            }
             if self.bit(coder, slot, (e_true > e) as u32) == 0 {
                 break;
             }
@@ -448,6 +505,10 @@ impl Model {
             };
             let mid = lo + (1i64 << i);
             self.set_dyn(slot, pa - (8 * mid - 4));
+            if on {
+                let top = lo + (2i64 << i);
+                self.set_param(self.mass(mid, Some(top)), self.mass(lo, Some(top)));
+            }
             if self.bit(coder, slot, bit) != 0 {
                 lo = mid;
             }
@@ -455,7 +516,14 @@ impl Model {
         let m = lo as i32;
         let close = ((self.pred8.unsigned_abs() as i64 - 8 * m as i64).unsigned_abs() >> 3).min(255) as u32;
         self.dyn_idx = self.dyn_base / (SLOTS * DYN_B * DYN_C) * (SLOTS * DYN_B * DYN_C) + (S_SIGN * DYN_B + dbucket(self.pred8 as i64)) * DYN_C + mb(close).min(7) as usize;
+        if on {
+            let m8 = 8 * m as i64;
+            let fp = self.cdf(m8 + 4) - self.cdf(m8 - 4);
+            let fneg = self.cdf(-m8 + 4) - self.cdf(-m8 - 4);
+            self.set_param(fneg, fp + fneg);
+        }
         let neg = self.bit(coder, S_SIGN, (v < 0) as u32);
+        self.pin = 0;
         if neg != 0 {
             -m
         } else {
@@ -703,11 +771,20 @@ impl Model {
             self.sel = [ucls, k as usize * 2 + ucls, (nzb(left) as usize) * 4 + (mb(wavg) as usize).min(3)];
             self.actx = [k as usize * 2 + ucls, (mb(wavg) as usize) * 16 + nzb(left) as usize];
             self.pred8 = if luma { 2 * wavg as i32 } else { px };
+            self.pmu8 = if luma { 0 } else { px };
+            let ei = ((ucls * 64 + k as usize) * 12 + nzb(left) as usize) * 16 + mb(wavg) as usize;
+            self.ps8 = match tune()[15] {
+                0 => 0,
+                f if f > 0 => (wavg as i32 * f / 16).max(2),
+                f => (self.emag[ei] * -f / 64 / 11).max(2),
+            };
             self.dyn_base = PART_INTERIOR * SLOTS * DYN_B * DYN_C + (k as usize >> 3).min(7);
             let forced = left == rem;
             self.part = 1;
             let val = self.value(coder, cur[n] as i32, !forced);
             cur[n] = val as i16;
+            let em = &mut self.emag[ei];
+            *em += (64 * val.unsigned_abs().min(1 << 16) as i32 - *em) >> 5;
             if val != 0 {
                 left -= 1;
                 act += val.unsigned_abs();
@@ -811,6 +888,8 @@ impl Model {
                 self.sel = [(1 + edge) * 2 + ucls, k as usize * 2 + ucls, 48 + pb(pbl) as usize / 2];
                 self.actx = [128 + (pb(pbl) as usize) * 2 + ucls, 256 + (pb(pbl) as usize) * 4 + (conf as usize).min(3)];
                 self.pred8 = pbl;
+                self.pmu8 = pbl;
+                self.ps8 = (econf * tune()[13] / 64).max(2);
                 self.dyn_base = PART_EDGE * SLOTS * DYN_B * DYN_C + conf as usize;
                 self.part = 6;
                 let val = self.value(coder, cur[n] as i32, left != 8 - i as u32);
@@ -931,6 +1010,8 @@ impl Model {
             self.sel = [6 + ucls, 128 + ucls, 64 + mb(spread) as usize];
             self.actx = [192 + ucls * 16 + conf as usize, 384 + (ctxr as usize) * 2 + ucls];
             self.pred8 = pdc - 8 * pred_dc;
+            self.pmu8 = pdc - 8 * pred_dc;
+            self.ps8 = (econf * tune()[14] / 64).max(2);
             self.dyn_base = PART_DC * SLOTS * DYN_B * DYN_C + (conf as usize).min(7);
             self.part = 10;
             let r = self.value(coder, cur[0] as i32 - pred_dc, true);
