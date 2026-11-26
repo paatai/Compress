@@ -418,8 +418,12 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
     if files.is_empty() {
         return Err("no input files".into());
     }
-    if read(&files[0]).is_ok_and(|b| jpeg::is_jpeg(&b)) {
-        return bench_jpeg(&files, threads, verify);
+    let (jpegs, files): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().partition(|f| read(f).is_ok_and(|b| jpeg::is_jpeg(&b)));
+    if !jpegs.is_empty() {
+        bench_jpeg(&jpegs, threads, verify)?;
+        if files.is_empty() {
+            return Ok(());
+        }
     }
     let opts = options();
     let next = AtomicUsize::new(0);

@@ -30,7 +30,7 @@ struct Model {
 impl Model {
     fn new(n: usize) -> Self {
         let t = tables();
-        let cap = (usize::BITS - n.max(1).leading_zeros() + 1).clamp(10, 22);
+        let cap = (usize::BITS - n.max(1).leading_zeros() + 1).clamp(10, 17);
         Model {
             t,
             tabs: (0..NORD).map(|i| CtxTable::new(if i == 0 { 8 } else { cap }, 4, 255)).collect(),
@@ -170,14 +170,18 @@ pub fn encode(data: &[u8]) -> Vec<u8> {
     e.finish()
 }
 
-pub fn decode(data: &[u8], n: usize) -> Vec<u8> {
+/// Decodes `n` bytes; fails if the input runs out long before that (a damaged length).
+pub fn decode(data: &[u8], n: usize) -> Result<Vec<u8>, String> {
     let mut d = Decoder::new(data);
     let mut m = Model::new(n);
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
+    let mut out = Vec::with_capacity(n.min(1 << 24));
+    for i in 0..n {
         out.push(m.code_byte(&mut d, 0));
+        if i % 4096 == 4095 && d.overrun() {
+            return Err("the .komla file is damaged or incomplete".into());
+        }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -193,7 +197,7 @@ mod tests {
         v.extend_from_slice(&v.clone()[100..900]);
         let c = super::encode(&v);
         assert!(c.len() < v.len());
-        assert_eq!(super::decode(&c, v.len()), v);
-        assert_eq!(super::decode(&super::encode(&[]), 0), Vec::<u8>::new());
+        assert_eq!(super::decode(&c, v.len()).unwrap(), v);
+        assert_eq!(super::decode(&super::encode(&[]), 0).unwrap(), Vec::<u8>::new());
     }
 }

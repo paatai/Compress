@@ -390,7 +390,7 @@ pub fn parse_container(b: &[u8]) -> Result<Container<'_>, String> {
                 if n > len as u64 {
                     return Err("corrupt .komla file".into());
                 }
-                parts.push(bytecm::decode(take(b, &mut pos, cl)?, n as usize));
+                parts.push(bytecm::decode(take(b, &mut pos, cl)?, n as usize)?);
             }
             c.trailer = parts.pop().unwrap();
             c.blob = parts.pop().unwrap();
@@ -418,7 +418,7 @@ pub fn parse_container(b: &[u8]) -> Result<Container<'_>, String> {
 pub fn finish(c: &Container, stripes: Vec<Vec<i16>>) -> Result<Vec<u8>, String> {
     let out = match c.mode {
         MODE_RAW => c.payload.to_vec(),
-        MODE_CM => bytecm::decode(c.payload, c.len),
+        MODE_CM => bytecm::decode(c.payload, c.len)?,
         _ => rebuild(c, stripes)?,
     };
     if out.len() != c.len || crate::crc32(&out) != c.crc {
@@ -452,6 +452,7 @@ fn rebuild(c: &Container, stripes: Vec<Vec<i16>>) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&c.blob[pos..s.blob_pos]);
         pos = s.blob_pos;
         let mut sc = format::SideCoder::new(&mut dec, None, &mut counts);
+        sc.limit = c.len;
         out.extend_from_slice(&format::encode_scan(f, s, &coefs, &mut sc)?);
         if out.len() > c.len {
             return Err("checksum mismatch: the .komla file is damaged or incomplete".into());

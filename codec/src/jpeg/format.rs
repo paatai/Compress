@@ -43,6 +43,9 @@ impl Huff {
             h.valptr[l] = k as i32;
             h.mincode[l] = code as i32;
             for _ in 0..counts[l] {
+                if code >= 1 << l {
+                    return Err("invalid Huffman table".into());
+                }
                 let s = h.syms[k] as usize;
                 if h.len[s] == 0 {
                     h.code[s] = code as u16;
@@ -752,6 +755,8 @@ pub struct SideCoder<'a, C: BitCoder> {
     pub counts: &'a mut [[u32; 2]; 8],
     pad_i: usize,
     eob_i: usize,
+    /// upper bound for decoded byte counts (the size of the original file)
+    pub limit: usize,
 }
 
 const S_PAD: usize = 0;
@@ -760,7 +765,7 @@ const S_GARBAGE: usize = 4;
 
 impl<'a, C: BitCoder> SideCoder<'a, C> {
     pub fn new(coder: &'a mut C, rec: Option<&'a ScanSide>, counts: &'a mut [[u32; 2]; 8]) -> Self {
-        SideCoder { coder, rec, counts, pad_i: 0, eob_i: 0 }
+        SideCoder { coder, rec, counts, pad_i: 0, eob_i: 0, limit: usize::MAX }
     }
     fn bit(&mut self, ctx: usize, bit: u32) -> u32 {
         let [n0, n1] = self.counts[ctx];
@@ -788,13 +793,16 @@ impl<'a, C: BitCoder> SideCoder<'a, C> {
         let v = self.rec.map_or(false, |r| r.eob_end.get(self.eob_i).copied().unwrap_or(true));
         self.bit(S_EOB + libjpeg_flushes as usize, v as u32) != 0
     }
-    fn garbage(&mut self) -> Vec<u8> {
+    fn garbage(&mut self) -> Result<Vec<u8>, String> {
         let g: &[u8] = self.rec.map_or(&[], |r| &r.garbage);
         if self.bit(S_GARBAGE, !g.is_empty() as u32) == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let n = self.coder.code_raw(g.len() as u32, 32) as usize;
-        (0..n).map(|i| self.coder.code_raw(g.get(i).copied().unwrap_or(0) as u32, 8) as u8).collect()
+        if n > self.limit {
+            return Err("corrupt side information".into());
+        }
+        Ok((0..n).map(|i| self.coder.code_raw(g.get(i).copied().unwrap_or(0) as u32, 8) as u8).collect())
     }
 }
 
@@ -918,7 +926,7 @@ pub fn encode_scan<C: BitCoder>(f: &Frame, s: &Scan, coefs: &[Vec<i16>], side: &
     let n = w.pad_len();
     let v = side.pad(n);
     w.put(v, n);
-    let g = side.garbage();
+    let g = side.garbage()?;
     w.out.extend_from_slice(&g);
     Ok(w.out)
 }

@@ -99,6 +99,12 @@ impl<'a> Decoder<'a> {
         d
     }
 
+    /// True once the decoder has read well past the end of its input, which a valid stream
+    /// never does (the encoder flushes only a few bytes).
+    pub fn overrun(&self) -> bool {
+        self.pos > self.data.len() + 8
+    }
+
     #[inline]
     fn next_byte(&mut self) -> u32 {
         let b = if self.pos < self.data.len() { self.data[self.pos] } else { 0 };

@@ -90,4 +90,27 @@ Image.fromarray(img[:, :, 0]).save(f"{out}/bmp8gray.bmp")
 Image.fromarray(img).convert("P", palette=Image.ADAPTIVE, colors=16).save(f"{out}/bmp4pal.bmp")
 Image.fromarray(img).convert("1").save(f"{out}/bmp1.bmp")
 Image.fromarray(rgba, "RGBA").save(f"{out}/bmp32.bmp")
+
+# JPEG variants: lossless recompression must give back every file byte for byte
+photo = np.clip(smooth(240, 320, 3, 255) + rng.normal(0, 6, (240, 320, 3)), 0, 255).astype(np.uint8)
+pim = Image.fromarray(photo)
+pim.save(f"{out}/jpeg_420.jpg", quality=85)
+pim.save(f"{out}/jpeg_444_q95.jpg", quality=95, subsampling=0)
+pim.save(f"{out}/jpeg_422_optimized.jpg", quality=80, subsampling=1, optimize=True)
+pim.save(f"{out}/jpeg_progressive.jpg", quality=88, progressive=True)
+pim.save(f"{out}/jpeg_restart.jpg", quality=75, restart_marker_blocks=3)
+pim.save(f"{out}/jpeg_progressive_restart.jpg", quality=70, progressive=True, restart_marker_rows=1)
+pim.convert("L").save(f"{out}/jpeg_gray.jpg", quality=90)
+pim.crop((5, 3, 58, 40)).save(f"{out}/jpeg_odd_size.jpg", quality=92, subsampling=2)
+Image.new("RGB", (1, 1), (200, 30, 90)).save(f"{out}/jpeg_1x1.jpg")
+exif = Image.Exif()
+exif[0x010F] = "Komla test camera"
+exif[0x0110] = "Model 1"
+pim.save(f"{out}/jpeg_metadata.jpg", quality=90, exif=exif.tobytes(), icc_profile=bytes(range(256)) * 4, comment=b"edge case")
+with open(f"{out}/jpeg_420.jpg", "rb") as f:
+    jpg = f.read()
+with open(f"{out}/jpeg_trailer.jpg", "wb") as f:
+    f.write(jpg + b"bytes after the end of the image")
+with open(f"{out}/jpeg_truncated.jpg", "wb") as f:
+    f.write(jpg[: len(jpg) * 2 // 3])
 print("written to", out)
