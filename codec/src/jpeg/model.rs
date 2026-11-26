@@ -21,6 +21,7 @@
 
 use super::format::{Frame, NATURAL};
 use crate::coder::BitCoder;
+use crate::ols::Ols;
 use crate::primitives::*;
 
 const SLOT_BITS: u32 = 4;
@@ -42,17 +43,17 @@ const DYN_B: usize = 24;
 const DYN_C: usize = 8;
 
 /// Model parameters; KOMLA_JTUNE="i=v,..." overrides them for experiments (both sides must agree).
-const TUNE_DEFAULT: [i32; 16] = [255, 400, 300, 6, 255, 400, 0, 0, 0, 1, 8192, 800, 4000, 12, 12, -90];
+const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 0, 0, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 16, 1, 16, 0, 0, 0];
 
-fn tune() -> &'static [i32; 16] {
-    static T: std::sync::OnceLock<[i32; 16]> = std::sync::OnceLock::new();
+fn tune() -> &'static [i32; 24] {
+    static T: std::sync::OnceLock<[i32; 24]> = std::sync::OnceLock::new();
     T.get_or_init(|| {
         let mut t = TUNE_DEFAULT;
         if let Ok(s) = std::env::var("KOMLA_JTUNE") {
             for kv in s.split(',').filter(|s| !s.is_empty()) {
                 if let Some((k, v)) = kv.split_once('=') {
                     if let (Ok(k), Ok(v)) = (k.parse::<usize>(), v.parse::<i32>()) {
-                        if k < 16 {
+                        if k < 24 {
                             t[k] = v;
                         }
                     }
@@ -246,6 +247,15 @@ pub struct Model {
     pin: i32,
     /// running mean of |value| x 64 per (class, position, nonzeros left, neighbour magnitude)
     emag: Vec<i32>,
+    /// 7x7 coefficients predicted by online least squares (per class and position) from the
+    /// blocks above and to the left, the corner blocks, the coefficients of this block already
+    /// coded in the same row and column, and for chroma the predictions from luma / Cb
+    ls: Vec<Ols>,
+    ls_feats: Vec<Vec<(u8, u8)>>,
+    ls_err: Vec<i32>,
+    ls_on: bool,
+    /// prediction for the sign decision (defaults to `pred8`)
+    spred8: i32,
     edge_err: Vec<[i32; 6]>,
     dc_err: [[i32; 5]; 2],
     gcfl: [[i64; 4]; 4],
@@ -340,6 +350,11 @@ impl Model {
             ps8: 0,
             pin: 0,
             emag: vec![64; 2 * 64 * 12 * 16],
+            ls: (0..2 * 49).map(|i| Ols::new(ls_feats(i / 49, i % 49).len(), 1.0 - 1.0 / tu[16].max(16) as f64, tu[17] as f64, tu[18].max(1) as u32)).collect(),
+            ls_feats: (0..2 * 49).map(|i| ls_feats(i / 49, i % 49)).collect(),
+            ls_err: vec![256; 2 * 49],
+            ls_on: tu[19] != 0,
+            spred8: 0,
             edge_err: vec![[256; 6]; 3 * 2 * 8],
             dc_err: [[256; 5]; 2],
             gcfl: [[0; 4]; 4],
@@ -515,7 +530,7 @@ impl Model {
         }
         let m = lo as i32;
         let close = ((self.pred8.unsigned_abs() as i64 - 8 * m as i64).unsigned_abs() >> 3).min(255) as u32;
-        self.dyn_idx = self.dyn_base / (SLOTS * DYN_B * DYN_C) * (SLOTS * DYN_B * DYN_C) + (S_SIGN * DYN_B + dbucket(self.pred8 as i64)) * DYN_C + mb(close).min(7) as usize;
+        self.dyn_idx = self.dyn_base / (SLOTS * DYN_B * DYN_C) * (SLOTS * DYN_B * DYN_C) + (S_SIGN * DYN_B + dbucket(self.spred8 as i64)) * DYN_C + mb(close).min(7) as usize;
         if on {
             let m8 = 8 * m as i64;
             let fp = self.cdf(m8 + 4) - self.cdf(m8 - 4);
@@ -744,12 +759,38 @@ impl Model {
             let c8 = if v > 1 { cur[n - 8] as i32 } else { 0 };
             let c9 = if u > 1 && v > 1 { cur[n - 9] as i32 } else { 0 };
             let px = if has_cc { pr8[n] } else { pc8[n] };
+            let lsi = ucls * 49 + j;
+            let pls = if self.ls_on {
+                let mut x = [0f64; 40];
+                for (i, &(src, idx)) in self.ls_feats[lsi].iter().enumerate() {
+                    let idx = idx as usize;
+                    x[i] = match src {
+                        0 => (a[idx] as i32 * q[idx]) as f64,
+                        1 => (l[idx] as i32 * q[idx]) as f64,
+                        2 => (al[idx] as i32 * q[idx]) as f64,
+                        3 => (ar[idx] as i32 * q[idx]) as f64,
+                        4 => (cur[idx] as i32 * q[idx]) as f64,
+                        5 => lc[idx] as f64,
+                        6 => cc[idx] as f64,
+                        _ => 64.0,
+                    };
+                }
+                let pr = self.ls[lsi].predict(&x) * 8.0 / q[n] as f64;
+                if pr.is_finite() { pr.round().clamp(-1e6, 1e6) as i32 } else { 0 }
+            } else {
+                0
+            };
+            let lsconf = mb((self.ls_err[lsi] >> 5) as u32).min(7);
             let prev_c = if j > 0 { cur[INTERIOR[j - 1]] as i32 } else { 0 };
             let (tail_a, tail_l) = ((mask_a >> k).count_ones().min(7), (mask_l >> k).count_ones().min(7));
             let hs: [u32; NCTX] = [
                 (k << 9) | (nzb(left) << 5) | (mb(wavg) << 1) | cls,
                 hash2(10 + k, (mb(c1.unsigned_abs()) << 12) | (mb(c8.unsigned_abs()) << 8) | (left.min(7) << 1) | cls),
-                hash2(20 + k, (((clip(va, 4) + 4) as u32) << 8) | (((clip(vl, 4) + 4) as u32) << 4) | (cls << 1)),
+                if self.ls_on {
+                    hash2(20 + k, (pb(pls) << 8) | (mb(wavg) << 3) | (lsconf.min(3) << 1) | cls)
+                } else {
+                    hash2(20 + k, (((clip(va, 4) + 4) as u32) << 8) | (((clip(vl, 4) + 4) as u32) << 4) | (cls << 1))
+                },
                 hash2(30 + k, (nz77.min(49) << 8) | ((nz77 - left).min(31) << 2) | cls),
                 hash2(40 + k, (mb(var.unsigned_abs()) << 12) | (mb(val.unsigned_abs()) << 8) | (mb(wavg) << 2) | cls),
                 hash2(50 + k, (mb(act) << 8) | (nzb(left) << 2) | cls),
@@ -762,22 +803,29 @@ impl Model {
                 hash2(120 + k, (mb(act_a) << 10) | (mb(act_l) << 6) | (nzb(left) << 2) | cls),
                 hash2(130 + k, (((clip(prev_c, 8) + 8) as u32) << 12) | (mb(last_nz) << 8) | (run.min(15) << 2) | cls),
                 hash2(140 + k, (mb(va.unsigned_abs() + vl.unsigned_abs()) << 10) | (mb(c1.unsigned_abs() + c8.unsigned_abs()) << 6) | (nzb(left) << 2) | cls),
-                hash2(150 + k, (tail_a << 12) | (tail_l << 9) | (mb(wavg) << 5) | (left.min(7) << 1) | cls),
+                if self.ls_on {
+                    hash2(150 + k, (pb(pls) << 10) | (nzb(left) << 5) | (lsconf << 1) | cls)
+                } else {
+                    hash2(150 + k, (tail_a << 12) | (tail_l << 9) | (mb(wavg) << 5) | (left.min(7) << 1) | cls)
+                },
             ];
-            let off = tune()[7] - 1;
             for (i, &h) in hs.iter().enumerate() {
-                self.tabs[i].set(if i as i32 == off { 0 } else { h });
+                self.tabs[i].set(h);
             }
             self.sel = [ucls, k as usize * 2 + ucls, (nzb(left) as usize) * 4 + (mb(wavg) as usize).min(3)];
             self.actx = [k as usize * 2 + ucls, (mb(wavg) as usize) * 16 + nzb(left) as usize];
             self.pred8 = if luma { 2 * wavg as i32 } else { px };
-            self.pmu8 = if luma { 0 } else { px };
+            self.pmu8 = if self.ls_on { pls } else if luma { 0 } else { px };
+            self.spred8 = if self.ls_on { pls } else { self.pred8 };
             let ei = ((ucls * 64 + k as usize) * 12 + nzb(left) as usize) * 16 + mb(wavg) as usize;
             self.ps8 = match tune()[15] {
                 0 => 0,
                 f if f > 0 => (wavg as i32 * f / 16).max(2),
                 f => (self.emag[ei] * -f / 64 / 11).max(2),
             };
+            if self.ls_on && tune()[20] > 0 {
+                self.ps8 = (self.ls_err[lsi] * tune()[20] / 64).max(2);
+            }
             self.dyn_base = PART_INTERIOR * SLOTS * DYN_B * DYN_C + (k as usize >> 3).min(7);
             let forced = left == rem;
             self.part = 1;
@@ -785,6 +833,10 @@ impl Model {
             cur[n] = val as i16;
             let em = &mut self.emag[ei];
             *em += (64 * val.unsigned_abs().min(1 << 16) as i32 - *em) >> 5;
+            if self.ls_on {
+                self.ls[lsi].update((val * q[n]) as f64);
+                track(&mut self.ls_err[lsi], 8 * val - pls);
+            }
             if val != 0 {
                 left -= 1;
                 act += val.unsigned_abs();
@@ -881,13 +933,13 @@ impl Model {
                     hash2(340 + k, (((clip(vn, 8) + 8) as u32) << 10) | (pb(pbl) << 4) | cls),
                     hash2(350 + k, (mb(act) << 10) | (conf << 6) | (nzb(nz77) << 2) | cls),
                 ];
-                let off = tune()[8] - 1;
                 for (j, &h) in hs.iter().enumerate() {
-                    self.tabs[j].set(if j as i32 == off { 0 } else { h });
+                    self.tabs[j].set(h);
                 }
                 self.sel = [(1 + edge) * 2 + ucls, k as usize * 2 + ucls, 48 + pb(pbl) as usize / 2];
                 self.actx = [128 + (pb(pbl) as usize) * 2 + ucls, 256 + (pb(pbl) as usize) * 4 + (conf as usize).min(3)];
                 self.pred8 = pbl;
+                self.spred8 = pbl;
                 self.pmu8 = pbl;
                 self.ps8 = (econf * tune()[13] / 64).max(2);
                 self.dyn_base = PART_EDGE * SLOTS * DYN_B * DYN_C + conf as usize;
@@ -1010,6 +1062,7 @@ impl Model {
             self.sel = [6 + ucls, 128 + ucls, 64 + mb(spread) as usize];
             self.actx = [192 + ucls * 16 + conf as usize, 384 + (ctxr as usize) * 2 + ucls];
             self.pred8 = pdc - 8 * pred_dc;
+            self.spred8 = self.pred8;
             self.pmu8 = pdc - 8 * pred_dc;
             self.ps8 = (econf * tune()[14] / 64).max(2);
             self.dyn_base = PART_DC * SLOTS * DYN_B * DYN_C + (conf as usize).min(7);
@@ -1162,6 +1215,35 @@ impl Model {
         }
         out
     }
+}
+
+/// Sources of the least-squares features of interior position `j` (class 0 luma, 1 chroma):
+/// 0 block above, 1 block to the left, 2 above-left, 3 above-right, 4 this block, 5 luma
+/// prediction, 6 first-chroma prediction, 7 constant.
+fn ls_feats(class: usize, j: usize) -> Vec<(u8, u8)> {
+    let n = INTERIOR[j];
+    let (u, v) = (n % 8, n / 8);
+    let mut f = Vec::new();
+    for g in 0..8 {
+        f.push((0, (g * 8 + u) as u8));
+        f.push((1, (v * 8 + g) as u8));
+    }
+    for g in 1..8 {
+        if ZZ[g * 8 + u] < ZZ[n] {
+            f.push((4, (g * 8 + u) as u8));
+        }
+        if ZZ[v * 8 + g] < ZZ[n] {
+            f.push((4, (v * 8 + g) as u8));
+        }
+    }
+    f.push((2, n as u8));
+    f.push((3, n as u8));
+    if class == 1 {
+        f.push((5, n as u8));
+        f.push((6, n as u8));
+    }
+    f.push((7, 0));
+    f
 }
 
 /// Zigzag position of each natural index.

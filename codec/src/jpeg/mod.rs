@@ -261,6 +261,18 @@ fn analyze(data: &[u8]) -> Result<Prepared, String> {
         }
     }
     let side = side_enc.finish();
+    if let Some(path) = std::env::var_os("KOMLA_DUMP") {
+        // debugging aid: quantization tables and coefficients of every component
+        let mut d = Vec::new();
+        for (c, plane) in l.frame.comps.iter().zip(coefs.iter()) {
+            for v in [c.pw as u32, c.ph as u32, c.h as u32, c.v as u32] {
+                d.extend_from_slice(&v.to_le_bytes());
+            }
+            d.extend(c.q.iter().flat_map(|v| v.to_le_bytes()));
+            d.extend(plane.iter().flat_map(|v| v.to_le_bytes()));
+        }
+        let _ = std::fs::write(path, d);
+    }
     let trailer = &data[l.end..];
     let f = &l.frame;
     let mut h = Vec::with_capacity(4096);
