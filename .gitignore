@@ -1,0 +1,9 @@
+target/
+bench/.tools/
+bench/out/
+node_modules/
+web/dist/
+web/public/kolmo.wasm
+*.kolmo
+.DS_Store
+bench/data/
