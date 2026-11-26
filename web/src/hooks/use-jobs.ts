@@ -11,7 +11,8 @@ export interface Job {
   name: string
   inputBytes: number
   previewUrl?: string
-  status: 'running' | 'done' | 'error'
+  /** 'verifying': the .kolmo file is ready; the round-trip check is still running */
+  status: 'running' | 'verifying' | 'done' | 'error'
   stage: string
   fraction: number
   error?: string
@@ -48,6 +49,7 @@ export function useJobs() {
         const res = await compress(buf, (p) => update(id, { stage: p.stage, fraction: p.fraction }))
         const originalHash = await sha256(res.samples)
         update(id, {
+          status: 'verifying',
           info: res.info,
           kolmo: res.kolmo,
           stripes: res.stripes,

@@ -1,11 +1,17 @@
-//! Continuous-tone model: per-sample prediction (blend of many predictors weighted by
-//! their recent local errors, plus online least squares), bias cancellation, and
-//! residual coding with binary context mixing.
+//! Continuous-tone model for photographs and other images with many colours.
+//!
+//! Per sample: about two dozen predictors (spatial and cross-channel), a least-squares
+//! predictor fitted on a 2-D causal window, an online least-squares "stack" that combines the
+//! strongest of them, and context-based bias cancellation give an integer prediction P.
+//! The residual x - P is coded as binary decisions (zero? sign? magnitude bucket? bits inside
+//! the bucket). Each decision is predicted by context counters, one "expert" counter per
+//! predictor (indexed by how far that predictor is from P and how reliable it has been
+//! locally), three gated logistic mixers, a final mixer and two APMs.
 
 use crate::coder::BitCoder;
-use crate::ols::Ols;
-use crate::wls::Wls2d;
 use crate::primitives::*;
+use crate::wls::Wls2d;
+use crate::ols::Ols;
 
 pub const PAD: usize = 4;
 const RING: usize = 4;
@@ -15,13 +21,14 @@ const SLOT_ZERO: usize = 0;
 const SLOT_SIGN: usize = 1;
 const NPRED: usize = 26;
 const NCTX: usize = 11;
-const NEXP: usize = 24;
+const NEXP: usize = 12;
 const EXP_CONF: usize = 8;
 const EXP_QD: usize = 24;
 const EXP_BLOCK: usize = EXP_CONF * EXP_QD * 2 * SLOTS;
 const NIN: usize = NCTX + NEXP + 1;
 const NSYN: usize = 10;
 const NIN_MAX: usize = NIN + 2 * NSYN;
+const BLEND: usize = usize::MAX;
 
 #[inline(always)]
 fn slot_unary(i: u32) -> usize {
@@ -115,6 +122,7 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Green first, then red from green, then blue from green and red; alpha before colour.
     pub fn for_channels(nc: usize) -> Plan {
         match nc {
             1 => Plan { src: vec![0], refs: vec![vec![]], alpha: None },
@@ -125,39 +133,25 @@ impl Plan {
     }
 }
 
+/// Model parameters. The defaults are what the file format uses; other values are only for
+/// experiments (encoder and decoder must agree).
 #[derive(Clone, Debug)]
 pub struct Tuning {
     pub mixer_lr: i32,
     pub mixer_lr_final: i32,
     pub ctr_limit: u32,
     pub ctr_limit_exact: u32,
-    pub ols_lambda: f64,
-    pub ols_nu: f64,
-    pub ols_interval: u32,
     pub blend_eps: f32,
-    pub param_scale: f64,
     pub apm_rate: u32,
-    pub disable: u32,
-    pub blend_pow: u32,
-    pub wls_on: u32,
     pub wls_lh: f64,
     pub wls_lv: f64,
     pub wls_nu: f64,
-    pub stack_on: u32,
+    pub wls_interval: u32,
+    pub wls_interval_ref: u32,
     pub stack_lambda: f64,
     pub stack_nu: f64,
-    pub vw_mode: u32,
+    pub stack_interval: u32,
     pub vw_c: f64,
-    pub stack_all: u32,
-    pub ols_on: u32,
-    pub wls_interval: u32,
-    pub exp_more: u32,
-    pub ctx_mask: u32,
-    pub exp_coarse: u32,
-    pub wls_interval_ref: u32,
-    pub lr_boost: u32,
-    pub lr_decay: u32,
-    pub apm_mix: u32,
 }
 
 impl Default for Tuning {
@@ -167,33 +161,17 @@ impl Default for Tuning {
             mixer_lr_final: 300,
             ctr_limit: 255,
             ctr_limit_exact: 60,
-            ols_lambda: 0.998,
-            ols_nu: 0.5,
-            ols_interval: 4,
             blend_eps: 0.125,
-            param_scale: 1.0,
             apm_rate: 6,
-            disable: 0,
-            blend_pow: 2,
-            wls_on: 15,
             wls_lh: 0.8,
             wls_lv: 0.8,
             wls_nu: 1.0,
-            stack_on: 1,
+            wls_interval: 1,
+            wls_interval_ref: 1,
             stack_lambda: 0.999,
             stack_nu: 0.5,
-            vw_mode: 7,
+            stack_interval: 4,
             vw_c: 0.5,
-            stack_all: 0,
-            ols_on: 0,
-            wls_interval: 1,
-            exp_more: 0,
-            ctx_mask: 0,
-            exp_coarse: 0,
-            wls_interval_ref: 1,
-            lr_boost: 0,
-            lr_decay: 1,
-            apm_mix: 0,
         }
     }
 }
@@ -204,9 +182,7 @@ struct Chan {
     aerr: Vec<i32>,
     perr: Vec<u32>,
     np: usize,
-    ols: Ols,
-    nols: usize,
-    wls: Option<Wls2d>,
+    wls: Wls2d,
     stack: Ols,
     stack_in: Vec<f64>,
     stack_idx: Vec<usize>,
@@ -214,82 +190,22 @@ struct Chan {
     bias: Vec<[i32; 2]>,
 }
 
-pub struct CtModel {
-    t: &'static Tables,
-    width: usize,
-    maxv: i32,
-    dshift: u32,
-    stride: usize,
-    plan: Plan,
-    ch: Vec<Chan>,
-    tabs: Vec<CtxTable>,
-    syn: Vec<HistTable>,
-    nin: usize,
-    m: [Mixer; 3],
-    mf: Mixer,
-    apm1: Apm,
-    apm2: Apm,
-    x: [i32; NIN_MAX],
-    sel: [usize; 3],
-    self_f: usize,
-    actx1: usize,
-    actx2: usize,
-    // per-row ring offsets
-    r0: usize,
-    r1: usize,
-    r2: usize,
-    r3: usize,
-    y: usize,
-    // per-pixel state of already coded channels
-    cur_val: [i32; 4],
-    cur_res: [i32; 4],
-    ols_in: [f64; 32],
-    exp_tab: Vec<u32>,
-    exp_base: [usize; NEXP],
-    nexp: usize,
-    side: usize,
-    small_exp: bool,
-    tune: Tuning,
-    pub stats: Option<Box<Stats>>,
-}
-
 #[derive(Default, Debug)]
 pub struct Stats {
     pub n: u64,
     pub abs_mu: f64,
-    pub abs_blend: f64,
-    pub abs_ols: f64,
-    pub abs_pred: [f64; NPRED],
     pub cost_slot: [f64; SLOTS],
     pub cnt_slot: [u64; SLOTS],
     pub cost_ch: [f64; 4],
     pub abs_ch: [f64; 4],
     pub n_ch: [u64; 4],
     pub cur_ch: usize,
-    pub abs_pred0: [f64; NPRED],
-    pub abs_blend0: f64,
 }
 
 impl Stats {
     pub fn report(&self) -> String {
         let n = self.n.max(1) as f64;
-        let mut s = format!(
-            "samples {} |e| mu {:.3} blend {:.3} ols {:.3}\n preds:",
-            self.n,
-            self.abs_mu / n / 16.0,
-            self.abs_blend / n / 16.0,
-            self.abs_ols / n / 16.0
-        );
-        for v in self.abs_pred.iter() {
-            s += &format!(" {:.2}", v / n / 16.0);
-        }
-        s += "\n ch0 preds:";
-        let n0 = self.n_ch[0].max(1) as f64;
-        for v in self.abs_pred0.iter().take(16) {
-            s += &format!(" {:.3}", v / n0 / 16.0);
-        }
-        s += &format!(" blend {:.3}", self.abs_blend0 / n0 / 16.0);
-        s += "\n per channel (bits, |e|):";
+        let mut s = format!("samples {} mean |e| {:.3}\n per channel (bits, |e|):", self.n, self.abs_mu / n / 16.0);
         for c in 0..4 {
             if self.n_ch[c] > 0 {
                 s += &format!(" [{c}: {:.4} {:.3}]", self.cost_ch[c] / self.n_ch[c] as f64, self.abs_ch[c] / self.n_ch[c] as f64 / 16.0);
@@ -306,7 +222,42 @@ impl Stats {
     }
 }
 
+pub struct CtModel {
+    t: &'static Tables,
+    width: usize,
+    maxv: i32,
+    dshift: u32,
+    stride: usize,
+    plan: Plan,
+    ch: Vec<Chan>,
+    tabs: Vec<CtxTable>,
+    syn: Vec<HistTable>,
+    m: [Mixer; 3],
+    mf: Mixer,
+    apm1: Apm,
+    apm2: Apm,
+    x: [i32; NIN_MAX],
+    sel: [usize; 3],
+    self_f: usize,
+    actx1: usize,
+    actx2: usize,
+    r0: usize,
+    r1: usize,
+    r2: usize,
+    r3: usize,
+    y: usize,
+    cur_val: [i32; 4],
+    cur_res: [i32; 4],
+    exp_tab: Vec<u32>,
+    exp_base: [usize; NEXP],
+    nexp: usize,
+    side: usize,
+    tune: Tuning,
+    pub stats: Option<Box<Stats>>,
+}
+
 impl CtModel {
+    /// `synth` enables extra exact-value contexts for screenshots and graphics.
     pub fn new(width: usize, height: usize, depth: u32, plan: Plan, tune: Tuning, synth: bool) -> Self {
         let t = tables();
         let maxv = ((1u32 << depth) - 1) as i32;
@@ -315,8 +266,8 @@ impl CtModel {
         let mut ch = Vec::with_capacity(nc);
         for c in 0..nc {
             let nref = plan.refs[c].len();
-            let use_wls = tune.wls_on & (1 << c) != 0;
-            let np = 14 + if nref >= 1 { 7 } else { 0 } + if nref >= 2 { 3 } else { 0 } + 1 + use_wls as usize;
+            let np = 14 + if nref >= 1 { 7 } else { 0 } + if nref >= 2 { 3 } else { 0 } + 1;
+            let wls_idx = np - 1;
             let mut stack_idx: Vec<usize> = vec![4, 10, 11];
             if nref >= 1 {
                 stack_idx.extend_from_slice(&[14, 15, 16, 19]);
@@ -324,76 +275,44 @@ impl CtModel {
             if nref >= 2 {
                 stack_idx.extend_from_slice(&[21, 22, 23]);
             }
-            let ols_idx = np - 1 - use_wls as usize;
-            stack_idx.push(ols_idx);
-            if use_wls {
-                stack_idx.push(np - 1);
-            }
-            if tune.stack_all != 0 {
-                stack_idx = (0..np).collect();
-            }
-            let nols = 10 + 5 * nref.min(2) + if plan.alpha.is_some() && plan.alpha != Some(c) { 1 } else { 0 };
+            stack_idx.push(wls_idx);
+            let mut exp_idx = vec![0usize, 1, 2, 4, 6, 10, 11, wls_idx, BLEND];
+            exp_idx.extend_from_slice(if nref >= 1 { &[14, 15, 16] } else { &[5, 7, 9] });
+            let nw = match nref {
+                0 => 12,
+                1 => 13,
+                _ => 16,
+            };
+            let interval = if nref > 0 { tune.wls_interval_ref } else { tune.wls_interval };
             ch.push(Chan {
                 vals: vec![(maxv + 1) / 2; RING * stride],
                 res: vec![0; RING * stride],
                 aerr: vec![32; RING * stride],
                 perr: vec![32; RING * stride * NPRED],
                 np,
-                ols: Ols::new(nols, tune.ols_lambda, tune.ols_nu * (maxv as f64 / 255.0).powi(2), tune.ols_interval),
-                nols,
-                stack: Ols::new(stack_idx.len() + 1, tune.stack_lambda, tune.stack_nu, tune.ols_interval),
+                wls: Wls2d::new(nw, width, tune.wls_lh, tune.wls_lv, tune.wls_nu, interval),
+                stack: Ols::new(stack_idx.len() + 1, tune.stack_lambda, tune.stack_nu, tune.stack_interval),
                 stack_in: vec![0.0; stack_idx.len() + 1],
                 stack_idx,
-                exp_idx: {
-                    let wl = if use_wls { np - 1 } else { 11 };
-                    let mut e = vec![0usize, 1, 2, 4, 6, 10, 11, wl, usize::MAX];
-                    if nref >= 1 {
-                        e.extend_from_slice(&[14, 15, 16]);
-                    } else {
-                        e.extend_from_slice(&[5, 7, 9]);
-                    }
-                    if tune.exp_more != 0 {
-                        for j in 0..np {
-                            if !e.contains(&j) && e.len() < NEXP {
-                                e.push(j);
-                            }
-                        }
-                    }
-                    e
-                },
-                wls: if use_wls {
-                    let nw = match nref {
-                        0 => 12,
-                        1 => 13,
-                        _ => 16,
-                    };
-                    Some(Wls2d::new(nw, width, tune.wls_lh, tune.wls_lv, tune.wls_nu, if nref > 0 { tune.wls_interval_ref } else { tune.wls_interval }))
-                } else {
-                    None
-                },
+                exp_idx,
                 bias: vec![[0, 0]; 4096],
             });
         }
-        let lb = if std::env::var_os("KOLMO_SMALL").is_some() { [10u32; 11] } else { [12u32, 16, 16, 18, 16, 16, 18, 18, 18, 14, 16] };
+        let lb = [12u32, 16, 16, 18, 16, 16, 18, 18, 18, 14, 16];
         let samples = (width * height * nc) as u64;
         let cap = (64 - samples.leading_zeros()).max(10);
-        let mut tabs = Vec::with_capacity(NCTX);
-        for (i, &b) in lb.iter().enumerate() {
-            let b = b.min(cap);
-            let lim = if (6..=8).contains(&i) { tune.ctr_limit_exact } else { tune.ctr_limit };
-            tabs.push(CtxTable::new(b, SLOT_BITS, lim));
-        }
+        let tabs = lb
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| CtxTable::new(b.min(cap), SLOT_BITS, if (6..=8).contains(&i) { tune.ctr_limit_exact } else { tune.ctr_limit }))
+            .collect();
         let nin = if synth { NIN_MAX } else { NIN };
         let syn: Vec<HistTable> = if synth { (0..NSYN).map(|_| HistTable::new(cap.min(18), SLOT_BITS)).collect() } else { Vec::new() };
-        let (bo, de) = (tune.lr_boost as i64, tune.lr_decay as i64);
         let m = [
-            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13).with_schedule(bo, de),
-            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13).with_schedule(bo, de),
-            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13).with_schedule(bo, de),
+            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13),
+            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13),
+            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13),
         ];
-        let mf = Mixer::new(4, SLOTS * 4, tune.mixer_lr_final, 22000);
-        let apm1 = Apm::new(SLOTS * 64, tune.apm_rate, t);
-        let apm2 = Apm::new(SLOTS * 1024, tune.apm_rate, t);
         CtModel {
             t,
             width,
@@ -404,11 +323,10 @@ impl CtModel {
             ch,
             tabs,
             syn,
-            nin,
             m,
-            mf,
-            apm1,
-            apm2,
+            mf: Mixer::new(4, SLOTS * 4, tune.mixer_lr_final, 22000),
+            apm1: Apm::new(SLOTS * 64, tune.apm_rate, t),
+            apm2: Apm::new(SLOTS * 1024, tune.apm_rate, t),
             x: [0; NIN_MAX],
             sel: [0; 3],
             self_f: 0,
@@ -421,23 +339,13 @@ impl CtModel {
             y: 0,
             cur_val: [0; 4],
             cur_res: [0; 4],
-            ols_in: [0.0; 32],
             exp_tab: vec![CTR_INIT; nc * NEXP * EXP_BLOCK],
             exp_base: [0; NEXP],
             nexp: 0,
             side: 0,
-            small_exp: std::env::var_os("KOLMO_SMALLEXP").is_some(),
             tune,
             stats: if std::env::var_os("KOLMO_STATS").is_some() { Some(Box::default()) } else { None },
         }
-    }
-
-    fn qlog_inv(q: usize) -> u32 {
-        let mut v = 0u32;
-        while v < (1 << 24) && (qlog(v) as usize) < q {
-            v = v + 1 + v / 8;
-        }
-        v
     }
 
     pub fn start_row(&mut self, y: usize) {
@@ -449,13 +357,12 @@ impl CtModel {
         self.r3 = ((y + RING - 3) % RING) * s;
         let (r0, r1) = (self.r0, self.r1);
         for c in self.ch.iter_mut() {
-            if let Some(wl) = c.wls.as_mut() {
-                wl.start_row();
+            c.wls.start_row();
+            if y == 0 {
+                continue;
             }
+            // left padding of this row repeats the first pixel of the row above
             for k in 1..=PAD {
-                if y == 0 {
-                    continue;
-                }
                 c.vals[r0 + PAD - k] = c.vals[r1 + PAD];
                 c.res[r0 + PAD - k] = c.res[r1 + PAD];
                 c.aerr[r0 + PAD - k] = c.aerr[r1 + PAD];
@@ -470,9 +377,7 @@ impl CtModel {
         let r0 = self.r0;
         let w = self.width;
         for c in self.ch.iter_mut() {
-            if let Some(wl) = c.wls.as_mut() {
-                wl.end_row();
-            }
+            c.wls.end_row();
             let last = r0 + PAD + w - 1;
             for k in 1..=PAD {
                 c.vals[last + k] = c.vals[last];
@@ -512,7 +417,8 @@ impl CtModel {
         }
     }
 
-    /// Codes (or decodes) one sample of coding position `ci` at column `x`.
+    /// Codes (or decodes) one sample of coding position `ci` at column `x`. With `known`
+    /// the value is not coded (it was resolved by the pixel model) but all state is updated.
     #[inline(never)]
     pub fn code_sample<C: BitCoder>(&mut self, coder: &mut C, x: usize, ci: usize, value: i32, known: bool) -> i32 {
         let xi = x + PAD;
@@ -523,7 +429,7 @@ impl CtModel {
         let alpha_pos = self.plan.alpha;
 
         // ---- neighbourhood
-        let (w, n, nw, ne, ww, nn, nne, nnw, nww, nee, nnn) = {
+        let (w, n, nw, ne, ww, nn, nne, nnw, nww, nee, nnn, www) = {
             let v = &self.ch[ci].vals;
             (
                 v[r0 + xi - 1],
@@ -537,6 +443,7 @@ impl CtModel {
                 v[r1 + xi - 2],
                 v[r1 + xi + 2],
                 v[r3 + xi],
+                v[r0 + xi - 3],
             )
         };
 
@@ -554,11 +461,12 @@ impl CtModel {
         p[8] = (2 * n - nn) * 16;
         p[9] = (2 * w - ww) * 16;
         p[10] = med(w, n, nw) * 16;
-        {
+        p[11] = {
+            // CALIC gradient-adjusted prediction
             let th = 1 << ds;
             let dh = (w - ww).abs() + (n - nw).abs() + (n - ne).abs();
             let dv = (w - nw).abs() + (n - nn).abs() + (ne - nne).abs();
-            let g = if dv - dh > 80 * th {
+            if dv - dh > 80 * th {
                 w * 16
             } else if dh - dv > 80 * th {
                 n * 16
@@ -574,18 +482,17 @@ impl CtModel {
                     g = (3 * g + n * 16) / 4;
                 }
                 g
-            };
-            p[11] = g;
-        }
+            }
+        };
         p[12] = (n + nw - nnw) * 16;
         p[13] = (w + nw - nww) * 16;
         let mut k = 14;
-        let mut refv = [[0i32; 6]; 2];
+        let mut refv = [[0i32; 5]; 2];
         for (ri, &rp) in self.plan.refs[ci].iter().take(2).enumerate() {
             let v = &self.ch[rp].vals;
             let xr = self.cur_val[rp];
             let (wr, nr, nwr, ner) = (v[r0 + xi - 1], v[r1 + xi], v[r1 + xi - 1], v[r1 + xi + 1]);
-            refv[ri] = [xr, wr, nr, nwr, ner, 0];
+            refv[ri] = [xr, wr, nr, nwr, ner];
             p[k] = (w + xr - wr) * 16;
             p[k + 1] = (n + xr - nr) * 16;
             p[k + 2] = (w + n - nw + xr - (wr + nr - nwr)) * 16;
@@ -599,65 +506,25 @@ impl CtModel {
                 k += 3;
             }
         }
-        // OLS
-        let nols = self.ch[ci].nols;
-        {
-            let o = &mut self.ols_in;
-            o[0] = n as f64;
-            o[1] = w as f64;
-            o[2] = nw as f64;
-            o[3] = ne as f64;
-            o[4] = nn as f64;
-            o[5] = ww as f64;
-            o[6] = nne as f64;
-            o[7] = nnw as f64;
-            o[8] = nww as f64;
-            o[9] = nee as f64;
-            let mut j = 10;
-            for rv in refv.iter().take(nref.min(2)) {
-                for &v in rv.iter().take(5) {
-                    o[j] = v as f64;
-                    j += 1;
-                }
-            }
-            if j < nols {
-                o[j] = match alpha_pos {
-                    Some(a) => self.cur_val[a] as f64,
-                    None => 0.0,
-                };
-            }
-        }
-        let po16 = if self.tune.ols_on != 0 {
-            let po = self.ch[ci].ols.predict(&self.ols_in[..nols]);
-            (po * 16.0).clamp(0.0, m16 as f64) as i32
+        // 2-D windowed least squares
+        let inp: [f64; 16] = if nref == 0 {
+            [w as f64, n as f64, nw as f64, ne as f64, ww as f64, nn as f64, nnw as f64, nne as f64, nww as f64, nee as f64, www as f64, nnn as f64, 0.0, 0.0, 0.0, 0.0]
         } else {
-            p[11]
+            let (a, b) = (&refv[0], &refv[1]);
+            [w as f64, n as f64, nw as f64, ne as f64, ww as f64, nn as f64, nne as f64, nww as f64, a[0] as f64, a[1] as f64, a[2] as f64, a[3] as f64, a[4] as f64, b[0] as f64, b[1] as f64, b[2] as f64]
         };
-        p[k] = po16;
+        p[k] = match self.ch[ci].wls.predict(x, &inp) {
+            Some(v) => (v * 16.0).clamp(0.0, m16 as f64) as i32,
+            None => p[10],
+        };
         k += 1;
-        let www = self.ch[ci].vals[r0 + xi - 3];
-        if let Some(wl) = self.ch[ci].wls.as_mut() {
-            let inp: [f64; 16] = match nref {
-                0 => [w as f64, n as f64, nw as f64, ne as f64, ww as f64, nn as f64, nnw as f64, nne as f64, nww as f64, nee as f64, www as f64, nnn as f64, 0.0, 0.0, 0.0, 0.0],
-                _ => {
-                    let a = &refv[0];
-                    let b = &refv[1];
-                    [w as f64, n as f64, nw as f64, ne as f64, ww as f64, nn as f64, nne as f64, nww as f64, a[0] as f64, a[1] as f64, a[2] as f64, a[3] as f64, a[4] as f64, b[0] as f64, b[1] as f64, b[2] as f64]
-                }
-            };
-            p[k] = match wl.predict(x, &inp) {
-                Some(v) => (v * 16.0).clamp(0.0, m16 as f64) as i32,
-                None => p[10],
-            };
-            k += 1;
-        }
         let np = k;
         debug_assert_eq!(np, self.ch[ci].np);
         for v in p[..np].iter_mut() {
             *v = (*v).clamp(0, m16);
         }
 
-        // ---- blend by local errors
+        // ---- blend by local errors (weights 1 / (error + eps)^2)
         let chn = &self.ch[ci];
         let pe = &chn.perr;
         let iw = (r0 + xi - 1) * NPRED;
@@ -680,23 +547,22 @@ impl CtModel {
             sw += wgt;
             swp += wgt * p[j] as f32;
         }
-        let blend16 = (swp / sw) as i32;
-        let blend16 = if self.tune.stack_on != 0 {
+        let blend = (swp / sw) as i32;
+
+        // ---- stacking: online least squares over the strongest predictors and the blend
+        let base16 = {
             let c = &mut self.ch[ci];
             let ns = c.stack_idx.len();
             for j in 0..ns {
                 c.stack_in[j] = p[c.stack_idx[j]] as f64 * (1.0 / 16.0);
             }
-            c.stack_in[ns] = blend16 as f64 * (1.0 / 16.0);
-            let sp = c.stack.predict(&c.stack_in);
-            (sp * 16.0).clamp(0.0, m16 as f64) as i32
-        } else {
-            blend16
+            c.stack_in[ns] = blend as f64 * (1.0 / 16.0);
+            (c.stack.predict(&c.stack_in) * 16.0).clamp(0.0, m16 as f64) as i32
         };
         let chn = &self.ch[ci];
         let mut spread = 0.0f32;
         for j in 0..np {
-            let d = (p[j] - blend16) as f32;
+            let d = (p[j] - base16) as f32;
             spread += wts[j] * d * d;
         }
         let spread16 = (spread / sw).sqrt() as u32;
@@ -710,23 +576,19 @@ impl CtModel {
         // ---- bias cancellation
         let qs = qlog(s16 >> ds).min(47);
         let qsc = qs / 6;
-        let sb = {
-            let b = blend16;
-            ((w * 16 > b) as u32)
-                | (((n * 16 > b) as u32) << 1)
-                | (((nw * 16 > b) as u32) << 2)
-                | (((ne * 16 > b) as u32) << 3)
-                | (((ww * 16 > b) as u32) << 4)
-                | (((nn * 16 > b) as u32) << 5)
-        };
+        let sb = ((w * 16 > base16) as u32)
+            | (((n * 16 > base16) as u32) << 1)
+            | (((nw * 16 > base16) as u32) << 2)
+            | (((ne * 16 > base16) as u32) << 3)
+            | (((ww * 16 > base16) as u32) << 4)
+            | (((nn * 16 > base16) as u32) << 5);
         let ref_q = if nref > 0 { qr(self.cur_res[self.plan.refs[ci][0]], ds) } else { 4 };
         let bctx = ((qsc * 64 + sb) * 9 + ref_q) as usize & 4095;
         let bb = chn.bias[bctx];
         let bias = if bb[1] > 0 { bb[0] / bb[1] } else { 0 };
-        let mu16 = (blend16 + bias).clamp(0, m16);
+        let mu16 = (base16 + bias).clamp(0, m16);
         let pv = ((mu16 + 8) >> 4).min(maxv);
         let frac = (mu16 - pv * 16 + 8).clamp(0, 15) as u32 >> 1;
-
         let cq = (qs as usize).min(63);
 
         // ---- contexts
@@ -779,6 +641,7 @@ impl CtModel {
             tb.set(hh);
         }
         if !self.syn.is_empty() {
+            // exact values together with the pixel's already coded channels
             let (p1, p2) = if nref > 0 {
                 let a = self.cur_val[self.plan.refs[ci][0]];
                 let b = if nref > 1 { self.cur_val[self.plan.refs[ci][1]] } else { -1 };
@@ -786,12 +649,7 @@ impl CtModel {
             } else {
                 (-1, -1)
             };
-            let (wr, nr) = if nref > 0 {
-                let v = &self.ch[self.plan.refs[ci][0]].vals;
-                (v[r0 + xi - 1], v[r1 + xi])
-            } else {
-                (0, 0)
-            };
+            let (wr, nr) = if nref > 0 { (refv[0][1], refv[0][2]) } else { (0, 0) };
             let c = ci as i32;
             let hs = [
                 hash_slice(&[c, pv, p1, p2]),
@@ -811,15 +669,15 @@ impl CtModel {
         }
         self.sel = [qsc as usize, (frac as usize) | ((ci.min(3)) << 3), (rq0 as usize) + 9 * (qr(rw, ds) as usize % 7)];
         self.self_f = ci.min(3);
-        self.actx1 = cq.min(63);
+        self.actx1 = cq;
         self.actx2 = (hash2(c32 | 0xB00, (qr(rw, ds) << 8) | (qr(rn, ds) << 4) | rq0) & 1023) as usize;
         {
+            // one expert per selected predictor: (its local error, its offset from P)
             let chn = &self.ch[ci];
             let ne_ = chn.exp_idx.len().min(NEXP);
-            let blend_err = s16 * 8;
             for e in 0..ne_ {
                 let j = chn.exp_idx[e];
-                let (pj, ej) = if j == usize::MAX { (blend16, blend_err) } else { (p[j], errs[j]) };
+                let (pj, ej) = if j == BLEND { (base16, s16 * 8) } else { (p[j], errs[j]) };
                 let conf = (qlog((ej >> 3) >> ds) / 6).min(EXP_CONF as u32 - 1) as usize;
                 let qd = (qdev(pj - pv * 16, ds) - 1) / 2;
                 let b = ((ci * NEXP + e) * EXP_CONF + conf) * (EXP_QD * 2 * SLOTS) + qd * 2 * SLOTS;
@@ -856,34 +714,17 @@ impl CtModel {
             st.n_ch[ci] += 1;
             st.abs_ch[ci] += ae as f64;
             st.abs_mu += ae as f64;
-            st.abs_blend += (v16 - blend16).abs() as f64;
-            st.abs_ols += (v16 - po16).abs() as f64;
-            for j in 0..np.min(NPRED) {
-                st.abs_pred[j] += pe[j] as f64;
-                if ci == 0 {
-                    st.abs_pred0[j] += pe[j] as f64;
-                }
-            }
-            if ci == 0 {
-                st.abs_blend0 += (v16 - blend16).abs() as f64;
-            }
         }
+        // least-squares training weight: inverse local variance, so that smooth areas count
+        // as much as edges (the coding cost is logarithmic in the error)
         let vw = {
             let sc = s16 as f64 / 16.0 / (1 << ds) as f64 + self.tune.vw_c;
             1.0 / (sc * sc)
         };
-        let vm = self.tune.vw_mode;
-        if self.tune.ols_on != 0 {
-            chn.ols.update_w(v as f64, if vm & 2 != 0 { vw } else { 1.0 });
-        }
-        if self.tune.stack_on != 0 {
-            chn.stack.update_w(v as f64, if vm & 1 != 0 { vw } else { 1.0 });
-        }
-        if let Some(wl) = chn.wls.as_mut() {
-            wl.update(x, v as f64, if vm & 4 != 0 { vw } else { 1.0 });
-        }
+        chn.stack.update_w(v as f64, vw);
+        chn.wls.update(x, v as f64, vw);
         let bbm = &mut chn.bias[bctx];
-        bbm[0] += v16 - blend16;
+        bbm[0] += v16 - base16;
         bbm[1] += 1;
         if bbm[1] >= 64 {
             bbm[0] /= 2;
@@ -901,33 +742,9 @@ impl CtModel {
         for (i, tb) in self.tabs.iter().enumerate() {
             self.x[i] = t.stretch(tb.p(slot));
         }
-        let dis = self.tune.disable;
-        let cm = self.tune.ctx_mask;
-        if cm != 0 {
-            for i in 0..NCTX {
-                if cm & (1 << i) != 0 {
-                    self.x[i] = 0;
-                }
-            }
-        }
-        if dis & 4 != 0 {
-            self.x[6] = 0;
-            self.x[7] = 0;
-            self.x[8] = 0;
-        }
-        if dis & 16 != 0 {
-            for i in [1usize, 2, 3, 4, 5, 9, 10] {
-                self.x[i] = 0;
-            }
-        }
         let sl = self.side * SLOTS + slot;
         for e in 0..NEXP {
             self.x[NCTX + e] = if e < self.nexp { t.stretch(ctr_p16(unsafe { *self.exp_tab.get_unchecked(self.exp_base[e] + sl) })) } else { 0 };
-        }
-        if dis & 32 != 0 {
-            for e in 0..NEXP {
-                self.x[NCTX + e] = 0;
-            }
         }
         self.x[NCTX + NEXP] = 256;
         for (i, tb) in self.syn.iter().enumerate() {
@@ -938,23 +755,16 @@ impl CtModel {
         let d0 = self.m[0].mix(&self.x, self.sel[0] * SLOTS + slot, t);
         let d1 = self.m[1].mix(&self.x, self.sel[1] * SLOTS + slot, t);
         let d2 = self.m[2].mix(&self.x, self.sel[2] * SLOTS + slot, t);
-        let fin = if self.tune.disable & 128 != 0 { [d0, d1, 0, 256] } else if self.tune.disable & 256 != 0 { [d0, 0, d2, 256] } else if self.tune.disable & 512 != 0 { [0, d1, d2, 256] } else { [d0, d1, d2, 256] };
+        let fin = [d0, d1, d2, 256];
         let df = self.mf.mix(&fin, self.self_f * SLOTS + slot, t);
         let pa1 = self.apm1.pp(df, self.actx1 * SLOTS + slot);
         let pa2 = self.apm2.pp(df, self.actx2 * SLOTS + slot);
-        let p = clamp_p(match self.tune.apm_mix {
-            1 => (self.mf.pr + pa1 + 2 * pa2) >> 2,
-            2 => (self.mf.pr + 3 * pa2) >> 2,
-            3 => (2 * self.mf.pr + 3 * pa1 + 3 * pa2) >> 3,
-            4 => (self.mf.pr + pa1) >> 1,
-            _ => (2 * self.mf.pr + pa1 + pa2) >> 2,
-        });
+        let p = clamp_p((2 * self.mf.pr + pa1 + pa2) >> 2);
         let bit = coder.code(bit, p);
         if let Some(st) = self.stats.as_mut() {
             let pp = if bit != 0 { p as f64 / 65536.0 } else { 1.0 - p as f64 / 65536.0 };
             st.cost_slot[slot] -= pp.log2();
-            let c = st.cur_ch;
-            st.cost_ch[c] -= pp.log2();
+            st.cost_ch[st.cur_ch] -= pp.log2();
             st.cnt_slot[slot] += 1;
         }
         let rc = &t.recip;
@@ -978,10 +788,11 @@ impl CtModel {
         bit
     }
 
+    /// Binarisation: zero flag, sign, unary over magnitude buckets [2^i, 2^(i+1)), then the
+    /// bits inside the bucket MSB first. Decisions forced by the value range are skipped.
     fn code_residual<C: BitCoder>(&mut self, coder: &mut C, r_enc: i32, pv: i32) -> i32 {
         let maxv = self.maxv;
-        let z = self.code_bit(coder, SLOT_ZERO, (r_enc == 0) as u32);
-        if z == 1 {
+        if self.code_bit(coder, SLOT_ZERO, (r_enc == 0) as u32) == 1 {
             return 0;
         }
         let pos = if pv == 0 {
@@ -992,7 +803,7 @@ impl CtModel {
             self.code_bit(coder, SLOT_SIGN, (r_enc > 0) as u32) == 1
         };
         let maxmag = if pos { maxv - pv } else { pv };
-        self.side = if self.tune.disable & 64 != 0 { 0 } else { pos as usize };
+        self.side = pos as usize;
         let mag_enc = r_enc.abs();
         let mut i = 0u32;
         loop {
@@ -1000,8 +811,7 @@ impl CtModel {
             if next_lo > maxmag {
                 break;
             }
-            let bit = self.code_bit(coder, slot_unary(i), (mag_enc >= next_lo) as u32);
-            if bit == 0 {
+            if self.code_bit(coder, slot_unary(i), (mag_enc >= next_lo) as u32) == 0 {
                 break;
             }
             i += 1;
@@ -1013,8 +823,7 @@ impl CtModel {
             if mid > hi {
                 continue;
             }
-            let bit = self.code_bit(coder, slot_mant(i, i - 1 - j), (mag_enc >= mid) as u32);
-            if bit == 1 {
+            if self.code_bit(coder, slot_mant(i, i - 1 - j), (mag_enc >= mid) as u32) == 1 {
                 lo = mid;
             } else {
                 hi = mid - 1;

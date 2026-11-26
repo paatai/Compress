@@ -1,1 +1,135 @@
-{"categories": [], "codecs": [], "notes": []}
+{
+ "categories": [
+  {
+   "id": "photo_kodak",
+   "label": "Kodak photos",
+   "images": 24,
+   "megapixels": 9.437184
+  },
+  {
+   "id": "photo_div2k",
+   "label": "DIV2K photos",
+   "images": 10,
+   "megapixels": 27.98064
+  },
+  {
+   "id": "screenshot",
+   "label": "Screenshots",
+   "images": 12,
+   "megapixels": 9.270894
+  },
+  {
+   "id": "graphics",
+   "label": "Charts, diagrams, maps",
+   "images": 12,
+   "megapixels": 10.701652
+  }
+ ],
+ "codecs": [
+  {
+   "id": "zip",
+   "label": "ZIP -9 (of BMP)",
+   "bpp": {
+    "photo_kodak": 15.0152,
+    "photo_div2k": 19.8078,
+    "screenshot": 2.4528,
+    "graphics": 0.5515,
+    "total": 12.6254
+   }
+  },
+  {
+   "id": "xz",
+   "label": "xz -9e (of BMP)",
+   "bpp": {
+    "photo_kodak": 12.2756,
+    "photo_div2k": 15.789,
+    "screenshot": 1.5346,
+    "graphics": 0.3205,
+    "total": 10.0242
+   }
+  },
+  {
+   "id": "png-zopfli",
+   "label": "PNG (zopflipng -m)",
+   "bpp": {
+    "photo_kodak": 12.4746,
+    "photo_div2k": 12.3837,
+    "screenshot": 1.5461,
+    "graphics": 0.4609,
+    "total": 8.4247
+   }
+  },
+  {
+   "id": "flif",
+   "label": "FLIF",
+   "bpp": {
+    "photo_kodak": 8.6924,
+    "photo_div2k": 9.3078,
+    "screenshot": 1.3684,
+    "graphics": 0.3036,
+    "total": 6.2451
+   }
+  },
+  {
+   "id": "avif",
+   "label": "AVIF lossless",
+   "bpp": {
+    "photo_kodak": 11.295,
+    "photo_div2k": 10.9702,
+    "screenshot": 2.4296,
+    "graphics": 0.7048,
+    "total": 7.7298
+   }
+  },
+  {
+   "id": "webp",
+   "label": "WebP lossless",
+   "bpp": {
+    "photo_kodak": 9.4978,
+    "photo_div2k": 9.7087,
+    "screenshot": 1.0925,
+    "graphics": 0.2547,
+    "total": 6.5193
+   }
+  },
+  {
+   "id": "jxl-e9",
+   "label": "JPEG XL e9",
+   "bpp": {
+    "photo_kodak": 8.4851,
+    "photo_div2k": 8.9105,
+    "screenshot": 1.3363,
+    "graphics": 0.3353,
+    "total": 6.018
+   }
+  },
+  {
+   "id": "jxl-e10",
+   "label": "JPEG XL e10",
+   "bpp": {
+    "photo_kodak": 8.4393,
+    "photo_div2k": 8.734,
+    "screenshot": 1.1125,
+    "graphics": 0.2501,
+    "total": 5.8723
+   }
+  },
+  {
+   "id": "kolmo",
+   "label": "Kolmo",
+   "bpp": {
+    "photo_kodak": 7.9843,
+    "photo_div2k": 8.2389,
+    "screenshot": 0.8325,
+    "graphics": 0.1669,
+    "total": 5.4954
+   },
+   "kolmo": true
+  }
+ ],
+ "notes": [
+  "Test set: the 24 Kodak images, DIV2K validation images 0801-0810, and 24 screenshots and graphics selected deterministically from Wikimedia Commons; a disjoint development set was used for tuning.",
+  "ZIP and xz compress an uncompressed BMP of the same pixels. Baselines: libjxl 0.13.0, libwebp 1.6.0, libavif 1.4.2 (aom 3.14.1), FLIF 0.4, zopflipng 1.0.3, Info-ZIP 3.0, XZ Utils 5.4.5. RAR, 7-Zip, QOI and oxipng results are in the README.",
+  "Kolmo decodes at about the same speed as it encodes (roughly 0.15 megapixels per second per core), much slower than the other image formats."
+ ]
+}

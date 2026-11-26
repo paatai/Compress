@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Unit and round-trip tests
+        run: cargo test --release
+      - name: Build CLI and WebAssembly
+        run: |
+          cargo build --release -p kolmo-cli
+          RUSTFLAGS="-C target-feature=+simd128" cargo build -p kolmo-wasm --target wasm32-unknown-unknown --profile wasm
+      - name: Native and WebAssembly produce identical files
+        run: |
+          python3 -m pip install --quiet pillow numpy || pip3 install --quiet --break-system-packages pillow numpy
+          python3 tests/make_edge_cases.py edge
+          node tests/cross_target.mjs target/wasm32-unknown-unknown/wasm/kolmo_wasm.wasm target/release/kolmo edge/*
+          ./target/release/kolmo bench edge/*

@@ -54,7 +54,7 @@ export function JobCard({
   }
   if (kolmoBytes) rows.push({ label: 'Kolmo', detail: '.kolmo file', measure: job.kolmo || job.kind === 'decompress' ? { state: 'done', bytes: kolmoBytes } : { state: 'running' }, highlight: true })
 
-  const canCompare = job.kind === 'compress' && job.status === 'done' && !!job.samples && job.webp.state === 'idle'
+  const canCompare = job.kind === 'compress' && (job.status === 'done' || job.status === 'verifying') && !!job.samples && job.webp.state === 'idle'
 
   return (
     <Card className="overflow-hidden">
@@ -90,7 +90,7 @@ export function JobCard({
               </div>
               <p className="text-sm text-muted-foreground">
                 {formatBytes(job.inputBytes)}
-                {job.status === 'done' && job.seconds !== undefined && (
+                {job.status !== 'running' && job.status !== 'error' && job.seconds !== undefined && (
                   <>
                     {' · '}
                     {job.kind === 'compress' ? 'compressed' : 'decoded'} in {formatSeconds(job.seconds)}
@@ -111,7 +111,7 @@ export function JobCard({
             </div>
           )}
 
-          {job.status === 'running' && (
+          {(job.status === 'running' || job.status === 'verifying') && (
             <div className="space-y-2">
               <div className="flex items-center justify-between text-sm">
                 <span className="flex items-center gap-2">
@@ -126,7 +126,7 @@ export function JobCard({
 
           {job.status !== 'error' && info && rows.length > 0 && <SizeTable rows={rows} pixels={pixels} kolmoBytes={kolmoBytes} />}
 
-          {job.status === 'done' && (
+          {(job.status === 'done' || job.status === 'verifying') && (
             <div className="space-y-3">
               {job.kind === 'compress' && job.verified === 'ok' && (
                 <div className="flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm">
