@@ -1,4 +1,4 @@
-use komla::{ct::Tuning, io, Options};
+use komla::{ct::Tuning, io, jpeg, Options};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -8,15 +8,19 @@ const USAGE: &str = "\
 Komla - lossless image compression by context mixing
 
 USAGE:
-  komla compress   <input.png|input.bmp> [-o output.komla]
-  komla decompress <input.komla> [-o output.png|output.bmp]
+  komla compress   <input.png|input.bmp|input.jpg> [-o output.komla]
+  komla decompress <input.komla> [-o output.png|output.bmp|output.jpg]
   komla info       <input.komla>
   komla bench      [-j threads] [--no-verify] <images...>
   komla pixhash    <images...>   (SHA-256 of pixels normalised to RGBA)
 
 compress writes <input>.komla by default; decompress restores the original
 file type (PNG or BMP) unless -o names another extension. Decompression checks
-the embedded CRC-32 of the pixels and fails loudly on any mismatch.";
+the embedded CRC-32 of the pixels and fails loudly on any mismatch.
+
+JPEG files are recompressed losslessly: decompress gives back the original file
+byte for byte (checked with a CRC-32 of the whole file). JPEGs that cannot be
+reproduced exactly from their coefficients are stored as they are.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -91,9 +95,62 @@ fn read(p: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))
 }
 
+fn jpeg_mode(info: &jpeg::JpegInfo) -> String {
+    match info.mode {
+        jpeg::MODE_JPEG => format!(
+            "{} x {} {} {}JPEG, {} stripe(s)",
+            info.width,
+            info.height,
+            info.sampling,
+            if info.progressive { "progressive " } else { "" },
+            info.stripes
+        ),
+        _ => format!("stored ({})", if info.note.is_empty() { "not recompressed" } else { &info.note }),
+    }
+}
+
+fn compress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8]) -> Result<(), String> {
+    let t0 = Instant::now();
+    let (out, info) = jpeg::compress(bytes, &mut |_| {});
+    let dt = t0.elapsed().as_secs_f64();
+    let output = output.unwrap_or_else(|| {
+        let mut s = input.as_os_str().to_owned();
+        s.push(".komla");
+        PathBuf::from(s)
+    });
+    std::fs::write(&output, &out).map_err(|e| format!("{}: {e}", output.display()))?;
+    println!(
+        "{} -> {}: {}, {} -> {} bytes ({:.2}% smaller) in {:.2}s",
+        input.display(),
+        output.display(),
+        jpeg_mode(&info),
+        bytes.len(),
+        out.len(),
+        100.0 * (1.0 - out.len() as f64 / bytes.len() as f64),
+        dt
+    );
+    Ok(())
+}
+
+fn decompress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8]) -> Result<(), String> {
+    let t0 = Instant::now();
+    let out = jpeg::decompress(bytes, &mut |_| {})?;
+    let dt = t0.elapsed().as_secs_f64();
+    let output = output.unwrap_or_else(|| {
+        let stem = input.to_string_lossy();
+        PathBuf::from(stem.strip_suffix(".komla").map(str::to_string).unwrap_or_else(|| format!("{stem}.jpg")))
+    });
+    std::fs::write(&output, &out).map_err(|e| format!("{}: {e}", output.display()))?;
+    println!("{} -> {}: {} bytes, checksum OK, in {:.2}s", input.display(), output.display(), out.len(), dt);
+    Ok(())
+}
+
 fn cmd_compress(args: &[String]) -> Result<(), String> {
     let (input, output) = split_out(args)?;
     let bytes = read(&input)?;
+    if jpeg::is_jpeg(&bytes) {
+        return compress_jpeg(&input, output, &bytes);
+    }
     let (img, src) = io::read_image(&bytes)?;
     let t0 = Instant::now();
     let out = komla::compress(&img, src, &options(), &mut |_| {})?;
@@ -124,6 +181,9 @@ fn cmd_compress(args: &[String]) -> Result<(), String> {
 fn cmd_decompress(args: &[String]) -> Result<(), String> {
     let (input, output) = split_out(args)?;
     let bytes = read(&input)?;
+    if jpeg::is_container(&bytes) {
+        return decompress_jpeg(&input, output, &bytes);
+    }
     let t0 = Instant::now();
     let (img, src) = komla::decompress(&bytes, &options(), &mut |_| {})?;
     let dt = t0.elapsed().as_secs_f64();
@@ -153,6 +213,21 @@ fn cmd_decompress(args: &[String]) -> Result<(), String> {
 fn cmd_info(args: &[String]) -> Result<(), String> {
     let (input, _) = split_out(args)?;
     let bytes = read(&input)?;
+    if jpeg::is_container(&bytes) {
+        let c = jpeg::parse_container(&bytes)?;
+        let info = jpeg::info(&bytes)?;
+        println!(
+            "{}: Komla JPEG v{}, {}, original {} bytes, crc32 {:08x}, {} bytes ({:.2}% smaller)",
+            input.display(),
+            jpeg::VERSION,
+            jpeg_mode(&info),
+            c.len,
+            c.crc,
+            bytes.len(),
+            100.0 * (1.0 - bytes.len() as f64 / c.len.max(1) as f64)
+        );
+        return Ok(());
+    }
     let (h, hl) = komla::parse_header(&bytes)?;
     let stripes = komla::split_stripes(&bytes, &h, hl)?;
     let mode = if h.mode & komla::MODE_PALETTE != 0 {
@@ -221,6 +296,99 @@ fn cmd_pixhash(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+struct JpegRow {
+    name: String,
+    input: usize,
+    size: usize,
+    enc_s: f64,
+    dec_s: f64,
+    ok: Option<bool>,
+    mode: String,
+}
+
+/// Compresses, decompresses and compares JPEG files byte for byte (SHA-256).
+fn bench_jpeg(files: &[PathBuf], threads: usize, verify: bool) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let next = AtomicUsize::new(0);
+    let rows: Mutex<Vec<Option<JpegRow>>> = Mutex::new((0..files.len()).map(|_| None).collect());
+    std::thread::scope(|s| {
+        for _ in 0..threads.max(1) {
+            s.spawn(|| loop {
+                let k = next.fetch_add(1, Ordering::SeqCst);
+                if k >= files.len() {
+                    break;
+                }
+                let f = &files[k];
+                let row = (|| -> Result<JpegRow, String> {
+                    let bytes = read(f)?;
+                    if !jpeg::is_jpeg(&bytes) {
+                        return Err("not a JPEG file".into());
+                    }
+                    let t0 = Instant::now();
+                    let (c, info) = jpeg::compress(&bytes, &mut |_| {});
+                    let enc_s = t0.elapsed().as_secs_f64();
+                    let (dec_s, ok) = if verify {
+                        let t1 = Instant::now();
+                        let d = jpeg::decompress(&c, &mut |_| {});
+                        let dec_s = t1.elapsed().as_secs_f64();
+                        (dec_s, Some(d.is_ok_and(|d| Sha256::digest(&d) == Sha256::digest(&bytes))))
+                    } else {
+                        (0.0, None)
+                    };
+                    Ok(JpegRow { name: f.file_name().unwrap().to_string_lossy().into_owned(), input: bytes.len(), size: c.len(), enc_s, dec_s, ok, mode: jpeg_mode(&info) })
+                })();
+                match row {
+                    Ok(r) => {
+                        eprintln!(
+                            "{:<32} {:>10} -> {:>10} {:>6.2}% {:>7.2}s {:>7.2}s {:<8} {}",
+                            r.name,
+                            r.input,
+                            r.size,
+                            100.0 * (1.0 - r.size as f64 / r.input as f64),
+                            r.enc_s,
+                            r.dec_s,
+                            match r.ok {
+                                Some(true) => "OK",
+                                Some(false) => "MISMATCH",
+                                None => "-",
+                            },
+                            r.mode
+                        );
+                        rows.lock().unwrap()[k] = Some(r);
+                    }
+                    Err(e) => eprintln!("{}: {e}", f.display()),
+                }
+            });
+        }
+    });
+    let rows = rows.into_inner().unwrap();
+    let (mut ti, mut tb, mut te, mut td, mut fails) = (0usize, 0usize, 0f64, 0f64, 0);
+    for r in rows.iter().flatten() {
+        println!("{}\t{}\t{}\t{:.3}\t{:.3}", r.name, r.input, r.size, r.enc_s, r.dec_s);
+        ti += r.input;
+        tb += r.size;
+        te += r.enc_s;
+        td += r.dec_s;
+        if r.ok == Some(false) {
+            fails += 1;
+        }
+    }
+    println!(
+        "TOTAL\t{}\t{}\t{:.3}% smaller\t{:.1}s enc ({:.2} MB/s)\t{:.1}s dec\t{} failures",
+        ti,
+        tb,
+        100.0 * (1.0 - tb as f64 / ti.max(1) as f64),
+        te,
+        ti as f64 / te.max(1e-9) / 1e6,
+        td,
+        fails
+    );
+    if fails > 0 {
+        return Err(format!("{fails} round-trip failures"));
+    }
+    Ok(())
+}
+
 struct BenchRow {
     name: String,
     pixels: usize,
@@ -249,6 +417,9 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
     }
     if files.is_empty() {
         return Err("no input files".into());
+    }
+    if read(&files[0]).is_ok_and(|b| jpeg::is_jpeg(&b)) {
+        return bench_jpeg(&files, threads, verify);
     }
     let opts = options();
     let next = AtomicUsize::new(0);

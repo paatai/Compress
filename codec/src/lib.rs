@@ -13,6 +13,7 @@ pub mod coder;
 pub mod ct;
 pub mod detmath;
 pub mod io;
+pub mod jpeg;
 pub mod ols;
 pub mod pal;
 pub mod pix;
