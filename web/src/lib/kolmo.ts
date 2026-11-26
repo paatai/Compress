@@ -133,17 +133,33 @@ export async function compress(file: ArrayBuffer, onProgress: (p: Progress) => v
   const t0 = performance.now()
   onProgress({ stage: 'Reading image', fraction: 0 })
   const prep = await pool.run<Prepared>({ op: 'prepare', file }, [file])
-  const { header, stripes, info, coded } = prep
-  const rowBytes = info.width * info.codedChannels * 2
-  const progress = stripeProgress(stripes, 'Compressing', onProgress)
+  const { candidates, coded } = prep
+  const jobs = candidates.flatMap((c, ci) => c.stripes.map((s) => ({ ci, s })))
+  const stage = candidates.length > 1 ? 'Compressing (trying palette and continuous-tone modes)' : 'Compressing'
+  const progress = stripeProgress(
+    jobs.map((j) => j.s),
+    stage,
+    onProgress,
+  )
   const streams = await Promise.all(
-    stripes.map(([y0, y1], k) => {
+    jobs.map(({ ci, s: [y0, y1] }, k) => {
+      const c = candidates[ci]
+      const rowBytes = c.info.width * c.info.codedChannels * 2
       const rows = coded.slice(y0 * rowBytes, y1 * rowBytes)
-      return pool.run<Uint8Array>({ op: 'encodeStripe', header, rows, height: y1 - y0 }, [rows.buffer], progress(k))
+      return pool.run<Uint8Array>({ op: 'encodeStripe', header: c.header, rows, height: y1 - y0 }, [rows.buffer], progress(k))
     }),
   )
-  const kolmo = assemble(header, streams)
-  return { kolmo, info, stripes: stripes.length, samples: prep.samples, seconds: (performance.now() - t0) / 1000 }
+  let best: { kolmo: Uint8Array; ci: number } | null = null
+  candidates.forEach((c, ci) => {
+    const kolmo = assemble(
+      c.header,
+      jobs.flatMap((j, k) => (j.ci === ci ? [streams[k]] : [])),
+    )
+    if (!best || kolmo.length < best.kolmo.length) best = { kolmo, ci }
+  })
+  const chosen = best!
+  const cand = candidates[chosen.ci]
+  return { kolmo: chosen.kolmo, info: cand.info, stripes: cand.stripes.length, samples: prep.samples, seconds: (performance.now() - t0) / 1000 }
 }
 
 export interface DecompressResult {

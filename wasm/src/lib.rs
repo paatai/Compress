@@ -110,26 +110,30 @@ fn u16s(b: &[u8]) -> Vec<u16> {
 }
 
 /// Input: PNG/BMP file. Result:
-///   u32 header_len, header, u32 n_stripes, n x (u32 y0, u32 y1), info block (20 bytes),
-///   u32 sample_bytes_len, original sample bytes, coded samples (u16 LE).
+///   u32 n_candidates, then per candidate: u32 header_len, header, u32 n_stripes,
+///   n x (u32 y0, u32 y1), info block (20 bytes); then u32 sample_bytes_len, original
+///   sample bytes, coded samples (u16 LE). The page codes every candidate and keeps the smallest.
 /// # Safety
 /// `ptr`/`len` must describe a readable buffer.
 #[no_mangle]
 pub unsafe extern "C" fn kolmo_prepare(ptr: *const u8, len: usize) -> i32 {
     let r = io::read_image(slice(ptr, len)).and_then(|(img, src)| {
         let prep = kolmo::prepare(&img, src)?;
-        let stripes = prep.info.stripes();
         let samples = img.sample_bytes();
         drop(img);
-        let mut v = Vec::with_capacity(64 + prep.header.len() + samples.len() + prep.coded.data.len() * 2);
-        put32(&mut v, prep.header.len() as u32);
-        v.extend_from_slice(&prep.header);
-        put32(&mut v, stripes.len() as u32);
-        for (a, b) in &stripes {
-            put32(&mut v, *a as u32);
-            put32(&mut v, *b as u32);
+        let mut v = Vec::with_capacity(256 + samples.len() + prep.coded.data.len() * 2);
+        put32(&mut v, prep.candidates.len() as u32);
+        for c in &prep.candidates {
+            let stripes = c.info.stripes();
+            put32(&mut v, c.header.len() as u32);
+            v.extend_from_slice(&c.header);
+            put32(&mut v, stripes.len() as u32);
+            for (a, b) in &stripes {
+                put32(&mut v, *a as u32);
+                put32(&mut v, *b as u32);
+            }
+            info_block(&mut v, &c.info);
         }
-        info_block(&mut v, &prep.info);
         put32(&mut v, samples.len() as u32);
         v.extend_from_slice(&samples);
         for s in &prep.coded.data {

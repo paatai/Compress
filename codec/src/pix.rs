@@ -7,8 +7,8 @@ use crate::coder::BitCoder;
 use crate::primitives::*;
 
 const NCAND: usize = 5;
-const NT: usize = 8;
-const NIN: usize = NT + 1;
+const NT: usize = 17;
+const NIN: usize = 2 * NT + 1;
 
 pub const KIND_NONE: u8 = 0;
 const KIND_W: u8 = 1;
@@ -29,14 +29,24 @@ pub struct PixModel {
     mlen: u32,
     mhash: u32,
     run: u32,
-    tabs: Vec<CtxTable>,
+    tabs: Vec<HistTable>,
     mixer: Mixer,
     mixer2: Mixer,
+    mf: Mixer,
     apm: Apm,
+    apm2: Apm,
     x: [i32; NIN],
     // per-pixel state
     cands: [(u64, u8); NCAND],
     ncand: usize,
+    pub flags_off: bool,
+    stats: bool,
+    pub cost: f64,
+    pub cost_by: [[f64; 2]; 8],
+    pub cnt_by: [[u64; 2]; 8],
+    pub resolved: u64,
+    pub total: u64,
+    pub mpred: u64,
     eqp: u32,
     sel: usize,
 }
@@ -44,7 +54,7 @@ pub struct PixModel {
 const NONE: u64 = u64::MAX;
 
 impl PixModel {
-    pub fn new(w: usize, h: usize) -> Self {
+    pub fn new(w: usize, h: usize, flags: bool) -> Self {
         let t = tables();
         let px = (w * h) as u64;
         let lb = (64 - px.leading_zeros()).clamp(10, 20);
@@ -61,13 +71,23 @@ impl PixModel {
             mlen: 0,
             mhash: 0,
             run: 0,
-            tabs: (0..NT).map(|i| CtxTable::new(if i < 3 { 12 } else { lb }, 3, 255)).collect(),
-            mixer: Mixer::new(NIN, 8 * 256, 600, 1 << 14),
-            mixer2: Mixer::new(NIN, 8 * 64, 600, 1 << 14),
+            tabs: (0..NT).map(|i| HistTable::new(if i < 3 { 12 } else { lb.min(18) }, 3)).collect(),
+            mixer: Mixer::new(NIN, 8 * 256, 800, 1 << 13),
+            mixer2: Mixer::new(NIN, 8 * 64, 800, 1 << 13),
+            mf: Mixer::new(3, 8 * 8, 500, 30000),
             apm: Apm::new(8 * 1024, 6, t),
+            apm2: Apm::new(8 * 4096, 6, t),
             x: [0; NIN],
             cands: [(NONE, 0); NCAND],
             ncand: 0,
+            flags_off: !flags,
+            stats: std::env::var_os("KOLMO_STATS").is_some(),
+            cost: 0.0,
+            cost_by: [[0.0; 2]; 8],
+            cnt_by: [[0; 2]; 8],
+            resolved: 0,
+            total: 0,
+            mpred: NONE,
             eqp: 0,
             sel: 0,
         }
@@ -150,6 +170,28 @@ impl PixModel {
             _ => 5,
         };
         let rq = self.run.min(15);
+        let ahead = |row: isize, refk: u64| -> u32 {
+            if row < 0 || refk == NONE {
+                return 0;
+            }
+            let base = row as usize * self.w;
+            let mut k = 0u32;
+            let mut xx = x + 1;
+            while k < 31 && xx < self.w && self.keys[base + xx] == refk {
+                k += 1;
+                xx += 1;
+            }
+            k
+        };
+        let an = ahead(yi - 1, n);
+        let ann = ahead(yi - 2, nn);
+        let aq = |a: u32| if a < 4 { a } else { 4 + (31 - a.leading_zeros()).min(4) - 2 };
+        let (anq, annq) = (aq(an), aq(ann));
+        let rl = if self.run < 4 { self.run } else { 4 + (31 - self.run.leading_zeros()).min(8) - 2 };
+        self.mpred = m;
+        if self.flags_off {
+            return None;
+        }
         let mut found = None;
         for i in 0..nc {
             let (ck, kind) = self.cands[i];
@@ -163,6 +205,15 @@ impl PixModel {
                 hash_slice(&[kk as i32 | 0x500, w as i32, n as i32, nw as i32, ne as i32]),
                 hash_slice(&[kk as i32 | 0x600, eqp as i32, hw as i32, hn as i32, mq as i32, ww as i32, nn as i32]),
                 hash2(kk | 0x700, (eqp << 8) | (hw << 4) | hn),
+                hash_slice(&[kk as i32 | 0x800, ck as i32, (ck >> 32) as i32]),
+                hash_slice(&[kk as i32 | 0x900, w as i32, ne as i32]),
+                hash_slice(&[kk as i32 | 0xA00, n as i32, nn as i32, nne as i32]),
+                hash_slice(&[kk as i32 | 0xB00, w as i32, ww as i32, nw as i32]),
+                hash_slice(&[kk as i32 | 0xC00, x as i32, eqp as i32]),
+                hash_slice(&[kk as i32 | 0xD00, ck as i32, w as i32, hw as i32]),
+                hash2(kk | 0xE00, (anq << 12) | (annq << 8) | rl),
+                hash2(kk | 0xF00, (anq << 12) | (eqp << 4) | hw),
+                hash_slice(&[kk as i32 | 0x1000, anq as i32, rl as i32, w as i32, n as i32]),
             ];
             for (tb, &hh) in self.tabs.iter_mut().zip(h.iter()) {
                 tb.set(hh);
@@ -174,8 +225,10 @@ impl PixModel {
                 break;
             }
         }
+        self.total += 1;
         found.map(|(k, kind)| {
             self.hit[pos] = kind;
+            self.resolved += 1;
             k
         })
     }
@@ -184,15 +237,25 @@ impl PixModel {
     fn code_bit<C: BitCoder>(&mut self, coder: &mut C, bit: u32, slot: usize, eqp: u32) -> u32 {
         let t = self.t;
         for (i, tb) in self.tabs.iter().enumerate() {
-            self.x[i] = t.stretch(tb.p(slot));
+            let (a, r) = tb.inputs(slot, t);
+            self.x[2 * i] = a;
+            self.x[2 * i + 1] = r;
         }
-        self.x[NT] = 256;
+        self.x[2 * NT] = 256;
         let d1 = self.mixer.mix(&self.x, self.sel % (8 * 256), t);
         let d2 = self.mixer2.mix(&self.x, slot * 64 + (eqp as usize & 63), t);
-        let d = (d1 + d2) / 2;
+        let fin = [d1, d2, 256];
+        let d = self.mf.mix(&fin, slot * 8 + (self.sel & 7), t);
         let pa = self.apm.pp(d, (slot * 128 + eqp as usize) % (8 * 1024));
-        let p = clamp_p((t.squash(d) + 3 * pa) >> 2);
+        let pa2 = self.apm2.pp(d, slot * 4096 + (self.sel & 4095));
+        let p = clamp_p((2 * self.mf.pr + pa + pa2) >> 2);
         let bit = coder.code(bit, p);
+        if self.stats {
+            let pp = if bit != 0 { p as f64 / 65536.0 } else { 1.0 - p as f64 / 65536.0 };
+            self.cost -= pp.log2();
+            self.cost_by[slot][bit as usize] -= pp.log2();
+            self.cnt_by[slot][bit as usize] += 1;
+        }
         let rc = &t.recip;
         for tb in self.tabs.iter_mut() {
             tb.update(slot, bit, rc);
@@ -200,12 +263,18 @@ impl PixModel {
         let x = self.x;
         self.mixer.update(&x, bit);
         self.mixer2.update(&x, bit);
+        self.mf.update(&fin, bit);
         self.apm.update(bit);
+        self.apm2.update(bit);
         bit
     }
 
     pub fn eqp(&self) -> u32 {
         self.eqp
+    }
+
+    pub fn mlen(&self) -> u32 {
+        self.mlen
     }
 
     /// Records the final value of pixel (x, y) (after channel coding if no candidate matched).

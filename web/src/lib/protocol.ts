@@ -19,10 +19,14 @@ export type WorkerRequest =
   | { op: 'finish'; header: Uint8Array; coded: Uint8Array; wantPng: boolean }
   | { op: 'readImage'; file: ArrayBuffer }
 
-export interface Prepared {
+export interface Candidate {
   header: Uint8Array
   stripes: [number, number][]
   info: ImageInfo
+}
+
+export interface Prepared {
+  candidates: Candidate[]
   samples: Uint8Array
   coded: Uint8Array
 }

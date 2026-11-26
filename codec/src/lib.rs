@@ -168,6 +168,7 @@ fn expand(img: Image, red: u8, target_channels: u8) -> Image {
 
 pub const MODE_PALETTE: u8 = 1;
 pub const MODE_PIXFLAGS: u8 = 4;
+const PALETTE_MAX: usize = 4096;
 /// Images are split into independent stripes of about this many pixels so that large
 /// photos can be coded on several cores; images up to this size use a single stripe.
 pub const STRIPE_PIXELS: usize = 1 << 22;
@@ -214,8 +215,9 @@ fn pack(p: &[u16]) -> u64 {
     k
 }
 
-/// Chooses the coding mode from simple image statistics.
-fn choose_mode(img: &Image) -> (u8, Option<Vec<u64>>) {
+/// Candidate coding modes from simple image statistics. With more than one candidate the
+/// encoder codes the image every way and keeps the smallest file.
+fn choose_modes(img: &Image) -> Vec<(u8, Option<Vec<u64>>)> {
     let nc = img.channels as usize;
     let w = img.width as usize;
     let mut colors: Vec<u64> = Vec::new();
@@ -223,7 +225,7 @@ fn choose_mode(img: &Image) -> (u8, Option<Vec<u64>>) {
     let mut eq = 0usize;
     for (i, p) in img.data.chunks_exact(nc).enumerate() {
         let k = pack(p);
-        if seen.len() <= 256 && seen.insert(k) {
+        if seen.len() <= PALETTE_MAX && seen.insert(k) {
             colors.push(k);
         }
         let x = i % w;
@@ -232,14 +234,19 @@ fn choose_mode(img: &Image) -> (u8, Option<Vec<u64>>) {
         }
     }
     let eq_rate = eq as f64 / img.pixels() as f64;
-    if colors.len() <= 256 {
+    let ct = (if eq_rate > 0.25 { MODE_PIXFLAGS } else { 0 }, None);
+    let single_stripe = img.pixels() <= STRIPE_PIXELS;
+    if colors.len() <= PALETTE_MAX && (colors.len() <= 256 || single_stripe) {
         sort_palette(&mut colors, nc);
-        return (MODE_PALETTE | MODE_PIXFLAGS, Some(colors));
+        let pal = (MODE_PALETTE, Some(colors));
+        return match std::env::var("KOLMO_MODE").as_deref() {
+            Ok("ct") => vec![ct],
+            Ok("pal") => vec![pal],
+            _ if pal.1.as_ref().is_some_and(|c| c.len() <= 256) => vec![pal],
+            _ => vec![ct, pal],
+        };
     }
-    if eq_rate > 0.25 {
-        return (MODE_PIXFLAGS, None);
-    }
-    (0, None)
+    vec![ct]
 }
 
 /// Palette order: by luminance, then by value, so that similar colours get nearby indices.
@@ -256,7 +263,7 @@ fn sort_palette(colors: &mut [u64], nc: usize) {
 
 fn code_palette<C: coder::BitCoder>(c: &mut C, pal: &mut Vec<u64>, nc: usize, depth: u8, enc: bool) {
     let t = primitives::tables();
-    let n = c.code_raw(pal.len().saturating_sub(1) as u32, 8) as usize + 1;
+    let n = c.code_raw(pal.len().saturating_sub(1) as u32, 12) as usize + 1;
     let bits = depth as u32;
     let mut ctr = vec![primitives::CTR_INIT; 4 * (1 << 17)];
     let mut prev = [0u32; 4];
@@ -287,11 +294,15 @@ fn code_palette<C: coder::BitCoder>(c: &mut C, pal: &mut Vec<u64>, nc: usize, de
     }
 }
 
-/// An image ready to be coded stripe by stripe.
-pub struct Prepared {
+/// One way of coding an image: its stream description and fixed header bytes.
+pub struct Candidate {
     pub info: StreamInfo,
-    /// Fixed header bytes (everything before the stripe table).
     pub header: Vec<u8>,
+}
+
+/// An image ready to be coded stripe by stripe, with one or more candidate modes.
+pub struct Prepared {
+    pub candidates: Vec<Candidate>,
     /// Samples after channel reductions, interleaved, row-major.
     pub coded: Image,
 }
@@ -308,37 +319,40 @@ pub fn prepare(img: &Image, src: SourceFormat) -> Result<Prepared, String> {
     }
     let crc = crc32(&img.sample_bytes());
     let (coded, red) = reduce(img);
-    let (mode, palette) = choose_mode(&coded);
-    let mut header = Vec::new();
-    header.extend_from_slice(MAGIC);
-    header.push(VERSION);
-    header.push(img.channels | if img.depth == 16 { 8 } else { 0 } | ((src as u8) << 4));
-    put_varint(&mut header, img.width);
-    put_varint(&mut header, img.height);
-    header.push(red);
-    header.push(mode);
-    header.extend_from_slice(&crc.to_le_bytes());
-    if let Some(pal) = &palette {
-        let mut e = coder::Encoder::new();
-        let mut p = pal.clone();
-        code_palette(&mut e, &mut p, coded.channels as usize, img.depth, true);
-        let block = e.finish();
-        put_varint(&mut header, block.len() as u32);
-        header.extend_from_slice(&block);
+    let mut candidates = Vec::new();
+    for (mode, palette) in choose_modes(&coded) {
+        let mut header = Vec::new();
+        header.extend_from_slice(MAGIC);
+        header.push(VERSION);
+        header.push(img.channels | if img.depth == 16 { 8 } else { 0 } | ((src as u8) << 4));
+        put_varint(&mut header, img.width);
+        put_varint(&mut header, img.height);
+        header.push(red);
+        header.push(mode);
+        header.extend_from_slice(&crc.to_le_bytes());
+        if let Some(pal) = &palette {
+            let mut e = coder::Encoder::new();
+            let mut p = pal.clone();
+            code_palette(&mut e, &mut p, coded.channels as usize, img.depth, true);
+            let block = e.finish();
+            put_varint(&mut header, block.len() as u32);
+            header.extend_from_slice(&block);
+        }
+        let info = StreamInfo {
+            width: img.width,
+            height: img.height,
+            channels: img.channels,
+            depth: img.depth,
+            source: src,
+            reductions: red,
+            mode,
+            crc,
+            coded_channels: coded.channels,
+            palette,
+        };
+        candidates.push(Candidate { info, header });
     }
-    let info = StreamInfo {
-        width: img.width,
-        height: img.height,
-        channels: img.channels,
-        depth: img.depth,
-        source: src,
-        reductions: red,
-        mode,
-        crc,
-        coded_channels: coded.channels,
-        palette,
-    };
-    Ok(Prepared { info, header, coded })
+    Ok(Prepared { candidates, coded })
 }
 
 /// Parses the fixed header. Returns the stream description and the header length.
@@ -429,7 +443,7 @@ pub fn assemble(header: &[u8], stripes: &[Vec<u8>]) -> Vec<u8> {
 pub fn encode_stripe(info: &StreamInfo, rows: &[u16], stripe_height: usize, tune: &ct::Tuning, progress: &mut dyn FnMut(f32)) -> Vec<u8> {
     let (w, h, nc) = (info.width as usize, stripe_height, info.coded_channels as usize);
     let mut enc = coder::Encoder::new();
-    let mut pix = pix::PixModel::new(w, h);
+    let mut pix = pix::PixModel::new(w, h, info.mode & MODE_PIXFLAGS != 0);
     if let Some(pal) = &info.palette {
         let map: std::collections::HashMap<u64, u32> = pal.iter().enumerate().map(|(i, &k)| (k, i as u32)).collect();
         let mut pm = pal::PalModel::new(w, h, pal.len());
@@ -438,8 +452,8 @@ pub fn encode_stripe(info: &StreamInfo, rows: &[u16], stripe_height: usize, tune
                 let i = y * w + x;
                 let idx = map[&pack(&rows[i * nc..(i + 1) * nc])];
                 if pix.code(&mut enc, x, y, idx as u64).is_none() {
-                    let eqp = pix.eqp();
-                    pm.code(&mut enc, &pix.keys, x, y, idx, eqp);
+                    let (eqp, mp, ml) = (pix.eqp(), pix.mpred, pix.mlen());
+                    pm.code(&mut enc, &pix.keys, x, y, idx, eqp, mp, ml);
                 }
                 pix.finish(x, y, idx as u64);
             }
@@ -452,7 +466,7 @@ pub fn encode_stripe(info: &StreamInfo, rows: &[u16], stripe_height: usize, tune
     }
     let flags = info.mode & MODE_PIXFLAGS != 0;
     let plan = ct::Plan::for_channels(nc);
-    let mut model = ct::CtModel::new(w, h, info.depth as u32, plan.clone(), tune.clone());
+    let mut model = ct::CtModel::new(w, h, info.depth as u32, plan.clone(), tune.clone(), flags);
     for y in 0..h {
         model.start_row(y);
         let row = &rows[y * w * nc..(y + 1) * w * nc];
@@ -475,6 +489,10 @@ pub fn encode_stripe(info: &StreamInfo, rows: &[u16], stripe_height: usize, tune
     progress(1.0);
     if let Some(s) = model.stats.as_ref() {
         eprintln!("{}", s.report());
+        eprintln!("pixel flags: {} of {} pixels resolved, {:.0} bytes on flags", pix.resolved, pix.total, pix.cost / 8.0);
+        for i in 0..5 {
+            eprintln!("  cand {i}: hit {} ({:.0} B), miss {} ({:.0} B)", pix.cnt_by[i][1], pix.cost_by[i][1] / 8.0, pix.cnt_by[i][0], pix.cost_by[i][0] / 8.0);
+        }
     }
     enc.finish()
 }
@@ -484,7 +502,7 @@ pub fn decode_stripe(info: &StreamInfo, data: &[u8], stripe_height: usize, tune:
     let (w, h, nc) = (info.width as usize, stripe_height, info.coded_channels as usize);
     let mut dec = coder::Decoder::new(data);
     let mut out = vec![0u16; w * h * nc];
-    let mut pix = pix::PixModel::new(w, h);
+    let mut pix = pix::PixModel::new(w, h, info.mode & MODE_PIXFLAGS != 0);
     if let Some(pal) = &info.palette {
         let mut pm = pal::PalModel::new(w, h, pal.len());
         for y in 0..h {
@@ -492,8 +510,8 @@ pub fn decode_stripe(info: &StreamInfo, data: &[u8], stripe_height: usize, tune:
                 let idx = match pix.code(&mut dec, x, y, 0) {
                     Some(k) => k as u32,
                     None => {
-                        let eqp = pix.eqp();
-                        pm.code(&mut dec, &pix.keys, x, y, 0, eqp)
+                        let (eqp, mp, ml) = (pix.eqp(), pix.mpred, pix.mlen());
+                        pm.code(&mut dec, &pix.keys, x, y, 0, eqp, mp, ml)
                     }
                 };
                 pix.finish(x, y, idx as u64);
@@ -512,7 +530,7 @@ pub fn decode_stripe(info: &StreamInfo, data: &[u8], stripe_height: usize, tune:
     }
     let flags = info.mode & MODE_PIXFLAGS != 0;
     let plan = ct::Plan::for_channels(nc);
-    let mut model = ct::CtModel::new(w, h, info.depth as u32, plan.clone(), tune.clone());
+    let mut model = ct::CtModel::new(w, h, info.depth as u32, plan.clone(), tune.clone(), flags);
     for y in 0..h {
         model.start_row(y);
         for x in 0..w {
@@ -571,20 +589,35 @@ fn run_parallel<T: Send, F: Fn(usize) -> T + Sync>(n: usize, f: F) -> Vec<T> {
 
 pub fn compress(img: &Image, src: SourceFormat, opts: &Options, progress: &mut dyn FnMut(f32)) -> Result<Vec<u8>, String> {
     let prep = prepare(img, src)?;
-    let stripes = prep.info.stripes();
-    let w = prep.info.width as usize;
-    let nc = prep.info.coded_channels as usize;
-    let streams = if stripes.len() == 1 {
-        vec![encode_stripe(&prep.info, &prep.coded.data, stripes[0].1, &opts.tuning, progress)]
+    let w = img.width as usize;
+    let nc = prep.coded.channels as usize;
+    let data = &prep.coded.data;
+    let jobs: Vec<(usize, usize, usize)> = prep
+        .candidates
+        .iter()
+        .enumerate()
+        .flat_map(|(c, cand)| cand.info.stripes().into_iter().map(move |(y0, y1)| (c, y0, y1)))
+        .collect();
+    let streams = if jobs.len() == 1 {
+        let (c, y0, y1) = jobs[0];
+        vec![encode_stripe(&prep.candidates[c].info, &data[y0 * w * nc..y1 * w * nc], y1 - y0, &opts.tuning, progress)]
     } else {
-        let s = run_parallel(stripes.len(), |k| {
-            let (y0, y1) = stripes[k];
-            encode_stripe(&prep.info, &prep.coded.data[y0 * w * nc..y1 * w * nc], y1 - y0, &opts.tuning, &mut |_| {})
+        let s = run_parallel(jobs.len(), |k| {
+            let (c, y0, y1) = jobs[k];
+            encode_stripe(&prep.candidates[c].info, &data[y0 * w * nc..y1 * w * nc], y1 - y0, &opts.tuning, &mut |_| {})
         });
         progress(1.0);
         s
     };
-    Ok(assemble(&prep.header, &streams))
+    let mut best: Option<Vec<u8>> = None;
+    for (c, cand) in prep.candidates.iter().enumerate() {
+        let parts: Vec<Vec<u8>> = jobs.iter().zip(streams.iter()).filter(|(j, _)| j.0 == c).map(|(_, s)| s.clone()).collect();
+        let file = assemble(&cand.header, &parts);
+        if best.as_ref().is_none_or(|b| file.len() < b.len()) {
+            best = Some(file);
+        }
+    }
+    Ok(best.unwrap())
 }
 
 pub fn decompress(b: &[u8], opts: &Options, progress: &mut dyn FnMut(f32)) -> Result<(Image, SourceFormat), String> {

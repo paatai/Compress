@@ -135,6 +135,70 @@ impl CtxTable {
     }
 }
 
+/// Counter table that also keeps a short bit history per slot: entries hold a 16-bit
+/// probability, an 8-bit count, a "only one bit value seen so far" flag and the last bit.
+/// An adaptive map learns, per table, how reliable such histories are; that estimate is a
+/// second mixer input, which makes deterministic contexts trusted after very few hits.
+pub struct HistTable {
+    t: Vec<u32>,
+    mask: usize,
+    block_bits: u32,
+    base: usize,
+    sm: [u32; 64],
+}
+
+const HT_INIT: u32 = (32768 << 16) | (1 << 7);
+
+impl HistTable {
+    pub fn new(log_blocks: u32, block_bits: u32) -> Self {
+        HistTable {
+            t: vec![HT_INIT; 1usize << (log_blocks + block_bits)],
+            mask: (1usize << log_blocks) - 1,
+            block_bits,
+            base: 0,
+            sm: [CTR_INIT; 64],
+        }
+    }
+    #[inline(always)]
+    pub fn set(&mut self, h: u32) {
+        self.base = ((h as usize) & self.mask) << self.block_bits;
+        prefetch(unsafe { self.t.as_ptr().add(self.base) });
+    }
+    #[inline(always)]
+    fn state_of(e: u32) -> usize {
+        let n = (e >> 8) & 255;
+        if n == 0 {
+            0
+        } else if e & 0x80 != 0 {
+            1 + ((e >> 6) & 1) as usize + 2 * (n.min(16) - 1) as usize
+        } else {
+            33 + (31 - n.leading_zeros()) as usize
+        }
+    }
+    /// Returns (direct, history) stretched probabilities for `slot`.
+    #[inline(always)]
+    pub fn inputs(&self, slot: usize, t: &Tables) -> (i32, i32) {
+        let e = unsafe { *self.t.get_unchecked(self.base + slot) };
+        let s = Self::state_of(e);
+        (t.stretch(e >> 16), if s == 0 { 0 } else { t.stretch(ctr_p16(self.sm[s])) })
+    }
+    #[inline(always)]
+    pub fn update(&mut self, slot: usize, bit: u32, recip: &[u32; 1024]) {
+        let e = unsafe { self.t.get_unchecked_mut(self.base + slot) };
+        let s = Self::state_of(*e);
+        if s != 0 {
+            ctr_update(&mut self.sm[s], bit, 1023, recip);
+        }
+        let n = (*e >> 8) & 255;
+        let p = (*e >> 16) as i32;
+        let target = if bit != 0 { 65535 } else { 0 };
+        let r = recip[n as usize] as i32;
+        let np = (p as i64 + (((target - p) as i64 * r as i64) >> 16)).clamp(1, 65535) as u32;
+        let det = if n == 0 || (((*e >> 6) & 1) == bit && *e & 0x80 != 0) { 0x80 } else { 0 };
+        *e = (np << 16) | ((n + 1).min(255) << 8) | det | (bit << 6);
+    }
+}
+
 /// Gated logistic mixer: one weight vector per selector value. Integer arithmetic only
 /// (wrapping i32 products are exact and identical on every target).
 pub struct Mixer {
@@ -158,11 +222,11 @@ impl Mixer {
         let n = self.n;
         let w = &self.w[self.base..self.base + n];
         let x = &x[..n];
-        let mut s: i32 = 0;
+        let mut s: i64 = 0;
         for i in 0..n {
-            s = s.wrapping_add(w[i].wrapping_mul(x[i]));
+            s += w[i] as i64 * x[i] as i64;
         }
-        let d = (s >> 16).clamp(-2047, 2047);
+        let d = (s >> 16).clamp(-2047, 2047) as i32;
         self.dot = d;
         self.pr = t.squash(d);
         d

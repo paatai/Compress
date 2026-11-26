@@ -86,22 +86,28 @@ async function handle(req: WorkerRequest): Promise<{ result: unknown; transfer: 
       const r = call(k, 'kolmo_prepare', [new Uint8Array(req.file)])
       const v = new DataView(r.buffer)
       let o = 0
-      const headerLen = v.getUint32(o, true)
+      const nCand = v.getUint32(o, true)
       o += 4
-      const header = r.slice(o, o + headerLen)
-      o += headerLen
-      const n = v.getUint32(o, true)
-      o += 4
-      const stripes: [number, number][] = []
-      for (let i = 0; i < n; i++, o += 8) stripes.push([v.getUint32(o, true), v.getUint32(o + 4, true)])
-      const info = readInfo(v, o)
-      o += 20
+      const candidates = []
+      for (let c = 0; c < nCand; c++) {
+        const headerLen = v.getUint32(o, true)
+        o += 4
+        const header = r.slice(o, o + headerLen)
+        o += headerLen
+        const n = v.getUint32(o, true)
+        o += 4
+        const stripes: [number, number][] = []
+        for (let i = 0; i < n; i++, o += 8) stripes.push([v.getUint32(o, true), v.getUint32(o + 4, true)])
+        const info = readInfo(v, o)
+        o += 20
+        candidates.push({ header, stripes, info })
+      }
       const sampleLen = v.getUint32(o, true)
       o += 4
       const samples = r.slice(o, o + sampleLen)
       o += sampleLen
       const coded = r.slice(o)
-      return { result: { header, stripes, info, samples, coded }, transfer: [header.buffer, samples.buffer, coded.buffer] }
+      return { result: { candidates, samples, coded }, transfer: [samples.buffer, coded.buffer] }
     }
     case 'encodeStripe': {
       const s = call(k, 'kolmo_encode_stripe', [req.header, req.rows], [req.height])

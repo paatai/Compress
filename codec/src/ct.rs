@@ -18,6 +18,8 @@ const NCTX: usize = 11;
 const NEXP: usize = 24;
 const EXP_BLOCK: usize = 16 * 48 * 2 * SLOTS;
 const NIN: usize = NCTX + NEXP + 1;
+const NSYN: usize = 10;
+const NIN_MAX: usize = NIN + 2 * NSYN;
 
 #[inline(always)]
 fn slot_unary(i: u32) -> usize {
@@ -209,11 +211,13 @@ pub struct CtModel {
     plan: Plan,
     ch: Vec<Chan>,
     tabs: Vec<CtxTable>,
+    syn: Vec<HistTable>,
+    nin: usize,
     m: [Mixer; 3],
     mf: Mixer,
     apm1: Apm,
     apm2: Apm,
-    x: [i32; NIN],
+    x: [i32; NIN_MAX],
     sel: [usize; 3],
     self_f: usize,
     actx1: usize,
@@ -291,7 +295,7 @@ impl Stats {
 }
 
 impl CtModel {
-    pub fn new(width: usize, height: usize, depth: u32, plan: Plan, tune: Tuning) -> Self {
+    pub fn new(width: usize, height: usize, depth: u32, plan: Plan, tune: Tuning, synth: bool) -> Self {
         let t = tables();
         let maxv = ((1u32 << depth) - 1) as i32;
         let stride = width + 2 * PAD;
@@ -367,10 +371,12 @@ impl CtModel {
             let lim = if (6..=8).contains(&i) { tune.ctr_limit_exact } else { tune.ctr_limit };
             tabs.push(CtxTable::new(b, SLOT_BITS, lim));
         }
+        let nin = if synth { NIN_MAX } else { NIN };
+        let syn: Vec<HistTable> = if synth { (0..NSYN).map(|_| HistTable::new(cap.min(18), SLOT_BITS)).collect() } else { Vec::new() };
         let m = [
-            Mixer::new(NIN, SLOTS * 64, tune.mixer_lr, 1 << 13),
-            Mixer::new(NIN, SLOTS * 64, tune.mixer_lr, 1 << 13),
-            Mixer::new(NIN, SLOTS * 64, tune.mixer_lr, 1 << 13),
+            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13),
+            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13),
+            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13),
         ];
         let mf = Mixer::new(4, SLOTS * 4, tune.mixer_lr_final, 22000);
         let apm1 = Apm::new(SLOTS * 64, tune.apm_rate, t);
@@ -384,11 +390,13 @@ impl CtModel {
             plan,
             ch,
             tabs,
+            syn,
+            nin,
             m,
             mf,
             apm1,
             apm2,
-            x: [0; NIN],
+            x: [0; NIN_MAX],
             sel: [0; 3],
             self_f: 0,
             actx1: 0,
@@ -772,6 +780,37 @@ impl CtModel {
         for (tb, &hh) in self.tabs.iter_mut().zip(h.iter()) {
             tb.set(hh);
         }
+        if !self.syn.is_empty() {
+            let (p1, p2) = if nref > 0 {
+                let a = self.cur_val[self.plan.refs[ci][0]];
+                let b = if nref > 1 { self.cur_val[self.plan.refs[ci][1]] } else { -1 };
+                (a, b)
+            } else {
+                (-1, -1)
+            };
+            let (wr, nr) = if nref > 0 {
+                let v = &self.ch[self.plan.refs[ci][0]].vals;
+                (v[r0 + xi - 1], v[r1 + xi])
+            } else {
+                (0, 0)
+            };
+            let c = ci as i32;
+            let hs = [
+                hash_slice(&[c, pv, p1, p2]),
+                hash_slice(&[c | 0x10, pv, w, p1, p2]),
+                hash_slice(&[c | 0x20, pv, n, p1, p2]),
+                hash_slice(&[c | 0x30, pv, w, n, nw]),
+                hash_slice(&[c | 0x40, pv, n, ne, p1]),
+                hash_slice(&[c | 0x50, pv, w, nw, n, ne, p1, p2]),
+                hash_slice(&[c | 0x60, pv, w, ww, p1]),
+                hash_slice(&[c | 0x70, pv, n, nn, p1]),
+                hash_slice(&[c | 0x80, pv, w - wr, n - nr, p1]),
+                hash_slice(&[c | 0x90, pv, ne, nne, nw, p1]),
+            ];
+            for (tb, &hh) in self.syn.iter_mut().zip(hs.iter()) {
+                tb.set(hh);
+            }
+        }
         self.sel = [qsc as usize, (frac as usize) | ((ci.min(3)) << 3), (rq0 as usize) + 9 * (qr(rw, ds) as usize % 7)];
         self.self_f = ci.min(3);
         self.actx1 = cq.min(63);
@@ -894,6 +933,11 @@ impl CtModel {
             }
         }
         self.x[NCTX + NEXP] = 256;
+        for (i, tb) in self.syn.iter().enumerate() {
+            let (a, r) = tb.inputs(slot, t);
+            self.x[NIN + 2 * i] = a;
+            self.x[NIN + 2 * i + 1] = r;
+        }
         let d0 = self.m[0].mix(&self.x, self.sel[0] * SLOTS + slot, t);
         let d1 = self.m[1].mix(&self.x, self.sel[1] * SLOTS + slot, t);
         let d2 = self.m[2].mix(&self.x, self.sel[2] * SLOTS + slot, t);
@@ -922,6 +966,9 @@ impl CtModel {
         self.m[0].update(&x, bit);
         self.m[1].update(&x, bit);
         self.m[2].update(&x, bit);
+        for tb in self.syn.iter_mut() {
+            tb.update(slot, bit, rc);
+        }
         self.mf.update(&fin, bit);
         self.apm1.update(bit);
         self.apm2.update(bit);
