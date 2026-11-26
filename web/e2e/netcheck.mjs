@@ -1,0 +1,17 @@
+import { chromium } from 'playwright-core'
+const browser = await chromium.launch({ executablePath: '/usr/bin/google-chrome-stable', args: ['--no-sandbox'] })
+const page = await browser.newPage()
+const failed = [], wasm = []
+page.on('requestfailed', (r) => failed.push(r.url()))
+page.on('response', (r) => { if (r.status() >= 400) failed.push(`${r.status()} ${r.url()}`); if (r.url().endsWith('.wasm')) wasm.push(`${r.status()} ${new URL(r.url()).pathname}`) })
+page.context().on('request', () => {})
+await page.goto('http://127.0.0.1:47125/Compress/')
+await page.setInputFiles('input[type=file] >> nth=0', '../bench/data/dev/graphics/graphics_0204773781.png')
+await page.getByText('Bit-exact round trip verified').waitFor({ timeout: 120000 })
+await page.getByRole('button', { name: /Compare with WebP and JPEG XL/ }).click()
+await page.getByText(/lossless, effort/).waitFor({ timeout: 300000 })
+const favicon = await page.evaluate(() => document.querySelector('link[rel=icon]').href)
+console.log('wasm loaded (incl. workers):', wasm.length ? wasm : 'none observed from page (workers fetch them)')
+console.log('failed requests:', failed.length ? failed : 'none')
+console.log('favicon resolves to', favicon)
+await browser.close()

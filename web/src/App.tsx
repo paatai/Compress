@@ -44,6 +44,9 @@ export default function App() {
             <a className="hidden rounded px-2 py-1 hover:text-foreground sm:inline" href="#cli">
               Command line
             </a>
+            <a className="rounded px-2 py-1 hover:text-foreground" href="https://github.com/paatai/Compress">
+              Source
+            </a>
           </nav>
         </div>
       </header>
@@ -95,7 +98,7 @@ export default function App() {
           <pre className="overflow-x-auto rounded-xl border bg-muted/40 p-4 text-sm leading-relaxed">
             <code>
               <span className="text-muted-foreground"># build once (needs Rust from rustup.rs)</span>
-              {'\n'}cargo install --path cli{'\n\n'}
+              {'\n'}git clone https://github.com/paatai/Compress && cd Compress{'\n'}cargo install --path cli{'\n\n'}
               kolmo compress photo.png{'           '}
               <span className="text-muted-foreground"># writes photo.png.kolmo</span>
               {'\n'}kolmo decompress photo.png.kolmo{'   '}

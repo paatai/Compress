@@ -1,5 +1,7 @@
 name: Deploy web app to GitHub Pages
 
+# One-time setup: repository Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
+
 on:
   push:
     branches: [main]
@@ -18,21 +20,26 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: Build
+      - id: pages
+        uses: actions/configure-pages@v6
+      - name: Build the WebAssembly codec and the site
         working-directory: web
+        # base_path is "/<repository>" for a project site (here /Compress) and "" with a custom domain
         run: |
           npm ci
-          npm run build
-      - uses: actions/upload-pages-artifact@v3
+          npm run wasm
+          npx tsc -b
+          npx vite build --base="${{ steps.pages.outputs.base_path }}/"
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: web/dist
 
@@ -44,4 +51,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

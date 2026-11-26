@@ -9,7 +9,7 @@ screenshots and graphics).
 It comes as
 
 - a **web app** that runs entirely in the browser (the codec is compiled to WebAssembly;
-  images never leave your computer), deployable as a static site, and
+  images never leave your computer): **https://paatai.github.io/Compress/**, and
 - a **command-line tool** (Rust) for macOS and Linux. Files are interchangeable.
 
 ## Results
@@ -95,6 +95,7 @@ builds of libwebp and libjxl. Drop a `.kolmo` file to get a PNG with the exact o
 Run locally:
 
 ```bash
+git clone https://github.com/paatai/Compress && cd Compress
 # needs Node 20+ and Rust (https://rustup.rs) with the wasm32 target
 rustup target add wasm32-unknown-unknown
 cd web
@@ -222,15 +223,16 @@ codec. Tests: `cargo test --release` (round trips, corrupt input), `node tests/c
 
 ## Putting the web app online
 
-The site is static. With the repository on GitHub:
+The site is static and is published to **https://paatai.github.io/Compress/** by
+`.github/workflows/pages.yml` on every push to `main`. The workflow installs Rust and Node,
+builds the WebAssembly codec and the site with the Pages base path (`/Compress/`), and deploys
+`web/dist`. One-time setup in the GitHub repository: Settings → Pages → Build and deployment →
+Source: **GitHub Actions** (then re-run the workflow from the Actions tab if the first run
+happened before that).
 
-1. Settings → Pages → Source: **GitHub Actions**.
-2. Push to `main`. `.github/workflows/pages.yml` installs Rust and Node, builds the
-   WebAssembly codec and the site, and publishes `web/dist`.
-
-Any other static host works too: run `npm run build` in `web/` and upload `web/dist`. The site
-needs no special headers (it does not use SharedArrayBuffer); parallelism comes from one Web
-Worker per stripe.
+Any other static host works too: run `npm run build` in `web/` and upload `web/dist` (the
+default build uses relative paths, so it works from any sub-path). The site needs no special
+headers (it does not use SharedArrayBuffer); parallelism comes from one Web Worker per stripe.
 
 ## Repository layout
 
