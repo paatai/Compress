@@ -98,26 +98,28 @@ fn get_varint(b: &[u8], pos: &mut usize) -> Result<u32, String> {
     Err("bad varint".into())
 }
 
-const RED_OPAQUE: u8 = 1;
+/// Alpha is the same value everywhere (stored in the header) and is not coded.
+const RED_CONST_ALPHA: u8 = 1;
+/// R = G = B everywhere: coded as gray.
 const RED_GRAY: u8 = 2;
 
-/// Removes redundant channels: constant-opaque alpha, and R=G=B colour.
-fn reduce(img: &Image) -> (Image, u8) {
+/// Removes redundant channels: constant alpha, and R=G=B colour. Returns the alpha value too.
+fn reduce(img: &Image) -> (Image, u8, u16) {
     let nc = img.channels as usize;
-    let maxv = img.maxv();
     let has_alpha = nc == 2 || nc == 4;
     let color = nc >= 3;
-    let opaque = has_alpha && img.data.chunks_exact(nc).all(|p| p[nc - 1] == maxv);
+    let a0 = if has_alpha { img.data[nc - 1] } else { 0 };
+    let opaque = has_alpha && img.data.chunks_exact(nc).all(|p| p[nc - 1] == a0);
     let gray = color && img.data.chunks_exact(nc).all(|p| p[0] == p[1] && p[1] == p[2]);
     let mut red = 0;
     if opaque {
-        red |= RED_OPAQUE;
+        red |= RED_CONST_ALPHA;
     }
     if gray {
         red |= RED_GRAY;
     }
     if red == 0 {
-        return (img.clone(), 0);
+        return (img.clone(), 0, 0);
     }
     let keep_alpha = has_alpha && !opaque;
     let base = if color && !gray { 3 } else { 1 };
@@ -129,20 +131,19 @@ fn reduce(img: &Image) -> (Image, u8) {
             data.push(p[nc - 1]);
         }
     }
-    (Image { width: img.width, height: img.height, channels: onc as u8, depth: img.depth, data }, red)
+    (Image { width: img.width, height: img.height, channels: onc as u8, depth: img.depth, data }, red, a0)
 }
 
-fn expand(img: Image, red: u8, target_channels: u8) -> Image {
+fn expand(img: Image, red: u8, target_channels: u8, alpha: u16) -> Image {
     if red == 0 {
         return img;
     }
     let nc = img.channels as usize;
     let tnc = target_channels as usize;
-    let maxv = img.maxv();
     let mut data = Vec::with_capacity(img.pixels() * tnc);
     let src_alpha = nc == 2 || nc == 4;
     for p in img.data.chunks_exact(nc) {
-        let a = if src_alpha { p[nc - 1] } else { maxv };
+        let a = if src_alpha { p[nc - 1] } else { alpha };
         match tnc {
             1 => data.push(p[0]),
             2 => data.extend_from_slice(&[p[0], a]),
@@ -185,6 +186,8 @@ pub struct StreamInfo {
     pub crc: u32,
     pub coded_channels: u8,
     pub palette: Option<Vec<u64>>,
+    /// Value of a constant alpha channel that is not coded.
+    pub alpha_value: u16,
 }
 
 impl StreamInfo {
@@ -202,7 +205,7 @@ pub fn stripe_rows(w: usize, h: usize) -> Vec<(usize, usize)> {
 fn coded_channels(channels: u8, reductions: u8) -> u8 {
     let nc = channels as usize;
     let has_alpha = nc == 2 || nc == 4;
-    let keep_alpha = has_alpha && reductions & RED_OPAQUE == 0;
+    let keep_alpha = has_alpha && reductions & RED_CONST_ALPHA == 0;
     let base = if nc >= 3 && reductions & RED_GRAY == 0 { 3 } else { 1 };
     (base + keep_alpha as usize) as u8
 }
@@ -318,7 +321,7 @@ pub fn prepare(img: &Image, src: SourceFormat) -> Result<Prepared, String> {
         return Err("pixel buffer size mismatch".into());
     }
     let crc = crc32(&img.sample_bytes());
-    let (coded, red) = reduce(img);
+    let (coded, red, alpha_value) = reduce(img);
     let mut candidates = Vec::new();
     for (mode, palette) in choose_modes(&coded) {
         let mut header = Vec::new();
@@ -330,6 +333,9 @@ pub fn prepare(img: &Image, src: SourceFormat) -> Result<Prepared, String> {
         header.push(red);
         header.push(mode);
         header.extend_from_slice(&crc.to_le_bytes());
+        if red & RED_CONST_ALPHA != 0 {
+            header.extend_from_slice(&alpha_value.to_le_bytes());
+        }
         if let Some(pal) = &palette {
             let mut e = coder::Encoder::new();
             let mut p = pal.clone();
@@ -349,6 +355,7 @@ pub fn prepare(img: &Image, src: SourceFormat) -> Result<Prepared, String> {
             crc,
             coded_channels: coded.channels,
             palette,
+            alpha_value,
         };
         candidates.push(Candidate { info, header });
     }
@@ -380,6 +387,13 @@ pub fn parse_header(b: &[u8]) -> Result<(StreamInfo, usize), String> {
     }
     let depth = if layout & 8 != 0 { 16 } else { 8 };
     let cnc = coded_channels(channels, reductions);
+    let alpha_value = if reductions & RED_CONST_ALPHA != 0 {
+        let v = b.get(pos..pos + 2).ok_or("truncated header")?;
+        pos += 2;
+        u16::from_le_bytes([v[0], v[1]])
+    } else {
+        0
+    };
     let palette = if mode & MODE_PALETTE != 0 {
         let len = get_varint(b, &mut pos)? as usize;
         let block = b.get(pos..pos + len).ok_or("truncated palette")?;
@@ -402,6 +416,7 @@ pub fn parse_header(b: &[u8]) -> Result<(StreamInfo, usize), String> {
         crc,
         coded_channels: cnc,
         palette,
+        alpha_value,
     };
     Ok((info, pos))
 }
@@ -439,8 +454,30 @@ pub fn assemble(header: &[u8], stripes: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-/// Codes one stripe. `rows` holds the coded samples of exactly this stripe's rows.
+const STRIPE_CODED: u8 = 0;
+const STRIPE_RAW: u8 = 1;
+
+/// Codes one stripe. `rows` holds the coded samples of exactly this stripe's rows. The stream
+/// starts with a kind byte; stripes that do not compress are stored raw.
 pub fn encode_stripe(info: &StreamInfo, rows: &[u16], stripe_height: usize, tune: &ct::Tuning, progress: &mut dyn FnMut(f32)) -> Vec<u8> {
+    let coded = encode_stripe_model(info, rows, stripe_height, tune, progress);
+    let raw_len = rows.len() * if info.depth == 16 { 2 } else { 1 };
+    let mut out = Vec::with_capacity(1 + coded.len().min(raw_len));
+    if coded.len() < raw_len {
+        out.push(STRIPE_CODED);
+        out.extend_from_slice(&coded);
+    } else {
+        out.push(STRIPE_RAW);
+        if info.depth == 16 {
+            out.extend(rows.iter().flat_map(|v| v.to_be_bytes()));
+        } else {
+            out.extend(rows.iter().map(|&v| v as u8));
+        }
+    }
+    out
+}
+
+fn encode_stripe_model(info: &StreamInfo, rows: &[u16], stripe_height: usize, tune: &ct::Tuning, progress: &mut dyn FnMut(f32)) -> Vec<u8> {
     let (w, h, nc) = (info.width as usize, stripe_height, info.coded_channels as usize);
     let mut enc = coder::Encoder::new();
     let mut pix = pix::PixModel::new(w, h, info.mode & MODE_PIXFLAGS != 0);
@@ -500,6 +537,21 @@ pub fn encode_stripe(info: &StreamInfo, rows: &[u16], stripe_height: usize, tune
 /// Decodes one stripe into its coded samples.
 pub fn decode_stripe(info: &StreamInfo, data: &[u8], stripe_height: usize, tune: &ct::Tuning, progress: &mut dyn FnMut(f32)) -> Vec<u16> {
     let (w, h, nc) = (info.width as usize, stripe_height, info.coded_channels as usize);
+    let n = w * h * nc;
+    match data.first() {
+        Some(&STRIPE_RAW) => {
+            progress(1.0);
+            let body = &data[1..];
+            return if info.depth == 16 {
+                (0..n).map(|i| body.get(2 * i..2 * i + 2).map_or(0, |b| u16::from_be_bytes([b[0], b[1]]))).collect()
+            } else {
+                (0..n).map(|i| body.get(i).copied().unwrap_or(0) as u16).collect()
+            };
+        }
+        Some(_) => {}
+        None => return vec![0; n],
+    }
+    let data = &data[1..];
     let mut dec = coder::Decoder::new(data);
     let mut out = vec![0u16; w * h * nc];
     let mut pix = pix::PixModel::new(w, h, info.mode & MODE_PIXFLAGS != 0);
@@ -566,7 +618,7 @@ pub fn decode_stripe(info: &StreamInfo, data: &[u8], stripe_height: usize, tune:
 /// Rebuilds the original image from the decoded coded samples and verifies the checksum.
 pub fn finish(info: &StreamInfo, coded: Vec<u16>) -> Result<Image, String> {
     let img = Image { width: info.width, height: info.height, channels: info.coded_channels, depth: info.depth, data: coded };
-    let img = expand(img, info.reductions, info.channels);
+    let img = expand(img, info.reductions, info.channels, info.alpha_value);
     if crc32(&img.sample_bytes()) != info.crc {
         return Err("checksum mismatch: file is corrupt".into());
     }

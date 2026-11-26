@@ -75,6 +75,11 @@ fn options() -> Options {
                 "wls_interval" => t.wls_interval = f as u32,
                 "exp_more" => t.exp_more = f as u32,
                 "ctx_mask" => t.ctx_mask = f as u32,
+                "exp_coarse" => t.exp_coarse = f as u32,
+                "wls_interval_ref" => t.wls_interval_ref = f as u32,
+                "lr_boost" => t.lr_boost = f as u32,
+                "lr_decay" => t.lr_decay = f as u32,
+                "apm_mix" => t.apm_mix = f as u32,
                 _ => panic!("unknown tuning key {k}"),
             }
         }

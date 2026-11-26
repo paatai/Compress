@@ -208,13 +208,25 @@ pub struct Mixer {
     pub pr: u32,
     pub dot: i32,
     lr: i32,
+    boost: i64,
+    decay: i64,
+    updates: i64,
 }
 
-const W_MAX: i32 = (1 << 20) - 1;
+/// Weights are clamped to +-4.0 so that `(w * x) >> 4` (|x| <= 2047) summed over up to 64
+/// inputs fits in an i32; this keeps the dot product in 32-bit SIMD lanes everywhere.
+const W_MAX: i32 = (1 << 18) - 1;
 
 impl Mixer {
     pub fn new(n: usize, nsets: usize, lr: i32, init_w: i32) -> Self {
-        Mixer { n, w: vec![init_w; n * nsets], base: 0, pr: 32768, dot: 0, lr }
+        Mixer { n, w: vec![init_w; n * nsets], base: 0, pr: 32768, dot: 0, lr, boost: 0, decay: 1, updates: 0 }
+    }
+    /// Learning rate starts at (1 + boost) times the base rate and decays towards it with
+    /// time constant `decay` updates.
+    pub fn with_schedule(mut self, boost: i64, decay: i64) -> Self {
+        self.boost = boost;
+        self.decay = decay.max(1);
+        self
     }
     #[inline(always)]
     pub fn mix(&mut self, x: &[i32], set: usize, t: &Tables) -> i32 {
@@ -222,11 +234,11 @@ impl Mixer {
         let n = self.n;
         let w = &self.w[self.base..self.base + n];
         let x = &x[..n];
-        let mut s: i64 = 0;
+        let mut s: i32 = 0;
         for i in 0..n {
-            s += w[i] as i64 * x[i] as i64;
+            s += (w[i] * x[i]) >> 4;
         }
-        let d = (s >> 16).clamp(-2047, 2047) as i32;
+        let d = (s >> 12).clamp(-2047, 2047);
         self.dot = d;
         self.pr = t.squash(d);
         d
@@ -234,7 +246,13 @@ impl Mixer {
     #[inline(always)]
     pub fn update(&mut self, x: &[i32], bit: u32) {
         let err = ((bit as i32) << 16) - self.pr as i32;
-        let e = (err * self.lr) >> 14;
+        let lr = if self.boost > 0 {
+            self.updates += 1;
+            (self.lr as i64 + self.lr as i64 * self.boost * self.decay / (self.decay + self.updates)) as i32
+        } else {
+            self.lr
+        };
+        let e = (err * lr) >> 14;
         let n = self.n;
         let w = &mut self.w[self.base..self.base + n];
         let x = &x[..n];

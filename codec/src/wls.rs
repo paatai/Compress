@@ -29,6 +29,29 @@ pub struct Wls2d {
     cnt: u32,
 }
 
+/// Dot product with four fixed-order partial sums: the same operations in the same order on
+/// every target (so results are bit-identical), but with independent chains the CPU can overlap.
+#[inline(always)]
+fn dot4(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut s = [0.0f64; 4];
+    let mut k = 0;
+    while k + 4 <= n {
+        s[0] += a[k] * b[k];
+        s[1] += a[k + 1] * b[k + 1];
+        s[2] += a[k + 2] * b[k + 2];
+        s[3] += a[k + 3] * b[k + 3];
+        k += 4;
+    }
+    let mut t = (s[0] + s[1]) + (s[2] + s[3]);
+    while k < n {
+        t += a[k] * b[k];
+        k += 1;
+    }
+    t
+}
+
 #[inline(always)]
 fn acc(dst: &mut [f64], lam: f64, z: &[f64], m: usize) {
     let mut k = 0;
@@ -118,10 +141,7 @@ impl Wls2d {
             let ri = i * (i + 1) / 2;
             for j in 0..=i {
                 let rj = j * (j + 1) / 2;
-                let mut s = a[ri + j];
-                for k in 0..j {
-                    s -= a[ri + k] * a[rj + k];
-                }
+                let mut s = a[ri + j] - dot4(&a[ri..ri + j], &a[rj..rj + j]);
                 if i == j {
                     s += reg;
                     if !(s > 1e-12) {

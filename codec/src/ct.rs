@@ -16,7 +16,9 @@ const SLOT_SIGN: usize = 1;
 const NPRED: usize = 26;
 const NCTX: usize = 11;
 const NEXP: usize = 24;
-const EXP_BLOCK: usize = 16 * 48 * 2 * SLOTS;
+const EXP_CONF: usize = 8;
+const EXP_QD: usize = 24;
+const EXP_BLOCK: usize = EXP_CONF * EXP_QD * 2 * SLOTS;
 const NIN: usize = NCTX + NEXP + 1;
 const NSYN: usize = 10;
 const NIN_MAX: usize = NIN + 2 * NSYN;
@@ -151,6 +153,11 @@ pub struct Tuning {
     pub wls_interval: u32,
     pub exp_more: u32,
     pub ctx_mask: u32,
+    pub exp_coarse: u32,
+    pub wls_interval_ref: u32,
+    pub lr_boost: u32,
+    pub lr_decay: u32,
+    pub apm_mix: u32,
 }
 
 impl Default for Tuning {
@@ -182,6 +189,11 @@ impl Default for Tuning {
             wls_interval: 1,
             exp_more: 0,
             ctx_mask: 0,
+            exp_coarse: 0,
+            wls_interval_ref: 1,
+            lr_boost: 0,
+            lr_decay: 1,
+            apm_mix: 0,
         }
     }
 }
@@ -355,7 +367,7 @@ impl CtModel {
                         1 => 13,
                         _ => 16,
                     };
-                    Some(Wls2d::new(nw, width, tune.wls_lh, tune.wls_lv, tune.wls_nu, tune.wls_interval))
+                    Some(Wls2d::new(nw, width, tune.wls_lh, tune.wls_lv, tune.wls_nu, if nref > 0 { tune.wls_interval_ref } else { tune.wls_interval }))
                 } else {
                     None
                 },
@@ -373,10 +385,11 @@ impl CtModel {
         }
         let nin = if synth { NIN_MAX } else { NIN };
         let syn: Vec<HistTable> = if synth { (0..NSYN).map(|_| HistTable::new(cap.min(18), SLOT_BITS)).collect() } else { Vec::new() };
+        let (bo, de) = (tune.lr_boost as i64, tune.lr_decay as i64);
         let m = [
-            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13),
-            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13),
-            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13),
+            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13).with_schedule(bo, de),
+            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13).with_schedule(bo, de),
+            Mixer::new(nin, SLOTS * 64, tune.mixer_lr, 1 << 13).with_schedule(bo, de),
         ];
         let mf = Mixer::new(4, SLOTS * 4, tune.mixer_lr_final, 22000);
         let apm1 = Apm::new(SLOTS * 64, tune.apm_rate, t);
@@ -654,30 +667,15 @@ impl CtModel {
         let iww = (r0 + xi - 2) * NPRED;
         let inn = (r2 + xi) * NPRED;
         let eps = self.tune.blend_eps * 16.0;
-        let bpow = self.tune.blend_pow;
         let mut wts = [0.0f32; NPRED];
         let mut errs = [0u32; NPRED];
         let mut sw = 0.0f32;
         let mut swp = 0.0f32;
-        let mut best_e = u32::MAX;
-        let dis = self.tune.disable;
         for j in 0..np {
-            if (dis & 1 != 0 && j == np - 1 - (self.ch[ci].wls.is_some() as usize)) || (dis & 2 != 0 && j >= 14 && j < np - 1) {
-                continue;
-            }
             let e = 2 * pe[iw + j] + 2 * pe[in_ + j] + pe[inw + j] + pe[ine + j] + pe[iww + j] + pe[inn + j];
             errs[j] = e;
-            best_e = best_e.min(e);
             let ef = e as f32 * 0.125 + eps;
-            let wgt = match bpow {
-                1 => 1.0 / ef,
-                2 => 1.0 / (ef * ef),
-                3 => 1.0 / (ef * ef * ef),
-                _ => {
-                    let e2 = ef * ef;
-                    1.0 / (e2 * e2)
-                }
-            };
+            let wgt = 1.0 / (ef * ef);
             wts[j] = wgt;
             sw += wgt;
             swp += wgt * p[j] as f32;
@@ -815,7 +813,6 @@ impl CtModel {
         self.self_f = ci.min(3);
         self.actx1 = cq.min(63);
         self.actx2 = (hash2(c32 | 0xB00, (qr(rw, ds) << 8) | (qr(rn, ds) << 4) | rq0) & 1023) as usize;
-        let _ = best_e;
         {
             let chn = &self.ch[ci];
             let ne_ = chn.exp_idx.len().min(NEXP);
@@ -823,9 +820,9 @@ impl CtModel {
             for e in 0..ne_ {
                 let j = chn.exp_idx[e];
                 let (pj, ej) = if j == usize::MAX { (blend16, blend_err) } else { (p[j], errs[j]) };
-                let conf = (qlog((ej >> 3) >> ds) / 3).min(15) as usize;
-                let qd = qdev(pj - pv * 16, ds);
-                let b = if self.small_exp { (ci * NEXP + e) * 32 } else { ((ci * NEXP + e) * 16 + conf) * (48 * 2 * SLOTS) + qd * 2 * SLOTS };
+                let conf = (qlog((ej >> 3) >> ds) / 6).min(EXP_CONF as u32 - 1) as usize;
+                let qd = (qdev(pj - pv * 16, ds) - 1) / 2;
+                let b = ((ci * NEXP + e) * EXP_CONF + conf) * (EXP_QD * 2 * SLOTS) + qd * 2 * SLOTS;
                 self.exp_base[e] = b;
                 prefetch(unsafe { self.exp_tab.as_ptr().add(b) });
                 prefetch(unsafe { self.exp_tab.as_ptr().add(b + SLOTS) });
@@ -898,7 +895,7 @@ impl CtModel {
         v
     }
 
-    #[inline(never)]
+    #[inline(always)]
     fn code_bit<C: BitCoder>(&mut self, coder: &mut C, slot: usize, bit: u32) -> u32 {
         let t = self.t;
         for (i, tb) in self.tabs.iter().enumerate() {
@@ -945,7 +942,13 @@ impl CtModel {
         let df = self.mf.mix(&fin, self.self_f * SLOTS + slot, t);
         let pa1 = self.apm1.pp(df, self.actx1 * SLOTS + slot);
         let pa2 = self.apm2.pp(df, self.actx2 * SLOTS + slot);
-        let p = clamp_p((2 * self.mf.pr + pa1 + pa2) >> 2);
+        let p = clamp_p(match self.tune.apm_mix {
+            1 => (self.mf.pr + pa1 + 2 * pa2) >> 2,
+            2 => (self.mf.pr + 3 * pa2) >> 2,
+            3 => (2 * self.mf.pr + 3 * pa1 + 3 * pa2) >> 3,
+            4 => (self.mf.pr + pa1) >> 1,
+            _ => (2 * self.mf.pr + pa1 + pa2) >> 2,
+        });
         let bit = coder.code(bit, p);
         if let Some(st) = self.stats.as_mut() {
             let pp = if bit != 0 { p as f64 / 65536.0 } else { 1.0 - p as f64 / 65536.0 };
@@ -975,7 +978,6 @@ impl CtModel {
         bit
     }
 
-    #[inline(never)]
     fn code_residual<C: BitCoder>(&mut self, coder: &mut C, r_enc: i32, pv: i32) -> i32 {
         let maxv = self.maxv;
         let z = self.code_bit(coder, SLOT_ZERO, (r_enc == 0) as u32);
