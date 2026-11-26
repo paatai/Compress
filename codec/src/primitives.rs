@@ -112,8 +112,12 @@ pub struct CtxTable {
 
 impl CtxTable {
     pub fn new(log_blocks: u32, block_bits: u32, limit: u32) -> Self {
+        Self::with_init(log_blocks, block_bits, limit, CTR_INIT)
+    }
+    /// Like `new`, with every counter starting at `init` (probability and hit count).
+    pub fn with_init(log_blocks: u32, block_bits: u32, limit: u32, init: u32) -> Self {
         let n = 1usize << (log_blocks + block_bits);
-        CtxTable { t: vec![CTR_INIT; n], mask: (1usize << log_blocks) - 1, block_bits, base: 0, limit }
+        CtxTable { t: vec![init; n], mask: (1usize << log_blocks) - 1, block_bits, base: 0, limit }
     }
     #[inline(always)]
     pub fn set(&mut self, h: u32) {

@@ -312,7 +312,7 @@ pub fn assemble(p: &Prepared, streams: &[Vec<u8>]) -> Vec<u8> {
 fn run_parallel<T: Send, F: Fn(usize) -> T + Sync>(n: usize, f: F) -> Vec<T> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if n > 1 {
+        if n > 1 && std::env::var("KOMLA_THREADS").as_deref() != Ok("1") {
             return std::thread::scope(|s| {
                 let f = &f;
                 let hs: Vec<_> = (0..n).map(|k| s.spawn(move || f(k))).collect();

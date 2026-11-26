@@ -7,14 +7,17 @@
 //! 1. the number of nonzero coefficients in the 7x7 block of AC coefficients with u, v >= 1,
 //! 2. those 49 coefficients in zigzag order until the count is exhausted,
 //! 3. the first row (u, 0) and first column (0, v): each edge's nonzero count, then its values.
-//!    They are predicted from the block above / to the left by asking that the two blocks join
-//!    smoothly at the shared boundary, which (given everything else already coded in both
-//!    blocks) leaves one unknown per coefficient,
-//! 4. DC, predicted from the boundary pixels of the neighbouring blocks and of this block's AC.
+//!    Each edge coefficient is predicted from the neighbouring blocks: by asking that the two
+//!    blocks join smoothly at the shared boundary (with and without extrapolating the gradient),
+//!    and from the same coefficient in the blocks above and to the left. The predictions are
+//!    blended with weights from their recent errors.
+//! 4. DC, predicted in the same way from the boundary pixels of the neighbouring blocks, given
+//!    this block's AC, and from the neighbours' DC values.
 //!
 //! Every value is binarised (zero?, exponent in unary, mantissa bits, sign) and every binary
-//! decision is predicted by a dozen adaptive context models combined by gated logistic mixers,
-//! a second mixing layer and adaptive probability maps. Only integer arithmetic is used.
+//! decision is predicted by a dozen adaptive context models, plus one that compares the
+//! prediction with the threshold the decision tests, combined by gated logistic mixers, a second
+//! mixing layer and adaptive probability maps. Only integer arithmetic is used.
 
 use super::format::{Frame, NATURAL};
 use crate::coder::BitCoder;
@@ -30,7 +33,35 @@ const S_M2: usize = 11;
 const S_M3: usize = 14;
 
 const NCTX: usize = 12;
-const NIN: usize = NCTX + 1;
+const NIN: usize = NCTX + 2;
+
+const PART_INTERIOR: usize = 0;
+const PART_EDGE: usize = 1;
+const PART_DC: usize = 2;
+const DYN_B: usize = 24;
+const DYN_C: usize = 8;
+
+/// Model parameters; KOMLA_JTUNE="i=v,..." overrides them for experiments (both sides must agree).
+const TUNE_DEFAULT: [i32; 16] = [255, 400, 300, 6, 255, 400, 4, 0, 0, 1, 8192, 0, 0, 0, 0, 0];
+
+fn tune() -> &'static [i32; 16] {
+    static T: std::sync::OnceLock<[i32; 16]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = TUNE_DEFAULT;
+        if let Ok(s) = std::env::var("KOMLA_JTUNE") {
+            for kv in s.split(',').filter(|s| !s.is_empty()) {
+                if let Some((k, v)) = kv.split_once('=') {
+                    if let (Ok(k), Ok(v)) = (k.parse::<usize>(), v.parse::<i32>()) {
+                        if k < 16 {
+                            t[k] = v;
+                        }
+                    }
+                }
+            }
+        }
+        t
+    })
+}
 
 /// cos(m * pi / 16), m = 0..8
 const COS16: [f64; 9] = [
@@ -109,6 +140,54 @@ fn pb(p8: i32) -> u32 {
     }
 }
 
+/// Signed distance bucket (1/8 units) for the decision context, 0..DYN_B.
+#[inline(always)]
+fn dbucket(d: i64) -> usize {
+    let a = d.unsigned_abs().min(1 << 30) as u32;
+    let m = if a < 2 { 0 } else { mb(a >> 1).min(11) } as usize;
+    if d < 0 {
+        11 - m
+    } else {
+        12 + m
+    }
+}
+
+/// Rounded division by 8.
+#[inline(always)]
+fn r8(p: i32) -> i32 {
+    if p >= 0 {
+        (p + 4) >> 3
+    } else {
+        -((-p + 4) >> 3)
+    }
+}
+
+/// Weighted blend of the available predictions with weights 1/err^2. Returns the blend and its
+/// expected error (same units as `errs`).
+fn blend(preds: &[i32], avail: &[bool], errs: &[i32]) -> (i32, i32) {
+    let (mut ws, mut wp, mut we) = (0i64, 0i64, 0i64);
+    for j in 0..preds.len() {
+        if !avail[j] {
+            continue;
+        }
+        let e = errs[j].max(1) as i64;
+        let w = (1i64 << 40) / (e * e + 16);
+        ws += w;
+        wp += w * preds[j] as i64;
+        we += w * e;
+    }
+    if ws == 0 {
+        return (0, 1 << 12);
+    }
+    ((wp / ws) as i32, (we / ws) as i32)
+}
+
+#[inline(always)]
+fn track(err: &mut i32, e8: i32) {
+    let target = 4 * e8.unsigned_abs().min(1 << 20) as i32;
+    *err += (target - *err) >> 4;
+}
+
 struct Plane {
     /// blocks per row (padded) and rows in this stripe
     w: usize,
@@ -123,6 +202,8 @@ struct Plane {
     /// border pixels (x8, level shifted): row 7, row 6, column 7, column 6
     border: Vec<[i16; 32]>,
     dcres: Vec<i16>,
+    /// error of the blended prediction of each edge coefficient, in quantization steps
+    eerr: Vec<[u8; 14]>,
     dc_coded: bool,
     ac_coded: bool,
     dc_w: usize,
@@ -145,19 +226,38 @@ pub struct Model {
     actx: [usize; 2],
     nzm: Mixer,
     nzapm: Apm,
+    dyn_t: Vec<u32>,
+    dyn_base: usize,
+    dyn_idx: usize,
+    pred8: i32,
+    edge_err: Vec<[i32; 4]>,
+    dc_err: [[i32; 5]; 2],
     planes: Vec<Plane>,
+    /// cost accounting (KOMLA_STATS): bits per decision class, current class base
+    stats: Option<Box<[f64; 16]>>,
+    part: usize,
+    dbg: [[f64; 8]; 8],
 }
 
 const ZERO_BLOCK: [i16; 64] = [0; 64];
+const STAT_NAMES: [&str; 14] = [
+    "nz77 count", "7x7 zero", "7x7 exponent", "7x7 mantissa", "7x7 sign", "edge count", "edge zero", "edge exponent", "edge mantissa", "edge sign", "DC zero", "DC exponent", "DC mantissa", "DC sign",
+];
+
+fn cost(p1: u32, bit: u32) -> f64 {
+    let p = if bit != 0 { p1 } else { 65536 - p1 } as f64 / 65536.0;
+    -p.log2()
+}
 
 impl Model {
     pub fn new(f: &Frame, rows: &[(usize, usize)], coded: &[(bool, bool)]) -> Self {
         let t = tables();
+        let tu = tune();
         let total: usize = rows.iter().zip(f.comps.iter()).map(|(r, c)| (r.1 - r.0) * c.pw).sum();
         let cap = (usize::BITS - total.max(1).leading_zeros()).clamp(12, 22);
         let lb = [14u32, 16, 16, 16, 16, 16, 16, 16, 20, 20, 10, 14];
-        let tabs = lb.iter().map(|&b| CtxTable::new(b.min(cap), SLOT_BITS, 255)).collect();
-        let nzt = (0..5).map(|_| CtxTable::new(14.min(cap), 6, 255)).collect();
+        let tabs = lb.iter().map(|&b| CtxTable::with_init(b.min(cap), SLOT_BITS, tu[0] as u32, CTR_INIT | tu[9] as u32)).collect();
+        let nzt = (0..5).map(|_| CtxTable::with_init(14.min(cap), 6, tu[4] as u32, CTR_INIT | tu[9] as u32)).collect();
         let l0 = &f.comps[0];
         let planes = f
             .comps
@@ -182,6 +282,7 @@ impl Model {
                     nze: vec![0; n],
                     border: vec![[0; 32]; n],
                     dcres: vec![0; n],
+                    eerr: vec![[0; 14]; n],
                     dc_coded: dc_c,
                     ac_coded: ac_c,
                     dc_w: c.pw,
@@ -196,16 +297,40 @@ impl Model {
             b: basis(),
             tabs,
             nzt,
-            m: [Mixer::new(NIN, SLOTS * 8, 400, 1 << 13), Mixer::new(NIN, SLOTS * 130, 400, 1 << 13), Mixer::new(NIN, SLOTS * 80, 400, 1 << 13)],
-            mf: Mixer::new(4, SLOTS * 8, 300, 22000),
-            apm1: Apm::new(SLOTS * 256, 6, t),
-            apm2: Apm::new(SLOTS * 512, 6, t),
+            m: [Mixer::new(NIN, SLOTS * 8, tu[1], tu[10]), Mixer::new(NIN, SLOTS * 130, tu[1], tu[10]), Mixer::new(NIN, SLOTS * 80, tu[1], tu[10])],
+            mf: Mixer::new(4, SLOTS * 8, tu[2], 22000),
+            apm1: Apm::new(SLOTS * 256, tu[3] as u32, t),
+            apm2: Apm::new(SLOTS * 512, tu[3] as u32, t),
             x: [0; NIN],
             sel: [0; 3],
             actx: [0; 2],
-            nzm: Mixer::new(6, 64 * 8, 400, 1 << 14),
-            nzapm: Apm::new(64 * 32, 6, t),
+            nzm: Mixer::new(6, 64 * 8, tu[5], 1 << 14),
+            nzapm: Apm::new(64 * 32, tu[3] as u32, t),
+            dyn_t: vec![CTR_INIT; 3 * SLOTS * DYN_B * DYN_C],
+            dyn_base: 0,
+            dyn_idx: 0,
+            pred8: 0,
+            edge_err: vec![[256; 4]; 2 * 2 * 8],
+            dc_err: [[256; 5]; 2],
             planes,
+            stats: if std::env::var_os("KOMLA_STATS").is_some() { Some(Box::new([0.0; 16])) } else { None },
+            part: 1,
+            dbg: [[0.0; 8]; 8],
+        }
+    }
+
+    fn report(&self) {
+        if let Some(s) = &self.stats {
+            let total: f64 = s.iter().sum();
+            let mut out = format!("coefficient model: {:.0} bytes\n", total / 8.0);
+            for (i, name) in STAT_NAMES.iter().enumerate() {
+                out += &format!("  {name:<14} {:>10.0} B {:>6.2}%\n", s[i] / 8.0, 100.0 * s[i] / total.max(1.0));
+            }
+            eprint!("{out}");
+            for (i, d) in self.dbg.iter().enumerate().skip(1) {
+                let n = d[6].max(1.0) * 8.0;
+                eprintln!("  edge i={i}: |F| {:.3}  |F-P| lak {:.3} grad {:.3} nb {:.3} side {:.3} blend {:.3}", d[0] / n, d[1] / n, d[2] / n, d[3] / n, d[4] / n, d[5] / n);
+            }
         }
     }
 
@@ -218,13 +343,21 @@ impl Model {
         p.ac_h = ac.1.min(p.h);
     }
 
+    /// Selects the decision context for `slot` from the signed distance `d` (1/8 units) between
+    /// the prediction and the decision's threshold.
+    #[inline(always)]
+    fn set_dyn(&mut self, slot: usize, d: i64) {
+        self.dyn_idx = self.dyn_base + (slot * DYN_B + dbucket(d)) * DYN_C;
+    }
+
     #[inline(always)]
     fn bit<C: BitCoder>(&mut self, coder: &mut C, slot: usize, bit: u32) -> u32 {
         let t = self.t;
         for i in 0..NCTX {
             self.x[i] = t.stretch(self.tabs[i].p(slot));
         }
-        self.x[NCTX] = 256;
+        self.x[NCTX] = t.stretch(ctr_p16(self.dyn_t[self.dyn_idx]));
+        self.x[NCTX + 1] = 256;
         let d0 = self.m[0].mix(&self.x, self.sel[0] * SLOTS + slot, t);
         let d1 = self.m[1].mix(&self.x, self.sel[1] * SLOTS + slot, t);
         let d2 = self.m[2].mix(&self.x, self.sel[2] * SLOTS + slot, t);
@@ -235,10 +368,20 @@ impl Model {
         let pc = self.apm2.pp(df, self.actx[1] * SLOTS + slot);
         let p = clamp_p((2 * p0 + pa + pc) >> 2);
         let b = coder.code(bit, p);
+        if let Some(s) = self.stats.as_mut() {
+            let kind = match slot {
+                S_ZERO => 0,
+                S_SIGN => 3,
+                2..=9 => 1,
+                _ => 2,
+            };
+            s[self.part + kind] += cost(p, b);
+        }
         let r = &t.recip;
         for i in 0..NCTX {
             self.tabs[i].update(slot, b, r);
         }
+        ctr_update(&mut self.dyn_t[self.dyn_idx], b, 255, r);
         self.m[0].update(&self.x, b);
         self.m[1].update(&self.x, b);
         self.m[2].update(&self.x, b);
@@ -248,22 +391,28 @@ impl Model {
         b
     }
 
-    /// Codes a value given contexts already selected in all tables.
+    /// Codes a value given contexts already selected in all tables. `self.pred8` is the
+    /// prediction (1/8 units; for magnitudes only its absolute value matters).
     fn value<C: BitCoder>(&mut self, coder: &mut C, v: i32, may_be_zero: bool) -> i32 {
         let a = v.unsigned_abs();
-        if may_be_zero && self.bit(coder, S_ZERO, (a != 0) as u32) == 0 {
-            return 0;
+        let pa = self.pred8.unsigned_abs() as i64;
+        if may_be_zero {
+            self.set_dyn(S_ZERO, pa - 4);
+            if self.bit(coder, S_ZERO, (a != 0) as u32) == 0 {
+                return 0;
+            }
         }
         let e_true = if a == 0 { 0 } else { 31 - a.leading_zeros() };
         let mut e = 0u32;
         while e < 14 {
             let slot = S_EXP + (e as usize).min(7);
+            self.set_dyn(slot, pa - ((16i64 << e) - 4));
             if self.bit(coder, slot, (e_true > e) as u32) == 0 {
                 break;
             }
             e += 1;
         }
-        let mut m = 1u32;
+        let mut lo = 1i64 << e;
         for i in (0..e).rev() {
             let bit = (a >> i) & 1;
             let slot = match e {
@@ -272,7 +421,7 @@ impl Model {
                     if i == 1 {
                         S_M2
                     } else {
-                        S_M2 + 1 + (m & 1) as usize
+                        S_M2 + 1 + (lo >> 1 & 1) as usize
                     }
                 }
                 _ => {
@@ -283,13 +432,20 @@ impl Model {
                     }
                 }
             };
-            m = (m << 1) | self.bit(coder, slot, bit);
+            let mid = lo + (1i64 << i);
+            self.set_dyn(slot, pa - (8 * mid - 4));
+            if self.bit(coder, slot, bit) != 0 {
+                lo = mid;
+            }
         }
+        let m = lo as i32;
+        let close = ((self.pred8.unsigned_abs() as i64 - 8 * m as i64).unsigned_abs() >> 3).min(255) as u32;
+        self.dyn_idx = self.dyn_base / (SLOTS * DYN_B * DYN_C) * (SLOTS * DYN_B * DYN_C) + (S_SIGN * DYN_B + dbucket(self.pred8 as i64)) * DYN_C + mb(close).min(7) as usize;
         let neg = self.bit(coder, S_SIGN, (v < 0) as u32);
         if neg != 0 {
-            -(m as i32)
+            -m
         } else {
-            m as i32
+            m
         }
     }
 
@@ -312,6 +468,9 @@ impl Model {
             let pa = self.nzapm.pp(d, (actx & 31) * 64 + node);
             let p = clamp_p((t.squash(d) + pa) >> 1);
             let got = coder.code(bit, p);
+            if let Some(s) = self.stats.as_mut() {
+                s[if max > 7 { 0 } else { 5 }] += cost(p, got);
+            }
             for i in 0..5 {
                 self.nzt[i].update(node, got, &t.recip);
             }
@@ -341,6 +500,7 @@ impl Model {
             }
         }
         progress(1.0);
+        self.report();
     }
 
     fn code_block<C: BitCoder>(&mut self, coder: &mut C, planes: &mut [&mut [i16]], ci: usize, bx: usize, by: usize) {
@@ -355,11 +515,11 @@ impl Model {
             b.copy_from_slice(&plane[(y * w + x) * 64..(y * w + x) * 64 + 64]);
             b
         };
-        let a = if by > 0 { get(bx, by - 1) } else { ZERO_BLOCK };
-        let l = if bx > 0 { get(bx - 1, by) } else { ZERO_BLOCK };
-        let al = if bx > 0 && by > 0 { get(bx - 1, by - 1) } else { ZERO_BLOCK };
-        let ar = if bx + 1 < w && by > 0 { get(bx + 1, by - 1) } else { ZERO_BLOCK };
         let (has_a, has_l) = (by > 0, bx > 0);
+        let a = if has_a { get(bx, by - 1) } else { ZERO_BLOCK };
+        let l = if has_l { get(bx - 1, by) } else { ZERO_BLOCK };
+        let al = if has_l && has_a { get(bx - 1, by - 1) } else { ZERO_BLOCK };
+        let ar = if bx + 1 < w && has_a { get(bx + 1, by - 1) } else { ZERO_BLOCK };
 
         // co-located luma statistics for chroma
         let (mut lnz, mut lact) = (0u32, 0u32);
@@ -399,6 +559,7 @@ impl Model {
         let nz_a = if has_a { p.nz77[bi - w] as u32 } else { 0 };
         let nz_l = if has_l { p.nz77[bi - 1] as u32 } else { 0 };
         let cls = (!luma) as u32;
+        let ucls = cls as usize;
 
         // ---- 1. nonzero count of the 7x7 block
         let mut nz_true = 0u32;
@@ -421,7 +582,7 @@ impl Model {
                 hash2(3, (nz_al << 8) | (nz_ar << 1) | cls),
                 hash2(4, (pred << 4) | (mb(lact) << 1) | cls),
             ];
-            self.count(coder, nz_true, &hs, 49, (cls as usize) * 2 + (has_a && has_l) as usize, nzb(pred) as usize * 2 + cls as usize)
+            self.count(coder, nz_true, &hs, 49, ucls * 2 + (has_a && has_l) as usize, nzb(pred) as usize * 2 + ucls)
         } else {
             0
         };
@@ -461,12 +622,16 @@ impl Model {
                 (k << 1) | cls,
                 (k << 7) | (wavg.min(63) << 1) | cls,
             ];
+            let off = tune()[7] - 1;
             for (i, &h) in hs.iter().enumerate() {
-                self.tabs[i].set(h);
+                self.tabs[i].set(if i as i32 == off { 0 } else { h });
             }
-            self.sel = [cls as usize, k as usize * 2 + cls as usize, (nzb(left) as usize) * 4 + (mb(wavg) as usize).min(3)];
-            self.actx = [k as usize * 2 + cls as usize, (mb(wavg) as usize) * 16 + nzb(left) as usize];
+            self.sel = [ucls, k as usize * 2 + ucls, (nzb(left) as usize) * 4 + (mb(wavg) as usize).min(3)];
+            self.actx = [k as usize * 2 + ucls, (mb(wavg) as usize) * 16 + nzb(left) as usize];
+            self.pred8 = 2 * wavg as i32;
+            self.dyn_base = PART_INTERIOR * SLOTS * DYN_B * DYN_C + (k as usize >> 3).min(7);
             let forced = left == rem;
+            self.part = 1;
             let val = self.value(coder, cur[n] as i32, !forced);
             cur[n] = val as i16;
             if val != 0 {
@@ -477,15 +642,31 @@ impl Model {
                 run += 1;
             }
             rem -= 1;
-            let _ = (u, v);
         }
 
         // ---- 3. edges: first row from the block above, first column from the block to the left
         let mut nze_total = 0u32;
+        let mut eerr = [0u8; 14];
         for edge in 0..2usize {
             let has_n = if edge == 0 { has_a } else { has_l };
+            let has_s = if edge == 0 { has_l } else { has_a };
             let nb = if edge == 0 { &a } else { &l };
+            let side = if edge == 0 { &l } else { &a };
             let idx = |i: usize| if edge == 0 { i } else { i * 8 };
+            // predictions of all seven coefficients of this edge (1/8 quantization steps)
+            let mut pr = [[0i32; 4]; 8];
+            let mut bl = [(0i32, 0i32); 8];
+            let mut npred = 0u32;
+            let mut spred = 0u32;
+            for i in 1..8 {
+                let n = idx(i);
+                let (p1, p2) = if has_n { self.edge_pred(&cur, nb, edge, i, &q) } else { (0, 0) };
+                pr[i] = [p1, p2, 8 * nb[n] as i32, 8 * side[n] as i32];
+                let avail = [has_n, has_n, has_n, has_s];
+                bl[i] = blend(&pr[i], &avail, &self.edge_err[(ucls * 2 + edge) * 8 + i]);
+                npred += (bl[i].0.unsigned_abs() >= 4) as u32;
+                spred += bl[i].0.unsigned_abs() >> 3;
+            }
             let mut cnt_true = 0u32;
             for i in 1..8 {
                 cnt_true += (cur[idx(i)] != 0) as u32;
@@ -502,48 +683,56 @@ impl Model {
             let cnt = if ac_on {
                 let hs = [
                     hash2(100 + edge as u32, (nzb(nz77) << 8) | (nb_cnt << 4) | (has_n as u32) << 1 | cls),
-                    hash2(110 + edge as u32, (nz77.min(49) << 2) | cls),
-                    hash2(120 + edge as u32, (nb_cnt << 8) | (mb(lact) << 2) | cls),
+                    hash2(110 + edge as u32, (npred << 8) | (mb(spred) << 2) | cls),
+                    hash2(120 + edge as u32, (nb_cnt << 8) | (npred << 4) | cls),
                     hash2(130 + edge as u32, (nze_total << 8) | (nzb(nz77) << 2) | cls),
-                    hash2(140 + edge as u32, (mb(act) << 8) | (nb_cnt << 3) | cls),
+                    hash2(140 + edge as u32, (mb(act) << 8) | (npred << 3) | cls),
                 ];
-                self.count(coder, cnt_true, &hs, 7, 4 + edge * 2 + cls as usize, 24 + edge * 4 + nb_cnt.min(3) as usize)
+                self.count(coder, cnt_true, &hs, 7, 4 + edge * 2 + ucls, 24 + edge * 4 + npred.min(3) as usize)
             } else {
                 0
             };
             nze_total += cnt;
             let mut left = cnt;
+            let ea_blk = if has_a { self.planes[ci].eerr[bi - w] } else { [0; 14] };
+            let el_blk = if has_l { self.planes[ci].eerr[bi - 1] } else { [0; 14] };
             for i in 1..8 {
                 let n = idx(i);
                 if left == 0 {
                     cur[n] = 0;
                     continue;
                 }
-                // continuity prediction (x8 of the quantization step)
-                let (p1, p2) = if has_n { self.edge_pred(&cur, nb, edge, i, &q) } else { (0, 0) };
+                let [p1, p2, pn, ps] = pr[i];
+                let (pbl, econf) = bl[i];
                 let vn = nb[n] as i32;
                 let k = ZZ[n] as u32;
                 let lum = if luma { 0 } else { (lco[n].unsigned_abs() / q[n] as u32).min(255) };
                 let inner = if edge == 0 { cur[n + 8] as i32 } else { cur[n + 1] as i32 };
+                let conf = mb((econf >> 5) as u32).min(7);
+                let lconf = mb(ea_blk[edge * 7 + i - 1] as u32 + el_blk[edge * 7 + i - 1] as u32).min(15);
                 let hs: [u32; NCTX] = [
-                    hash2(200 + k, (pb(p1) << 6) | (left.min(7) << 2) | cls),
-                    hash2(210 + k, (pb(p2) << 6) | (has_n as u32) << 1 | cls),
-                    hash2(220 + k, (pb((p1 + p2) / 2) << 8) | (mb(inner.unsigned_abs()) << 2) | cls),
-                    hash2(230 + k, (((clip(vn, 8) + 8) as u32) << 8) | (left.min(7) << 2) | cls),
+                    hash2(200 + k, (pb(pbl) << 8) | (conf << 4) | (left.min(7) << 1) | cls),
+                    hash2(210 + k, (pb(p2) << 8) | (pb(p1) << 2) | cls),
+                    hash2(220 + k, (pb(pbl) << 8) | (mb(inner.unsigned_abs()) << 2) | cls),
+                    hash2(230 + k, (pb(pn) << 8) | (pb(ps) << 2) | cls),
                     hash2(240 + k, (nzb(nz77) << 8) | (cnt << 4) | (left << 1) | cls),
-                    hash2(250 + k, (mb(act) << 8) | (pb(p1) << 2) | cls),
-                    hash2(260 + k, if luma { mb(vn.unsigned_abs()) << 2 } else { (mb(lum) << 8) | (pb(p1) << 2) | 1 }),
-                    hash2(270 + k, (pb(p1) << 10) | (pb(p2) << 4) | cls),
+                    hash2(250 + k, (pb(pbl) << 8) | (lconf << 2) | cls),
+                    hash2(260 + k, if luma { (pb(pbl) << 6) | (mb(act) << 1) } else { (mb(lum) << 8) | (pb(pbl) << 2) | 1 }),
+                    hash2(270 + k, ((clip(r8(pbl), 15) + 16) as u32) << 8 | (conf << 4) | (left.min(7) << 1) | cls),
                     hash2(280 + k, (((clip(vn, 8) + 8) as u32) << 12) | ((clip(inner, 8) + 8) as u32) << 6 | cls),
-                    hash2(290 + k, ((clip(p1 >> 3, 31) + 32) as u32) << 2 | cls),
-                    hash2(300 + k, cls),
-                    hash2(310 + k, ((clip((p1 + p2) >> 4, 15) + 16) as u32) << 6 | (left.min(7) << 2) | cls),
+                    hash2(290 + k, ((clip(pbl >> 2, 63) + 64) as u32) << 2 | cls),
+                    hash2(300 + k, (lconf << 4) | (conf << 1) | cls),
+                    hash2(310 + k, ((clip(r8(p1), 15) + 16) as u32) << 8 | ((clip(r8(p2), 15) + 16) as u32) << 2 | cls),
                 ];
+                let off = tune()[8] - 1;
                 for (j, &h) in hs.iter().enumerate() {
-                    self.tabs[j].set(h);
+                    self.tabs[j].set(if j as i32 == off { 0 } else { h });
                 }
-                self.sel = [(1 + edge) * 2 + cls as usize, k as usize * 2 + cls as usize, 48 + pb(p1) as usize / 2];
-                self.actx = [128 + (pb(p1) as usize) * 2 + cls as usize, 256 + (pb(p2) as usize) * 4 + (left.min(3) as usize)];
+                self.sel = [(1 + edge) * 2 + ucls, k as usize * 2 + ucls, 48 + pb(pbl) as usize / 2];
+                self.actx = [128 + (pb(pbl) as usize) * 2 + ucls, 256 + (pb(pbl) as usize) * 4 + (conf as usize).min(3)];
+                self.pred8 = pbl;
+                self.dyn_base = PART_EDGE * SLOTS * DYN_B * DYN_C + conf as usize;
+                self.part = 6;
                 let val = self.value(coder, cur[n] as i32, left != 8 - i as u32);
                 cur[n] = val as i16;
                 if val != 0 {
@@ -551,70 +740,127 @@ impl Model {
                     act += val.unsigned_abs();
                 }
             }
+            if self.stats.is_some() && has_n && has_s && luma {
+                for i in 1..8 {
+                    let v8 = 8 * cur[idx(i)] as i32;
+                    let d = &mut self.dbg[i];
+                    d[0] += v8.unsigned_abs() as f64;
+                    for j in 0..4 {
+                        d[1 + j] += (v8 - pr[i][j]).unsigned_abs() as f64;
+                    }
+                    d[5] += (v8 - bl[i].0).unsigned_abs() as f64;
+                    d[6] += 1.0;
+                }
+            }
+            // learn the predictors' errors and record this block's prediction errors
+            let errs = &mut self.edge_err[(ucls * 2 + edge) * 8..(ucls * 2 + edge) * 8 + 8];
+            for i in 1..8 {
+                let v8 = 8 * cur[idx(i)] as i32;
+                if has_n {
+                    for (j, e) in errs[i].iter_mut().enumerate().take(3) {
+                        track(e, v8 - pr[i][j]);
+                    }
+                }
+                if has_s {
+                    track(&mut errs[i][3], v8 - pr[i][3]);
+                }
+                eerr[edge * 7 + i - 1] = ((v8 - bl[i].0).unsigned_abs() >> 3).min(255) as u8;
+            }
         }
 
         // ---- 4. DC from the neighbours' boundary pixels and this block's AC
         let pix0 = self.idct(&cur, &q, false);
-        let border_a = if has_a { Some(self.planes[ci].border[bi - w]) } else { None };
-        let border_l = if has_l { Some(self.planes[ci].border[bi - 1]) } else { None };
         let q0 = q[0];
-        let mut preds: Vec<i32> = Vec::with_capacity(4);
-        let mut spread = 0i32;
-        if let Some(ba) = border_a {
-            let mut s = 0i32;
+        let mut dp = [0i32; 5];
+        let mut dav = [false; 5];
+        if has_a {
+            let ba = self.planes[ci].border[bi - w];
+            let (mut sg, mut s0) = (0i64, 0i64);
             for x in 0..8 {
-                let ea = 2 * ba[x] as i32 + (ba[x] as i32 - ba[8 + x] as i32);
-                let ec = 2 * pix0[x] - (pix0[8 + x] - pix0[x]);
-                s += ea - ec;
+                let (a7, a6) = (ba[x] as i64, ba[8 + x] as i64);
+                let (c0, c1) = (pix0[x] as i64, pix0[8 + x] as i64);
+                sg += (3 * a7 - a6) - (3 * c0 - c1);
+                s0 += a7 - c0;
             }
-            preds.push(s);
+            dp[0] = (sg / (2 * q0 as i64)) as i32;
+            dp[2] = (s0 / q0 as i64) as i32;
+            dav[0] = true;
+            dav[2] = true;
         }
-        if let Some(bl) = border_l {
-            let mut s = 0i32;
+        if has_l {
+            let bl = self.planes[ci].border[bi - 1];
+            let (mut sg, mut s0) = (0i64, 0i64);
             for y in 0..8 {
-                let el = 2 * bl[16 + y] as i32 + (bl[16 + y] as i32 - bl[24 + y] as i32);
-                let ec = 2 * pix0[y * 8] - (pix0[y * 8 + 1] - pix0[y * 8]);
-                s += el - ec;
+                let (l7, l6) = (bl[16 + y] as i64, bl[24 + y] as i64);
+                let (c0, c1) = (pix0[y * 8] as i64, pix0[y * 8 + 1] as i64);
+                sg += (3 * l7 - l6) - (3 * c0 - c1);
+                s0 += l7 - c0;
             }
-            preds.push(s);
+            dp[1] = (sg / (2 * q0 as i64)) as i32;
+            dp[3] = (s0 / q0 as i64) as i32;
+            dav[1] = true;
+            dav[3] = true;
         }
-        // preds are sums of 8 doubled boundary estimates of DC*q0 (x8 pixel units): /16
-        let pred_dc = if preds.is_empty() {
-            0
-        } else {
-            if preds.len() == 2 {
-                spread = ((preds[0] - preds[1]).abs() / 16 / q0).min(1 << 12);
+        if has_a || has_l {
+            let (da, dl, dal) = (a[0] as i32, l[0] as i32, al[0] as i32);
+            dp[4] = 8 * match (has_a, has_l) {
+                (true, true) => {
+                    let (mx, mn) = (da.max(dl), da.min(dl));
+                    let g = da + dl - dal;
+                    g.clamp(mn, mx)
+                }
+                (true, false) => da,
+                _ => dl,
+            };
+            dav[4] = true;
+        }
+        let (pdc, econf) = blend(&dp, &dav, &self.dc_err[ucls]);
+        let pred_dc = r8(pdc);
+        let (mut mx, mut mn) = (i32::MIN, i32::MAX);
+        for j in 0..4 {
+            if dav[j] {
+                mx = mx.max(dp[j]);
+                mn = mn.min(dp[j]);
             }
-            let s: i32 = preds.iter().sum();
-            let n = preds.len() as i32 * 16 * q0;
-            (2 * s + n * s.signum()) / (2 * n)
-        };
+        }
+        let spread = if mx >= mn { ((mx - mn) >> 3) as u32 } else { 0 };
         let dcv = if dc_on {
             let ra = if has_a { self.planes[ci].dcres[bi - w] as i32 } else { 0 };
             let rl = if has_l { self.planes[ci].dcres[bi - 1] as i32 } else { 0 };
             let ctxr = mb(ra.unsigned_abs() + rl.unsigned_abs());
+            let conf = mb((econf >> 5) as u32).min(15);
+            let navail = dav.iter().filter(|&&x| x).count() as u32;
             let hs: [u32; NCTX] = [
-                hash2(400, (mb(spread as u32) << 6) | (preds.len() as u32) << 2 | cls),
-                hash2(401, (ctxr << 6) | (preds.len() as u32) << 2 | cls),
-                hash2(402, (mb(spread as u32) << 8) | (ctxr << 2) | cls),
+                hash2(400, (mb(spread) << 8) | (conf << 3) | (navail.min(3) << 1) | cls),
+                hash2(401, (ctxr << 8) | (conf << 2) | cls),
+                hash2(402, (mb(spread) << 8) | (ctxr << 2) | cls),
                 hash2(403, ((clip(ra, 8) + 8) as u32) << 8 | ((clip(rl, 8) + 8) as u32) << 2 | cls),
                 hash2(404, (nzb(nz77) << 8) | (nze_total << 2) | cls),
-                hash2(405, (mb(act) << 6) | (mb(spread as u32) << 2) | cls),
-                hash2(406, if luma { 0 } else { (mb(lact) << 2) | 1 }),
-                hash2(407, (preds.len() as u32) << 2 | cls),
-                hash2(408, ((clip(pred_dc - if has_l { l[0] as i32 } else { 0 }, 15) + 16) as u32) << 2 | cls),
-                hash2(409, ((clip(pred_dc - if has_a { a[0] as i32 } else { 0 }, 15) + 16) as u32) << 2 | cls),
-                hash2(410, cls),
-                hash2(411, (mb(spread as u32) << 2) | cls),
+                hash2(405, (mb(act) << 6) | (mb(spread) << 2) | cls),
+                hash2(406, if luma { conf << 1 } else { (mb(lact) << 6) | (conf << 1) | 1 }),
+                hash2(407, ((pdc - 8 * pred_dc + 4) as u32) << 6 | (conf << 2) | cls),
+                hash2(408, ((clip(r8(dp[4]) - pred_dc, 15) + 16) as u32) << 6 | (conf << 2) | cls),
+                hash2(409, ((clip(r8(dp[2]) - pred_dc, 15) + 16) as u32) << 8 | ((clip(r8(dp[3]) - pred_dc, 15) + 16) as u32) << 2 | cls),
+                hash2(410, ((clip(r8(dp[0]) - pred_dc, 15) + 16) as u32) << 8 | ((clip(r8(dp[1]) - pred_dc, 15) + 16) as u32) << 2 | cls),
+                hash2(411, (mb(spread) << 2) | cls),
             ];
             for (j, &h) in hs.iter().enumerate() {
                 self.tabs[j].set(h);
             }
-            self.sel = [6 + cls as usize, 128 + cls as usize, 64 + mb(spread as u32) as usize];
-            self.actx = [192 + cls as usize * 16 + mb(spread as u32) as usize, 384 + (ctxr as usize) * 2 + cls as usize];
+            self.sel = [6 + ucls, 128 + ucls, 64 + mb(spread) as usize];
+            self.actx = [192 + ucls * 16 + conf as usize, 384 + (ctxr as usize) * 2 + ucls];
+            self.pred8 = pdc - 8 * pred_dc;
+            self.dyn_base = PART_DC * SLOTS * DYN_B * DYN_C + (conf as usize).min(7);
+            self.part = 10;
             let r = self.value(coder, cur[0] as i32 - pred_dc, true);
             let v = pred_dc + r;
             self.planes[ci].dcres[bi] = r.clamp(-32767, 32767) as i16;
+            let v8 = 8 * v;
+            for j in 0..5 {
+                if dav[j] {
+                    track(&mut self.dc_err[ucls][j], v8 - dp[j]);
+                }
+            }
             v
         } else {
             cur[0] as i32
@@ -625,6 +871,7 @@ impl Model {
         let pl = &mut self.planes[ci];
         pl.nz77[bi] = nz77 as u8;
         pl.nze[bi] = nze_total as u8;
+        pl.eerr[bi] = eerr;
         let dc8 = dcv * q0;
         let mut bd = [0i16; 32];
         for i in 0..8 {
@@ -635,7 +882,6 @@ impl Model {
         }
         pl.border[bi] = bd;
         plane[bi * 64..bi * 64 + 64].copy_from_slice(&cur);
-        let _ = (&al, &ar);
     }
 
     /// Predictions of edge coefficient `i` (row 0 if `edge == 0`, else column 0) of `cur` from
