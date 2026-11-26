@@ -56,7 +56,7 @@ const NONE: u64 = u64::MAX;
 impl PixModel {
     pub fn new(w: usize, h: usize, flags: bool) -> Self {
         let t = tables();
-        let px = (w * h) as u64;
+        let px = w as u64 * h as u64;
         let lb = (64 - px.leading_zeros()).clamp(10, 20);
         let mbits = (64 - px.leading_zeros()).clamp(10, 22);
         PixModel {

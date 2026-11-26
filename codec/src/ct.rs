@@ -299,7 +299,7 @@ impl CtModel {
             });
         }
         let lb = [12u32, 16, 16, 18, 16, 16, 18, 18, 18, 14, 16];
-        let samples = (width * height * nc) as u64;
+        let samples = width as u64 * height as u64 * nc as u64;
         let cap = (64 - samples.leading_zeros()).max(10);
         let tabs = lb
             .iter()

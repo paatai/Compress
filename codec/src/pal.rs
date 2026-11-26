@@ -28,7 +28,7 @@ pub struct PalModel {
 impl PalModel {
     pub fn new(w: usize, h: usize, palette_size: usize) -> Self {
         let t = tables();
-        let px = (w * h) as u64;
+        let px = w as u64 * h as u64;
         let lb = (64 - px.leading_zeros()).clamp(10, 18);
         let mut nbits = 1;
         while (1usize << nbits) < palette_size {
