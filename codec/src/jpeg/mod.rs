@@ -5,7 +5,7 @@
 //!   mode RAW:  the original bytes
 //!   mode CM:   the original bytes coded with the general-purpose byte model
 //!   mode JPEG: varint header-blob length | varint coded length | coded header blob
-//!              varint trailer length | varint coded length | coded trailer
+//!              varint trailer length | varint coded length | trailer kind | coded trailer
 //!              varint side-info length | side info
 //!              varint stripe count | varint byte length of every stripe but the last | stripes
 //!
@@ -16,6 +16,10 @@
 //! between scan data and the next marker, end-of-band run boundaries). Before anything is
 //! written the scans are regenerated from the coefficients and compared with the input; any
 //! difference, or anything unsupported, falls back to storing the input as it is.
+//!
+//! Data after the end of the image (trailer kind 0) is coded with the byte model; if it is
+//! itself a JPEG, as cameras append previews and depth maps, it can instead be a complete
+//! nested .komla JPEG file (kind 1).
 
 pub mod bytecm;
 pub mod format;
@@ -244,6 +248,34 @@ pub fn prepare(data: &[u8]) -> Prepared {
     }
 }
 
+const TRAILER_CM: u8 = 0;
+const TRAILER_JPEG: u8 = 1;
+
+/// Codes the bytes after the end of the image: recursively as a JPEG if they are one (and that
+/// is smaller), otherwise with the byte model.
+fn encode_trailer(t: &[u8]) -> (u8, Vec<u8>) {
+    let cm = bytecm::encode(t);
+    if is_jpeg(t) {
+        let (nested, info) = compress(t, &mut |_| {});
+        if info.mode == MODE_JPEG && nested.len() < cm.len() {
+            return (TRAILER_JPEG, nested);
+        }
+    }
+    (TRAILER_CM, cm)
+}
+
+fn decode_trailer(kind: u8, coded: &[u8], len: usize) -> Result<Vec<u8>, String> {
+    let t = match kind {
+        TRAILER_CM => bytecm::decode(coded, len)?,
+        TRAILER_JPEG => decompress(coded, &mut |_| {})?,
+        _ => return Err("corrupt .komla file".into()),
+    };
+    if t.len() != len {
+        return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
+    }
+    Ok(t)
+}
+
 fn analyze(data: &[u8]) -> Result<Prepared, String> {
     if data.len() > u32::MAX as usize {
         return Err("file too large".into());
@@ -282,12 +314,15 @@ fn analyze(data: &[u8]) -> Result<Prepared, String> {
     h.push(MODE_JPEG);
     put_varint(&mut h, data.len() as u64);
     h.extend_from_slice(&crate::crc32(data).to_le_bytes());
-    for part in [&l.blob[..], trailer] {
-        let c = bytecm::encode(part);
-        put_varint(&mut h, part.len() as u64);
-        put_varint(&mut h, c.len() as u64);
-        h.extend_from_slice(&c);
-    }
+    let c = bytecm::encode(&l.blob);
+    put_varint(&mut h, l.blob.len() as u64);
+    put_varint(&mut h, c.len() as u64);
+    h.extend_from_slice(&c);
+    let (kind, c) = encode_trailer(trailer);
+    put_varint(&mut h, trailer.len() as u64);
+    put_varint(&mut h, c.len() as u64);
+    h.push(kind);
+    h.extend_from_slice(&c);
     put_varint(&mut h, side.len() as u64);
     h.extend_from_slice(&side);
     let rows = stripe_rows(f);
@@ -372,7 +407,8 @@ pub struct Container<'a> {
     /// stored modes: the payload; JPEG mode: unused
     pub payload: &'a [u8],
     pub blob: Vec<u8>,
-    pub trailer: Vec<u8>,
+    /// data after the end of the image: kind, coded bytes and length (decoded by `finish`)
+    pub trailer: (u8, &'a [u8], usize),
     pub side: &'a [u8],
     pub stripes: Vec<&'a [u8]>,
 }
@@ -388,24 +424,27 @@ pub fn parse_container(b: &[u8]) -> Result<Container<'_>, String> {
     let mut pos = 7;
     let len = usize::try_from(get_varint(b, &mut pos)?).map_err(|_| "corrupt .komla file")?;
     let crc = u32::from_le_bytes(take(b, &mut pos, 4)?.try_into().unwrap());
-    let mut c = Container { mode, len, crc, payload: &[], blob: Vec::new(), trailer: Vec::new(), side: &[], stripes: Vec::new() };
+    let mut c = Container { mode, len, crc, payload: &[], blob: Vec::new(), trailer: (TRAILER_CM, &[], 0), side: &[], stripes: Vec::new() };
     match mode {
         MODE_RAW | MODE_CM => {
             c.payload = &b[pos..];
             Ok(c)
         }
         MODE_JPEG => {
-            let mut parts = Vec::new();
-            for _ in 0..2 {
-                let n = get_varint(b, &mut pos)?;
-                let cl = get_varint(b, &mut pos)?;
-                if n > len as u64 {
-                    return Err("corrupt .komla file".into());
-                }
-                parts.push(bytecm::decode(take(b, &mut pos, cl)?, n as usize)?);
+            let n = get_varint(b, &mut pos)?;
+            let cl = get_varint(b, &mut pos)?;
+            if n > len as u64 {
+                return Err("corrupt .komla file".into());
             }
-            c.trailer = parts.pop().unwrap();
-            c.blob = parts.pop().unwrap();
+            c.blob = bytecm::decode(take(b, &mut pos, cl)?, n as usize)?;
+            let n = get_varint(b, &mut pos)?;
+            let cl = get_varint(b, &mut pos)?;
+            if n > len as u64 {
+                return Err("corrupt .komla file".into());
+            }
+            let kind = *b.get(pos).ok_or("truncated .komla file")?;
+            pos += 1;
+            c.trailer = (kind, take(b, &mut pos, cl)?, n as usize);
             let sl = get_varint(b, &mut pos)?;
             c.side = take(b, &mut pos, sl)?;
             let n = get_varint(b, &mut pos)? as usize;
@@ -471,7 +510,7 @@ fn rebuild(c: &Container, stripes: Vec<Vec<i16>>) -> Result<Vec<u8>, String> {
         }
     }
     out.extend_from_slice(&c.blob[pos..]);
-    out.extend_from_slice(&c.trailer);
+    out.extend_from_slice(&decode_trailer(c.trailer.0, c.trailer.1, c.trailer.2)?);
     Ok(out)
 }
 

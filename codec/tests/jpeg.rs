@@ -24,6 +24,17 @@ fn fixtures_restore_byte_for_byte() {
 }
 
 #[test]
+fn jpeg_after_the_end_of_image_is_recompressed_too() {
+    let mut data = fixture("tiny_420.jpg");
+    let tail = fixture("tiny_progressive_444.jpg");
+    data.extend_from_slice(&tail);
+    let packed = roundtrip(&data, jpeg::MODE_JPEG);
+    let (alone, _) = jpeg::compress(&fixture("tiny_420.jpg"), &mut |_| {});
+    let (tail_alone, _) = jpeg::compress(&tail, &mut |_| {});
+    assert!(packed.len() < alone.len() + tail_alone.len() + 32, "{} vs {} + {}", packed.len(), alone.len(), tail_alone.len());
+}
+
+#[test]
 fn unsupported_or_damaged_input_is_stored() {
     let data = fixture("tiny_420.jpg");
     roundtrip(&data[..data.len() * 2 / 3], jpeg::MODE_CM);
