@@ -136,16 +136,34 @@ fn compress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8], fast: bool
     Ok(())
 }
 
-fn decompress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8]) -> Result<(), String> {
+/// Restores a .komla JPEG file straight from file to file (fast-mode files are never held in
+/// memory as a whole).
+fn decompress_jpeg(input: &Path, output: Option<PathBuf>) -> Result<(), String> {
     let t0 = Instant::now();
-    let out = jpeg::decompress_with(bytes, jpeg::threads())?;
-    let dt = t0.elapsed().as_secs_f64();
     let output = output.unwrap_or_else(|| {
         let stem = input.to_string_lossy();
         PathBuf::from(stem.strip_suffix(".komla").map(str::to_string).unwrap_or_else(|| format!("{stem}.jpg")))
     });
-    std::fs::write(&output, &out).map_err(|e| format!("{}: {e}", output.display()))?;
-    println!("{} -> {}: {} bytes, checksum OK, in {:.2}s", input.display(), output.display(), out.len(), dt);
+    let inp = std::fs::File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let mut out = std::fs::File::create(&output).map_err(|e| format!("{}: {e}", output.display()))?;
+    #[cfg(unix)]
+    let res = jpeg::decompress_file(&inp, &mut out, jpeg::threads());
+    #[cfg(not(unix))]
+    let res = {
+        use std::io::{Read, Write};
+        let mut b = Vec::new();
+        let mut inp = inp;
+        inp.read_to_end(&mut b).map_err(|e| e.to_string())?;
+        jpeg::decompress_with(&b, jpeg::threads()).and_then(|d| out.write_all(&d).map_err(|e| e.to_string()))
+    };
+    if let Err(e) = res {
+        drop(out);
+        let _ = std::fs::remove_file(&output);
+        return Err(e);
+    }
+    let n = out.metadata().map_or(0, |m| m.len());
+    let dt = t0.elapsed().as_secs_f64();
+    println!("{} -> {}: {} bytes, checksum OK, in {:.2}s", input.display(), output.display(), n, dt);
     Ok(())
 }
 
@@ -186,10 +204,16 @@ fn cmd_compress(args: &[String]) -> Result<(), String> {
 
 fn cmd_decompress(args: &[String]) -> Result<(), String> {
     let (input, output) = split_out(args)?;
-    let bytes = read(&input)?;
-    if jpeg::is_container(&bytes) {
-        return decompress_jpeg(&input, output, &bytes);
+    let mut head = [0u8; 8];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(&input).map_err(|e| format!("{}: {e}", input.display()))?;
+        let n = f.read(&mut head).map_err(|e| e.to_string())?;
+        if jpeg::is_container(&head[..n]) {
+            return decompress_jpeg(&input, output);
+        }
     }
+    let bytes = read(&input)?;
     let t0 = Instant::now();
     let (img, src) = komla::decompress(&bytes, &options(), &mut |_| {})?;
     let dt = t0.elapsed().as_secs_f64();

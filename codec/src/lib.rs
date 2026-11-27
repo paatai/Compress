@@ -90,8 +90,13 @@ static CRC_TABLES: [[u32; 256]; 8] = {
 };
 
 pub fn crc32(data: &[u8]) -> u32 {
+    crc32_continue(0, data)
+}
+
+/// CRC-32 of the data before (whose CRC is `prev`) followed by `data`.
+pub fn crc32_continue(prev: u32, data: &[u8]) -> u32 {
     let t = &CRC_TABLES;
-    let mut crc = 0xFFFF_FFFFu32;
+    let mut crc = !prev;
     let mut chunks = data.chunks_exact(8);
     for c in &mut chunks {
         let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) ^ crc;
@@ -109,6 +114,60 @@ pub fn crc32(data: &[u8]) -> u32 {
         crc = t[0][((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc ^ 0xFFFF_FFFF
+}
+
+/// CRC-32 of two pieces joined, from their CRCs and the length of the second (zeros appended to
+/// the first by squaring the one-zero-bit operator over GF(2), as zlib does).
+pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
+    fn times(m: &[u32; 32], mut v: u32) -> u32 {
+        let mut s = 0;
+        let mut i = 0;
+        while v != 0 {
+            if v & 1 != 0 {
+                s ^= m[i];
+            }
+            v >>= 1;
+            i += 1;
+        }
+        s
+    }
+    fn square(m: &[u32; 32]) -> [u32; 32] {
+        let mut r = [0u32; 32];
+        for (i, x) in r.iter_mut().enumerate() {
+            *x = times(m, m[i]);
+        }
+        r
+    }
+    if len2 == 0 {
+        return crc1;
+    }
+    let mut odd = [0u32; 32];
+    odd[0] = 0xEDB8_8320;
+    for (i, x) in odd.iter_mut().enumerate().skip(1) {
+        *x = 1 << (i - 1);
+    }
+    let mut even = square(&odd);
+    odd = square(&even);
+    let (mut c1, mut len) = (crc1, len2);
+    loop {
+        even = square(&odd);
+        if len & 1 != 0 {
+            c1 = times(&even, c1);
+        }
+        len >>= 1;
+        if len == 0 {
+            break;
+        }
+        odd = square(&even);
+        if len & 1 != 0 {
+            c1 = times(&odd, c1);
+        }
+        len >>= 1;
+        if len == 0 {
+            break;
+        }
+    }
+    c1 ^ crc2
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u32) {
@@ -745,5 +804,10 @@ mod tests {
             assert_eq!(super::crc32(&data[..n]), !c);
         }
         assert_eq!(super::crc32(&data), !crc);
+        for (a, b) in [(0usize, 0usize), (0, 5), (5, 0), (1, 1), (7, 9), (1000, 99_003)] {
+            let (x, y) = (&data[..a], &data[a..a + b]);
+            assert_eq!(super::crc32_continue(super::crc32(x), y), super::crc32(&data[..a + b]));
+            assert_eq!(super::crc32_combine(super::crc32(x), super::crc32(y), y.len() as u64), super::crc32(&data[..a + b]));
+        }
     }
 }

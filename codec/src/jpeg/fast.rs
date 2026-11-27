@@ -387,9 +387,14 @@ pub trait Io {
     fn raw(&mut self, v: u32, n: u32) -> u32;
 }
 
+/// Symbols per rANS chunk: the encoder holds at most one chunk of symbols, and the decoder
+/// starts from new states (stored at the head of each chunk) every CHUNK symbols.
+const CHUNK: u32 = 1 << 16;
+
 pub struct Enc<L: Lanes = Base> {
     lanes: std::marker::PhantomData<L>,
     ops: Vec<u32>,
+    out: Vec<u8>,
     raw: Vec<u8>,
     racc: u64,
     rbits: u32,
@@ -403,10 +408,11 @@ impl<L: Lanes> Default for Enc<L> {
 
 impl<L: Lanes> Enc<L> {
     pub fn new() -> Self {
-        Enc { lanes: std::marker::PhantomData, ops: Vec::with_capacity(1 << 16), raw: Vec::with_capacity(1 << 16), racc: 0, rbits: 0 }
+        Enc { lanes: std::marker::PhantomData, ops: Vec::with_capacity(CHUNK as usize), out: Vec::new(), raw: Vec::new(), racc: 0, rbits: 0 }
     }
-    /// Returns (rANS-coded bytes, raw bits).
-    pub fn finish(mut self) -> (Vec<u8>, Vec<u8>) {
+    /// Codes the buffered symbols in reverse as one chunk: its two final states, then the
+    /// renormalization words in the order the decoder reads them.
+    fn flush_chunk(&mut self) {
         let mut x = [RANS_L; 2];
         let mut words: Vec<u16> = Vec::with_capacity(self.ops.len() / 2 + 8);
         for (i, &op) in self.ops.iter().enumerate().rev() {
@@ -423,10 +429,25 @@ impl<L: Lanes> Enc<L> {
             words.push(s as u16);
             words.push((s >> 16) as u16);
         }
-        let mut out = Vec::with_capacity(words.len() * 2);
+        self.out.reserve(words.len() * 2);
         for &w in words.iter().rev() {
-            out.extend_from_slice(&w.to_be_bytes());
+            self.out.extend_from_slice(&w.to_be_bytes());
         }
+        self.ops.clear();
+    }
+    #[inline(always)]
+    fn push(&mut self, op: u32) {
+        self.ops.push(op);
+        if self.ops.len() == CHUNK as usize {
+            self.flush_chunk();
+        }
+    }
+    /// Returns (rANS-coded bytes, raw bits).
+    pub fn finish(mut self) -> (Vec<u8>, Vec<u8>) {
+        if !self.ops.is_empty() || self.out.is_empty() {
+            self.flush_chunk();
+        }
+        let out = std::mem::take(&mut self.out);
         while self.rbits >= 8 {
             self.rbits -= 8;
             self.raw.push((self.racc >> self.rbits) as u8);
@@ -444,14 +465,14 @@ impl<L: Lanes> Io for Enc<L> {
     fn sym(&mut self, c: &mut Cdf, cnt: &mut u8, n: usize, s: usize) -> usize {
         debug_assert!(s < n);
         let (start, freq) = c.interval(s);
-        self.ops.push(start | ((freq - 1) << 16));
+        self.push(start | ((freq - 1) << 16));
         c.update::<L>(cnt, s, n);
         s
     }
     #[inline(always)]
     fn bit(&mut self, p: &mut Bit, b: u32) -> u32 {
         let q = *p as u32;
-        self.ops.push(if b != 0 { q | ((PROB_ONE - q - 1) << 16) } else { (q - 1) << 16 });
+        self.push(if b != 0 { q | ((PROB_ONE - q - 1) << 16) } else { (q - 1) << 16 });
         *p = adapt_bit(*p, b);
         b
     }
@@ -472,6 +493,8 @@ pub struct Dec<'a, L: Lanes = Base> {
     lanes: std::marker::PhantomData<L>,
     x0: u32,
     x1: u32,
+    /// symbols left in the current chunk
+    left: u32,
     data: &'a [u8],
     pos: usize,
     rdata: &'a [u8],
@@ -482,10 +505,15 @@ pub struct Dec<'a, L: Lanes = Base> {
 
 impl<'a, L: Lanes> Dec<'a, L> {
     pub fn new(data: &'a [u8], raw: &'a [u8]) -> Self {
-        let mut d = Dec { lanes: std::marker::PhantomData, x0: 0, x1: 0, data, pos: 0, rdata: raw, rpos: 0, racc: 0, rbits: 0 };
-        d.x0 = (d.word() << 16) | d.word();
-        d.x1 = (d.word() << 16) | d.word();
+        let mut d = Dec { lanes: std::marker::PhantomData, x0: 0, x1: 0, left: 0, data, pos: 0, rdata: raw, rpos: 0, racc: 0, rbits: 0 };
+        d.next_chunk();
         d
+    }
+    #[cold]
+    fn next_chunk(&mut self) {
+        self.x0 = (self.word() << 16) | self.word();
+        self.x1 = (self.word() << 16) | self.word();
+        self.left = CHUNK;
     }
     #[inline(always)]
     fn word(&mut self) -> u32 {
@@ -506,6 +534,10 @@ impl<L: Lanes> Io for Dec<'_, L> {
     const DEC: bool = true;
     #[inline(always)]
     fn sym(&mut self, c: &mut Cdf, cnt: &mut u8, n: usize, _s: usize) -> usize {
+        if self.left == 0 {
+            self.next_chunk();
+        }
+        self.left -= 1;
         let x = self.x0;
         let slot = x & (PROB_ONE - 1);
         let s = c.find::<L>(slot);
@@ -521,6 +553,10 @@ impl<L: Lanes> Io for Dec<'_, L> {
     }
     #[inline(always)]
     fn bit(&mut self, p: &mut Bit, _b: u32) -> u32 {
+        if self.left == 0 {
+            self.next_chunk();
+        }
+        self.left -= 1;
         let x = self.x0;
         let slot = x & (PROB_ONE - 1);
         let q = *p as u32;
@@ -1100,12 +1136,14 @@ pub struct Extent {
     pub ac_h: usize,
 }
 
-/// Codes the blocks of one stripe in MCU-row order. `planes[c]`: the stripe's block rows of
-/// component c (`width[c]` blocks of 64 coefficients per row); `v[c]`: block rows per MCU row;
-/// `q[c]`: quantization table (natural order).
-#[allow(clippy::too_many_arguments)]
+/// Codes the blocks of one stripe in MCU-row order. `planes[c]` holds `rows[c]` block rows of
+/// component c (`width[c]` blocks of 64 coefficients each): block row `by` of the stripe lives
+/// in row `by % rows[c]`, so a ring of two MCU rows is enough (the decoder clears a row before
+/// reusing it). `v[c]`: block rows per MCU row; `q[c]`: quantization table (natural order).
+/// `emit(my, planes)` is called after every MCU row.
 #[inline(always)]
-pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize], v: &[usize], ext: &[Extent], q: &[[u16; 64]], mcu_rows: usize) -> Model {
+#[allow(clippy::too_many_arguments)]
+pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], rows: &[usize], width: &[usize], v: &[usize], ext: &[Extent], q: &[[u16; 64]], mcu_rows: usize, mut emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<Model, String> {
     let mut m = Model::new();
     let qs: Vec<[i64; 64]> = q.iter().map(|t| t.map(|x| x as i64)).collect();
     let rqs: Vec<[i64; 64]> = q.iter().map(|t| t.map(|x| (1i64 << 32) / (COS0[0] * x.max(1) as i64))).collect();
@@ -1115,6 +1153,7 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize]
             let cls = (c > 0) as usize;
             let w = width[c];
             let e = ext[c];
+            let len = w * 64;
             for r in 0..v[c] {
                 let by = my * v[c] + r;
                 let row_dc = e.dc && by < e.dc_h;
@@ -1122,8 +1161,22 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize]
                 if !row_dc && !row_ac {
                     continue;
                 }
-                let (before, cur) = planes[c].split_at_mut(by * w * 64);
-                let above: Option<&[i16]> = if by > 0 { Some(&before[(by - 1) * w * 64..]) } else { None };
+                let slot = by % rows[c];
+                if I::DEC && by >= rows[c] {
+                    planes[c][slot * len..(slot + 1) * len].fill(0);
+                }
+                let (cur, above): (&mut [i16], Option<&[i16]>) = if by == 0 {
+                    (&mut planes[c][slot * len..(slot + 1) * len], None)
+                } else {
+                    let up = (by - 1) % rows[c];
+                    if up < slot {
+                        let (a, b) = planes[c].split_at_mut(slot * len);
+                        (&mut b[..len], Some(&a[up * len..(up + 1) * len]))
+                    } else {
+                        let (a, b) = planes[c].split_at_mut(up * len);
+                        (&mut a[slot * len..(slot + 1) * len], Some(&b[..len]))
+                    }
+                };
                 // chroma: mean 7x7 count of the luma blocks at the same place (coded before)
                 let mut hints = Vec::new();
                 if c > 0 && v[0] % v[c] == 0 && width[0] % w == 0 {
@@ -1164,12 +1217,15 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize]
                 }
             }
         }
+        emit(my, planes)?;
     }
-    m
+    Ok(m)
 }
 
-/// Geometry of a stripe for `encode_stripe` and `decode_stripe`.
+/// Geometry of a stripe for `encode_stripe` and `decode_stripe`; `rows[c]`: block rows held
+/// per component (see `code_stripe`).
 pub struct Geometry<'a> {
+    pub rows: &'a [usize],
     pub width: &'a [usize],
     pub v: &'a [usize],
     pub ext: &'a [Extent],
@@ -1179,14 +1235,17 @@ pub struct Geometry<'a> {
 
 fn encode_with<L: Lanes>(planes: &mut [&mut [i16]], g: &Geometry) -> (Vec<u8>, Vec<u8>) {
     let mut e = Enc::<L>::new();
-    code_stripe(&mut e, planes, g.width, g.v, g.ext, g.q, g.mcu_rows);
+    let _ = code_stripe(&mut e, planes, g.rows, g.width, g.v, g.ext, g.q, g.mcu_rows, |_, _| Ok(()));
     e.finish()
 }
 
-fn decode_with<L: Lanes>(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry) -> bool {
+fn decode_with<L: Lanes>(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry, emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<(), String> {
     let mut d = Dec::<L>::new(rans, raw);
-    code_stripe(&mut d, planes, g.width, g.v, g.ext, g.q, g.mcu_rows);
-    !d.overrun()
+    code_stripe(&mut d, planes, g.rows, g.width, g.v, g.ext, g.q, g.mcu_rows, emit)?;
+    if d.overrun() {
+        return Err("corrupt .komla file".into());
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1197,8 +1256,8 @@ unsafe fn encode_avx2(planes: &mut [&mut [i16]], g: &Geometry) -> (Vec<u8>, Vec<
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn decode_avx2(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry) -> bool {
-    decode_with::<Avx2>(rans, raw, planes, g)
+unsafe fn decode_avx2(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry, emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<(), String> {
+    decode_with::<Avx2>(rans, raw, planes, g, emit)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1216,14 +1275,15 @@ pub fn encode_stripe(planes: &mut [&mut [i16]], g: &Geometry) -> (Vec<u8>, Vec<u
     encode_with::<Base>(planes, g)
 }
 
-/// Decodes the coefficients of one stripe into zeroed planes; false if the data ran out.
-pub fn decode_stripe(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry) -> bool {
+/// Decodes the coefficients of one stripe into zeroed planes, calling `emit` after every MCU
+/// row (see `code_stripe`).
+pub fn decode_stripe(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry, emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<(), String> {
     #[cfg(target_arch = "x86_64")]
     if has_avx2() {
         // SAFETY: the CPU has every feature the function is compiled for.
-        return unsafe { decode_avx2(rans, raw, planes, g) };
+        return unsafe { decode_avx2(rans, raw, planes, g, emit) };
     }
-    decode_with::<Base>(rans, raw, planes, g)
+    decode_with::<Base>(rans, raw, planes, g, emit)
 }
 
 /// Builds the priors file from summed `Model::stats` of a training set of `files` files:

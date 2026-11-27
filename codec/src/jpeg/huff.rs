@@ -519,9 +519,10 @@ impl<'a, 'c> SeqScan<'a, 'c> {
         Ok(())
     }
 
-    /// Bytes in the output so far.
-    pub fn len(&self) -> usize {
-        self.w.out.len()
+    /// The complete bytes written so far (pending bits stay in the encoder); the caller may
+    /// move them out and clear the vector.
+    pub fn bytes(&mut self) -> &mut Vec<u8> {
+        self.w.out
     }
 
     /// Final padding and the bytes after it.
@@ -712,9 +713,10 @@ impl<'a, 'c> ProgScan<'a, 'c> {
         Ok(())
     }
 
-    /// Bytes written so far.
-    pub fn len(&self) -> usize {
-        self.out.len()
+    /// The complete bytes written so far (pending bits stay in the encoder); the caller may
+    /// move them out and clear the vector.
+    pub fn bytes(&mut self) -> &mut Vec<u8> {
+        &mut self.out
     }
 
     /// Ends the scan and returns its bytes.
