@@ -2,7 +2,8 @@
 """Size, speed and peak memory of lossless JPEG recompressors, one process at a time.
 
 Every codec runs on every file twice: single-threaded ("1t") and at its default thread count
-("mt"; codecs without threads run the same command). Each encode and decode is timed (wall
+("mt"; for codecs without threads the "mt" row repeats the "1t" measurement). The fastest of
+--reps runs counts (one run for the slow default Komla mode). Each encode and decode is timed (wall
 clock) and its peak resident memory read from /usr/bin/time; the output of every decode is
 compared with the original file byte for byte (SHA-256). A codec that rejects a file or does not
 restore it exactly is counted at the original size and reported as a failure. Files are run in
@@ -64,8 +65,12 @@ CODECS = {
         "1t": ([t("packJPG"), "-np", "-o", "in.jpg"], "in.pjg", [t("packJPG"), "-np", "-o", "d/in.pjg"], {}),
     },
 }
+# no threads: the multi-threaded column repeats the single-threaded measurement
+SAME = {"brunsli", "packjpg"}
 CODECS["brunsli"]["mt"] = CODECS["brunsli"]["1t"]
 CODECS["packjpg"]["mt"] = CODECS["packjpg"]["1t"]
+# slow codecs run once per file
+REPS = {"komla": 1}
 ORDER = ["jxl", "brunsli", "packjpg", "lepton", "lepton-rust", "komla", "komla-fast"]
 GROUPS = ["kodak_q50", "kodak_q75", "kodak_q90_444", "kodak_q95_prog", "camera", "progressive", "gray", "screenshot"]
 
@@ -168,7 +173,11 @@ def main():
         rel = os.path.relpath(p, HERE)
         r = {"codec": c, "threads": v, "image": rel, "group": g, "input": s}
         try:
-            r.update(run_one(c, v, p, args.reps))
+            if v == "mt" and c in SAME and (c, "1t", rel) in results:
+                r.update({k: x for k, x in results[(c, "1t", rel)].items() if k not in r})
+                r["same_as_1t"] = True
+            else:
+                r.update(run_one(c, v, p, REPS.get(c, args.reps)))
         except Exception as e:
             r.update(bytes=None, enc_s=0, dec_s=0, enc_rss_kb=0, dec_rss_kb=0, ok=False, error=str(e).replace(ROOT + os.sep, "")[:300])
             print(f"FAILED {c} {v} {rel}: {r['error']}", file=sys.stderr)
