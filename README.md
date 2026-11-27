@@ -200,7 +200,9 @@ the model and its learned starting distributions), part the kind of files: on th
 Komla fast trails on camera originals, edited photos and scans, and leads on progressive files,
 screenshots and small web images (per-group table in the report). The
 narrowest speed margin is one-thread decompression against JPEG XL: a tie on the development
-and test sets, 9% faster on the held-out set. All tables (with the development and test sets,
+and test sets, 9% faster on the held-out set. In the browser (WebAssembly, one worker) a
+10-megapixel, 7.8 MB photo is compressed and verified in 1.3 seconds. All tables (with the
+development and test sets,
 per-group sizes, run-to-run spread and failures):
 [`bench/results/JPEG_SPEED_REPORT.md`](bench/results/JPEG_SPEED_REPORT.md); per-file numbers:
 `bench/results/jpeg_speed_{heldout,test,dev}.jsonl` and `bench/results/jpeg_paq8px_*.jsonl`.
