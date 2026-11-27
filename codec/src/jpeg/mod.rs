@@ -1200,19 +1200,37 @@ struct Part {
     at: u64,
     end: u64,
     crc: u32,
+    /// bytes not yet passed to the sink (they end at `at`); whole chunks write faster
+    buf: Vec<u8>,
 }
+
+/// Bytes a part collects before writing them.
+const PART_CHUNK: usize = 1 << 15;
 
 impl Part {
     fn new(start: u64, len: u64) -> Part {
-        Part { start, at: start, end: start + len, crc: 0 }
+        Part { start, at: start, end: start + len, crc: 0, buf: Vec::new() }
     }
     fn write(&mut self, sink: &mut dyn Sink, data: &[u8]) -> Result<(), String> {
         if self.at + data.len() as u64 > self.end {
             return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
         }
-        sink.put(self.at, data)?;
         self.crc = crate::crc32_continue(self.crc, data);
         self.at += data.len() as u64;
+        if self.buf.is_empty() && data.len() >= PART_CHUNK {
+            return sink.put(self.at - data.len() as u64, data);
+        }
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= PART_CHUNK {
+            self.flush(sink)?;
+        }
+        Ok(())
+    }
+    fn flush(&mut self, sink: &mut dyn Sink) -> Result<(), String> {
+        if !self.buf.is_empty() {
+            sink.put(self.at - self.buf.len() as u64, &self.buf)?;
+            self.buf.clear();
+        }
         Ok(())
     }
 }
@@ -1316,6 +1334,7 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
     }
     for (p, a, b) in heads.iter_mut() {
         p.write(sink, &c.blob[*a..*b])?;
+        p.flush(sink)?;
     }
     let geom = StripeGeom::new(&l);
     {
@@ -1340,11 +1359,11 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
             }
             Ok(())
         };
-        let read = |k: usize| -> Result<(Vec<u8>, usize), String> {
+        let read = |k: usize, v: &mut Vec<u8>| -> Result<usize, String> {
             let (p, a, b) = c.stripes[k];
-            let mut v = vec![0u8; (a + b) as usize];
-            inp.read_at(p, &mut v)?;
-            Ok((v, a as usize))
+            v.resize((a + b) as usize, 0);
+            inp.read_at(p, v)?;
+            Ok(a as usize)
         };
         if threads > 1 && rows.len() > 1 {
             pipeline(
@@ -1354,7 +1373,8 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
                 |k| {
                     let (my0, my1) = rows[k];
                     let mut bufs: Vec<Vec<i16>> = f.comps.iter().map(|comp| vec![0i16; (my1 - my0) * comp.v * comp.pw * 64]).collect();
-                    let (data, split) = read(k)?;
+                    let mut data = Vec::new();
+                    let split = read(k, &mut data)?;
                     let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
                     geom.decode(rows[k], &data[..split], &data[split..], &mut planes)?;
                     Ok(bufs)
@@ -1371,6 +1391,7 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
             // every MCU row back into scan data at once
             let held: Vec<usize> = geom.v.iter().map(|&v| 2 * v).collect();
             let mut ring: Vec<Vec<i16>> = f.comps.iter().zip(&held).map(|(comp, &h)| vec![0i16; h * comp.pw * 64]).collect();
+            let mut data = Vec::new();
             for k in 0..rows.len() {
                 let (my0, my1) = rows[k];
                 if k > 0 {
@@ -1378,7 +1399,7 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
                         b.fill(0);
                     }
                 }
-                let (data, split) = read(k)?;
+                let split = read(k, &mut data)?;
                 let ext = geom.extents(my0);
                 let mut planes: Vec<&mut [i16]> = ring.iter_mut().map(|b| &mut b[..]).collect();
                 let g = fast::Geometry { rows: &held, width: &geom.width, v: &geom.v, ext: &ext, q: &geom.q, mcu_rows: my1 - my0 };
@@ -1395,6 +1416,7 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
         }
         for (out, p) in outs.iter().zip(scans.iter_mut()) {
             p.write(sink, out)?;
+            p.flush(sink)?;
         }
     }
     let (kind, tpos, cl, tl) = c.trailer;
@@ -1405,6 +1427,7 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
             let t = fast::decode_bytes(&coded, tl as usize)?;
             drop(coded);
             trailer.write(sink, &t)?;
+            trailer.flush(sink)?;
         }
         TRAILER_FAST => {
             let (n, tcrc) = restore(&Sub { inner: inp, off: tpos, len: cl }, trailer.at, sink, threads, depth + 1)?;
