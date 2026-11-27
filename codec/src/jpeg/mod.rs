@@ -1325,6 +1325,20 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
     let len = r.varint()?;
     let crc = u32::from_le_bytes(r.bytes(4)?.try_into().unwrap());
     match head[6] {
+        MODE_RAW if inp.size() - r.pos == len => {
+            let mut part = Part::new(base, len);
+            let mut buf = vec![0u8; (len as usize).min(1 << 16)];
+            while part.at - base < len {
+                let n = (len - (part.at - base)).min(buf.len() as u64) as usize;
+                inp.read_at(r.pos + (part.at - base), &mut buf[..n])?;
+                part.write(sink, &buf[..n])?;
+            }
+            part.flush(sink)?;
+            if part.crc != crc {
+                return Err(damaged());
+            }
+            return Ok((len, crc));
+        }
         MODE_RAW | MODE_BYTES => {
             let rest = r.bytes(inp.size() - r.pos)?;
             let out = if head[6] == MODE_RAW { rest } else { fast::decode_bytes(&rest, len as usize)? };
@@ -1516,11 +1530,25 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
     let (kind, tpos, cl, tl) = c.trailer;
     match kind {
         TRAILER_CM => {
-            let mut coded = vec![0u8; cl as usize];
-            inp.read_at(tpos, &mut coded)?;
-            let t = fast::decode_bytes(&coded, tl as usize)?;
-            drop(coded);
-            trailer.write(sink, &t)?;
+            let mut first = [0u8; 1];
+            inp.read_at(tpos, &mut first)?;
+            if first[0] == 0 && cl == tl + 1 {
+                // stored as it is (such as a video appended to the picture): copied piece by piece
+                let mut buf = vec![0u8; (tl as usize).min(1 << 16)];
+                let mut at = 0u64;
+                while at < tl {
+                    let n = (tl - at).min(buf.len() as u64) as usize;
+                    inp.read_at(tpos + 1 + at, &mut buf[..n])?;
+                    trailer.write(sink, &buf[..n])?;
+                    at += n as u64;
+                }
+            } else {
+                let mut coded = vec![0u8; cl as usize];
+                inp.read_at(tpos, &mut coded)?;
+                let t = fast::decode_bytes(&coded, tl as usize)?;
+                drop(coded);
+                trailer.write(sink, &t)?;
+            }
             trailer.flush(sink)?;
         }
         TRAILER_FAST => {
