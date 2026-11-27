@@ -1,4 +1,4 @@
-import { Blend, Binary, Grid3x3, Layers, Repeat, Sigma } from 'lucide-react'
+import { Blend, Binary, FileImage, Grid3x3, Layers, Repeat, Sigma } from 'lucide-react'
 
 const steps = [
   {
@@ -25,6 +25,11 @@ const steps = [
     icon: Repeat,
     title: 'Handle screenshots and graphics',
     text: 'Images with few colours are coded as palette indices. Before coding a pixel, a few flags ask whether it repeats a neighbour or the continuation of a 2-D match found earlier in the image, which captures text, flat areas and repeated UI.',
+  },
+  {
+    icon: FileImage,
+    title: 'Recompress JPEGs, byte for byte',
+    text: "A JPEG's Huffman-coded data is decoded back to its DCT coefficients. Each block's coefficients are predicted from the neighbouring blocks (least-squares fits learned on the image, smooth boundaries, chroma from luma) and coded with the same context mixing. The decoder regenerates the original Huffman data, headers and metadata exactly.",
   },
   {
     icon: Sigma,

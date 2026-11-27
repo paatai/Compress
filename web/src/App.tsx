@@ -2,6 +2,7 @@ import { Cpu, Lock, ShieldCheck, Terminal } from 'lucide-react'
 import { Benchmark } from '@/components/benchmark'
 import { DropZone } from '@/components/drop-zone'
 import { HowItWorks } from '@/components/how-it-works'
+import { JpegBenchmark } from '@/components/jpeg-benchmark'
 import { JobCard } from '@/components/job-card'
 import { useJobs } from '@/hooks/use-jobs'
 
@@ -41,6 +42,9 @@ export default function App() {
             <a className="rounded px-2 py-1 hover:text-foreground" href="#benchmark">
               Benchmark
             </a>
+            <a className="rounded px-2 py-1 hover:text-foreground" href="#jpeg-benchmark">
+              JPEG
+            </a>
             <a className="hidden rounded px-2 py-1 hover:text-foreground sm:inline" href="#cli">
               Command line
             </a>
@@ -57,7 +61,8 @@ export default function App() {
             <h1 className="text-3xl font-semibold tracking-tight text-balance sm:text-5xl">Lossless image compression, smaller than WebP and JPEG XL.</h1>
             <p className="text-lg text-pretty text-muted-foreground">
               Drop a PNG or BMP and get a <code className="rounded bg-muted px-1 py-0.5 text-base">.komla</code> file that decodes back to exactly the same
-              pixels, bit for bit. Everything runs here in your browser; your images never leave your computer.
+              pixels, bit for bit. Drop a JPEG and it shrinks by about a quarter, and comes back as the very same file, byte for byte. Everything runs here in your
+              browser; your images never leave your computer.
             </p>
             <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm text-muted-foreground">
               <span className="flex items-center gap-1.5">
@@ -81,14 +86,15 @@ export default function App() {
           )}
           {jobs.length === 0 && (
             <p className="text-center text-sm text-muted-foreground">
-              Supports 8- and 16-bit grayscale, RGB and RGBA PNG (including palette PNGs) and uncompressed BMP. Large photos take a while: a 12-megapixel image
-              needs roughly half a minute on a recent laptop.
+              Supports 8- and 16-bit grayscale, RGB and RGBA PNG (including palette PNGs), uncompressed BMP, and baseline and progressive JPEG. Large photos take a
+              while: a 12-megapixel PNG needs roughly half a minute on a recent laptop, a 12-megapixel JPEG about ten to twenty seconds.
             </p>
           )}
         </section>
 
         <HowItWorks />
         <Benchmark />
+        <JpegBenchmark />
 
         <section id="cli" className="scroll-mt-20 space-y-4">
           <h2 className="text-2xl font-semibold tracking-tight">Command line</h2>
@@ -103,7 +109,11 @@ export default function App() {
               <span className="text-muted-foreground"># writes photo.png.komla</span>
               {'\n'}komla decompress photo.png.komla{'   '}
               <span className="text-muted-foreground"># restores photo.png, checks the CRC</span>
-              {'\n'}komla info photo.png.komla
+              {'\n'}komla info photo.png.komla{'\n\n'}
+              komla compress photo.jpg{'           '}
+              <span className="text-muted-foreground"># writes photo.jpg.komla</span>
+              {'\n'}komla decompress photo.jpg.komla{'   '}
+              <span className="text-muted-foreground"># restores the original photo.jpg, byte for byte</span>
             </code>
           </pre>
           <p className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -114,7 +124,7 @@ export default function App() {
 
       <footer className="border-t">
         <div className="mx-auto flex max-w-5xl flex-col gap-2 px-4 py-6 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between sm:px-6">
-          <span>Komla 1.0 · lossless image compression by context mixing</span>
+          <span>Komla 1.1 · lossless image compression and JPEG recompression by context mixing</span>
           <span>Runs locally in WebAssembly. Nothing is uploaded or stored.</span>
         </div>
       </footer>
