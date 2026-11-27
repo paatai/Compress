@@ -43,7 +43,7 @@ const DYN_B: usize = 24;
 const DYN_C: usize = 8;
 
 /// Model parameters; KOMLA_JTUNE="i=v,..." overrides them for experiments (both sides must agree).
-const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 1, 2, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 32, 1, 16, 1, 2, 0];
+const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 0, 2, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 32, 1, 16, 1, 2, 8];
 
 fn tune() -> &'static [i32; 24] {
     static T: std::sync::OnceLock<[i32; 24]> = std::sync::OnceLock::new();
@@ -736,12 +736,40 @@ impl Model {
             };
             let nz_al = if has_a && has_l { p.nz77[bi - w - 1] as u32 } else { 0 };
             let nz_ar = if has_a && bx + 1 < w { p.nz77[bi - w + 1] as u32 } else { 0 };
+            // how many 7x7 coefficients the least-squares models expect to be nonzero, from the
+            // neighbours alone (this block's own features still zero)
+            let (mut npr, mut spr) = (0u32, 0u32);
+            if self.ls_on && tune()[23] > 0 {
+                let zero = [0i16; 64];
+                for j in 0..49 {
+                    let lsi = ucls * 49 + j;
+                    let mut x = [0f64; 44];
+                    for (f, &(src, idx)) in self.ls_feats[lsi].iter().enumerate() {
+                        let idx = idx as usize;
+                        x[f] = match src {
+                            0 => (a[idx] as i32 * q[idx]) as f64,
+                            1 => (l[idx] as i32 * q[idx]) as f64,
+                            2 => (al[idx] as i32 * q[idx]) as f64,
+                            3 => (ar[idx] as i32 * q[idx]) as f64,
+                            4 => (zero[idx] as i32 * q[idx]) as f64,
+                            5 => lc[idx] as f64,
+                            6 => cc[idx] as f64,
+                            _ => 64.0,
+                        };
+                    }
+                    let n = INTERIOR[j];
+                    let pr = (self.ls[lsi].predict(&x) * 8.0 / q[n] as f64).abs();
+                    let pr = if pr.is_finite() { pr.min(1e6) as u32 } else { 0 };
+                    npr += (pr >= tune()[23] as u32) as u32;
+                    spr += pr >> 3;
+                }
+            }
             let hs = [
                 pred * 2 + cls,
                 hash2(1, (nz_a.min(31) << 6) | (nz_l.min(31) << 1) | cls),
                 hash2(2, (lnz.min(49) << 8) | (mb(lact) << 4) | (cls << 3) | (has_a as u32) << 1 | has_l as u32),
                 hash2(3, (nz_al << 8) | (nz_ar << 1) | cls),
-                hash2(4, (pred << 4) | (mb(lact) << 1) | cls),
+                if self.ls_on && tune()[23] > 0 { hash2(5, (npr << 10) | (mb(spr) << 6) | (nzb(pred) << 2) | cls) } else { hash2(4, (pred << 4) | (mb(lact) << 1) | cls) },
             ];
             self.count(coder, nz_true, &hs, 49, ucls * 2 + (has_a && has_l) as usize, nzb(pred) as usize * 2 + ucls)
         } else {
@@ -808,7 +836,7 @@ impl Model {
                     hash2(20 + k, (((clip(va, 4) + 4) as u32) << 8) | (((clip(vl, 4) + 4) as u32) << 4) | (cls << 1))
                 },
                 hash2(30 + k, (nz77.min(49) << 8) | ((nz77 - left).min(31) << 2) | cls),
-                if self.ls_on && tune()[7] == 1 {
+                if self.ls_on {
                     hash2(40 + k, (((clip(r8(pls), 15) + 16) as u32) << 10) | (nzb(left) << 5) | (lsconf << 1) | cls)
                 } else {
                     hash2(40 + k, (mb(var.unsigned_abs()) << 12) | (mb(val.unsigned_abs()) << 8) | (mb(wavg) << 2) | cls)
