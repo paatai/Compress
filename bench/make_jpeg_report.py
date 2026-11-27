@@ -38,19 +38,25 @@ def load(name):
 
 def summarize(rows):
     groups = [g for g in GROUPS if any(r["group"] == g for r in rows)]
+    files = {g: {r["image"] for r in rows if r["group"] == g} for g in groups}
     table = {}
     for cid, _, _ in CODECS:
         rs = [r for r in rows if r["codec"] == cid]
         if not rs:
             continue
         e = {"fails": sum(1 for r in rs if not r["ok"])}
+        complete = True
         for g in groups + ["total"]:
             gr = [r for r in rs if g == "total" or r["group"] == g]
+            if g != "total" and len({r["image"] for r in gr}) < len(files[g]):
+                complete = False
+                e[g] = None
+                continue
             i = sum(r["input"] for r in gr)
             o = sum(r["bytes"] if r["ok"] else r["input"] for r in gr)
-            e[g] = 100 * (1 - o / i) if i else float("nan")
+            e[g] = (100 * (1 - o / i) if i else float("nan")) if (g != "total" or complete) else None
             if g == "total":
-                e["input"], e["bytes"] = i, o
+                e["input"], e["bytes"] = i, (o if complete else None)
         ok = [r for r in rs if r["ok"]]
         mb = sum(r["input"] for r in ok) / 1e6
         es, ds = sum(r["enc_s"] for r in ok), sum(r["dec_s"] for r in ok)
@@ -65,20 +71,23 @@ def md(rows):
     groups, table, info = summarize(rows)
     head = "| Codec | " + " | ".join(f"{GROUPS[g]}<br>{info[g][0]} files, {info[g][1] / 1e6:.1f} MB" for g in groups) + " | **Total** | Output bytes | Failed files |"
     out = [head, "|" + "---|" * (len(groups) + 4)]
-    best = {g: max(v[g] for c, v in table.items() if c != "komla") for g in groups + ["total"]}
+    best = {g: max((v[g] for c, v in table.items() if c != "komla" and v[g] is not None), default=None) for g in groups + ["total"]}
     for cid, label, _ in CODECS:
         if cid not in table:
             continue
         v = table[cid]
         cells = []
         for g in groups + ["total"]:
+            if v[g] is None:
+                cells.append("—")
+                continue
             s = f"{v[g]:.2f}%"
             cells.append(f"**{s}**" if cid == "komla" or v[g] == best[g] else s)
         name = f"**{label}**" if cid == "komla" else label
-        out.append(f"| {name} | " + " | ".join(cells) + f" | {v['bytes']:,} | {v['fails']} |")
-    total_in = next(iter(table.values()))["input"]
+        out.append(f"| {name} | " + " | ".join(cells) + f" | {v['bytes']:,} | {v['fails']} |" if v["bytes"] is not None else f"| {name} | " + " | ".join(cells) + f" | — | {v['fails']} |")
+    total_in = table["komla"]["input"] if "komla" in table else next(iter(table.values()))["input"]
     out.append("")
-    out.append(f"Original JPEG files: {total_in:,} bytes. Higher is better.")
+    out.append(f"Original JPEG files: {total_in:,} bytes. Higher is better; — means the tool was not run on every file of that group.")
     sp = ["| Codec | Compress MB/s | Decompress MB/s |", "|---|---|---|"]
     for cid, label, _ in CODECS:
         if cid in table:
@@ -109,7 +118,7 @@ def main():
         data = {
             "groups": [{"id": g, "label": GROUPS[g], "files": info[g][0], "megabytes": round(info[g][1] / 1e6, 1)} for g in groups],
             "codecs": [
-                {"id": cid, "label": label, "saved": {g: round(table[cid][g], 2) for g in groups + ["total"]}, "fails": table[cid]["fails"], **({"komla": True} if cid == "komla" else {})}
+                {"id": cid, "label": label, "saved": {g: round(table[cid][g], 2) for g in groups + ["total"] if table[cid][g] is not None}, "fails": table[cid]["fails"], **({"komla": True} if cid == "komla" else {})}
                 for cid, label, _ in CODECS
                 if cid in table
             ],

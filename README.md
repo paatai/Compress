@@ -6,13 +6,19 @@ bit for bit, and is smaller than every standard lossless format we compared agai
 WebP and 34.8% smaller than optimized PNG** on the held-out test set below (photos,
 screenshots and graphics).
 
+It also recompresses **JPEG files losslessly**: the `.komla` file decompresses to the original
+JPEG, byte for byte, and is **24.1% smaller than the JPEGs** on the held-out JPEG test set below.
+That is 5.2% less output than paq8px, 6.3% less than Dropbox's Lepton and 9.7% less than JPEG
+XL's lossless JPEG transcoding. paq8px remains 1.5 points ahead on baseline JPEGs, but it
+cannot model progressive JPEGs, which Komla handles as well as baseline ones.
+
 It comes as
 
 - a **web app** that runs entirely in the browser (the codec is compiled to WebAssembly;
   images never leave your computer): **https://paatai.github.io/Compress/**, and
 - a **command-line tool** (Rust) for macOS and Linux. Files are interchangeable.
 
-## Results
+## Results: lossless images (PNG, BMP)
 
 Bits per pixel on the test set (lower is better). The test images were never used for tuning;
 the final codec was run on them once. Every output was decoded again and compared with the
@@ -80,6 +86,64 @@ in the browser on 8 cores (measured in headless Chrome while other jobs were run
 - All images are 8-bit RGB or RGBA (several graphics have alpha). Komla also supports 8- and
   16-bit grayscale, gray+alpha, RGB and RGBA; 16-bit images are not part of this benchmark
   (WebP cannot store them losslessly); on small 16-bit tests Komla was on par with JPEG XL.
+
+## Results: lossless JPEG recompression
+
+How much smaller than the original JPEG files (higher is better) on the held-out JPEG test set.
+Komla was tuned only on the development set and run on the test files once, with the final
+code. Every output, of every tool, was decompressed again and compared with the original JPEG
+file byte for byte (SHA-256); a tool that rejects a file or does not restore it exactly is
+counted at the original size. Komla restored all 80 test files exactly.
+
+| Tool | Kodak q50<br>12 files | Kodak q75<br>12 files | Kodak q90 4:4:4<br>12 files | Kodak q95 progressive<br>12 files | Camera photos<br>12 files, 52 MB | Progressive<br>8 files, 25 MB | Grayscale<br>6 files, 5 MB | Screenshots<br>6 files, 2 MB | **Total**<br>80 files, 89 MB | Rejected |
+|---|---|---|---|---|---|---|---|---|---|---|
+| JPEG XL | 16.60% | 13.46% | 14.57% | 8.86% | 17.82% | 12.35% | 16.16% | 21.02% | 16.00% | 0 |
+| brunsli | 20.64% | 16.35% | 16.89% | 11.06% | 20.54% | 14.65% | 20.70% | 22.34% | 18.67% | 0 |
+| Lepton (Dropbox) | 22.14% | 17.88% | 17.62% | 11.24% | 20.78% | 15.14% | 21.34% | 21.57% | 19.00% | 0 |
+| packJPG | 23.32% | 18.48% | 18.53% | 12.02% | 21.05% | 15.57% | 21.07% | 22.46% | 19.33% | 0 |
+| Lepton (Rust port) | 22.07% | 17.88% | 18.15% | 11.49% | 21.30% | 15.74% | 21.96% | 20.26% | 19.49% | 1 |
+| paq8px | **27.93%** | **23.21%** | **24.41%** | 0.94% | **27.43%** | 2.72% | **27.94%** | 26.62% | 19.97% | 0 |
+| **Komla** | 26.97% | 22.31% | 22.98% | **15.45%** | 25.77% | **20.52%** | 26.33% | **27.73%** | **24.11%** | 0 |
+
+| | Baseline JPEGs (62.7 MB) | Progressive JPEGs (26.5 MB) | Total (89.3 MB) |
+|---|---|---|---|
+| Komla | 25.78% | 20.16% | **24.11%** |
+| Best other tool | paq8px 27.31% | Lepton (Rust) 15.44% | paq8px 19.97% |
+| Lepton (Dropbox) | 20.75% | 14.87% | 19.00% |
+| JPEG XL | 17.65% | 12.10% | 16.00% |
+
+So Komla beats Lepton and JPEG XL on every group and on the total, and beats paq8px on the
+total (its output is 5.2% smaller) because paq8px has no progressive JPEG model; on baseline
+JPEGs paq8px, about 35 times slower, is still 1.5 points better. On the development set the
+picture is the same (Komla 25.0% overall, Lepton 19.1%, brunsli 19.4%, JPEG XL 16.8%). Full
+tables, byte counts and the development set: [`bench/results/JPEG_REPORT.md`](bench/results/JPEG_REPORT.md);
+per-file numbers: `bench/results/jpeg_test.jsonl` and `jpeg_dev.jsonl`.
+
+| Tool | Version and command |
+|---|---|
+| JPEG XL | libjxl 0.13.0: `cjxl --lossless_jpeg=1 -e 9`, restored with `djxl` |
+| brunsli | google/brunsli c18b962: `cbrunsli`, `dbrunsli` |
+| Lepton | dropbox/lepton f34c7f4: `lepton -singlethread -allowprogressive` (its default threading for the files where single-threaded mode fails its own round-trip check) |
+| Lepton (Rust port) | microsoft/lepton_jpeg_rust 0.5.9: `lepton_jpeg_util --threads 1` |
+| packJPG | packJPG 2.5n |
+| paq8px | paq8px v217: `paq8px -8` |
+
+**Speed.** Single-threaded, Komla compresses and decompresses about 0.37 MB of JPEG per second
+(paq8px 0.01 MB/s, JPEG XL 0.4 MB/s to compress and 9.6 to restore, Lepton 3.3 and 18 MB/s).
+Files above about 5.6 megapixels are split into stripes coded in parallel: in the browser
+(headless Chrome, 8 cores) a 12.6-megapixel photo is compressed and verified in 13 seconds, a
+24-megapixel one in 12.5 seconds.
+
+**Data sets** (built and hash-checked by `bench/fetch_jpeg_datasets.py`):
+
+- *Kodak:* the 24 Kodak images encoded with libjpeg-turbo 3.2.1 `cjpeg` at four settings:
+  quality 50 (4:2:0, standard tables), 75 (`-optimize`), 90 4:4:4 (`-optimize`) and 95
+  `-progressive`. Odd-numbered images form the development set, even-numbered the test set.
+- *Wikimedia Commons* (`bench/select_jpegs.py`, licences CC0, public domain, CC BY, CC BY-SA):
+  camera originals (EXIF make and model, no editing software) from eight camera models
+  including phones, progressive JPEGs from Quality and Featured images, grayscale JPEGs from
+  black-and-white photographs, and JPEG screenshots. Files in a size range are sorted by SHA-1
+  and the ones passing the group's check alternate between test and development set.
 
 ## Using it
 
@@ -288,7 +352,7 @@ of the Commons photos; points of saving):
 | Least-squares prediction of the 7×7 coefficients | +0.57 / +0.75 |
 | Least-squares prediction of the first row and column, used as centre of the distribution | +0.18 / +0.29 |
 | Least-squares DC combination, third APM, Laplace probability input, count contexts from the fits | +0.2 / +0.1 |
-| Context tables capped at 2^16 blocks (about 60 MB per stripe model instead of 115 MB) | −0.01 |
+| Context tables capped at 2^16 blocks (about 60 MB of tables per stripe instead of 115 MB) | −0.01 |
 
 Tried and dropped: coding first-row/column coefficients as residuals from their prediction
 instead of using the prediction as context (−1.2 / −1.6), bit-history counters (no gain, 50%

@@ -1,1 +1,167 @@
-{"groups": [], "codecs": []}
+{
+ "groups": [
+  {
+   "id": "kodak_q50",
+   "label": "Kodak q50",
+   "files": 12,
+   "megabytes": 0.5
+  },
+  {
+   "id": "kodak_q75",
+   "label": "Kodak q75",
+   "files": 12,
+   "megabytes": 0.8
+  },
+  {
+   "id": "kodak_q90_444",
+   "label": "Kodak q90 4:4:4",
+   "files": 12,
+   "megabytes": 1.6
+  },
+  {
+   "id": "kodak_q95_prog",
+   "label": "Kodak q95 progressive",
+   "files": 12,
+   "megabytes": 1.9
+  },
+  {
+   "id": "camera",
+   "label": "Camera photos",
+   "files": 12,
+   "megabytes": 52.2
+  },
+  {
+   "id": "progressive",
+   "label": "Progressive",
+   "files": 8,
+   "megabytes": 24.7
+  },
+  {
+   "id": "gray",
+   "label": "Grayscale",
+   "files": 6,
+   "megabytes": 5.2
+  },
+  {
+   "id": "screenshot",
+   "label": "Screenshots",
+   "files": 6,
+   "megabytes": 2.3
+  }
+ ],
+ "codecs": [
+  {
+   "id": "jxl",
+   "label": "JPEG XL",
+   "saved": {
+    "kodak_q50": 16.6,
+    "kodak_q75": 13.46,
+    "kodak_q90_444": 14.57,
+    "kodak_q95_prog": 8.86,
+    "camera": 17.82,
+    "progressive": 12.35,
+    "gray": 16.16,
+    "screenshot": 21.02,
+    "total": 16.0
+   },
+   "fails": 0
+  },
+  {
+   "id": "brunsli",
+   "label": "brunsli",
+   "saved": {
+    "kodak_q50": 20.64,
+    "kodak_q75": 16.35,
+    "kodak_q90_444": 16.89,
+    "kodak_q95_prog": 11.06,
+    "camera": 20.54,
+    "progressive": 14.65,
+    "gray": 20.7,
+    "screenshot": 22.34,
+    "total": 18.67
+   },
+   "fails": 0
+  },
+  {
+   "id": "lepton",
+   "label": "Lepton (Dropbox)",
+   "saved": {
+    "kodak_q50": 22.14,
+    "kodak_q75": 17.88,
+    "kodak_q90_444": 17.62,
+    "kodak_q95_prog": 11.24,
+    "camera": 20.78,
+    "progressive": 15.14,
+    "gray": 21.34,
+    "screenshot": 21.57,
+    "total": 19.0
+   },
+   "fails": 0
+  },
+  {
+   "id": "lepton-rust",
+   "label": "Lepton (Rust port)",
+   "saved": {
+    "kodak_q50": 22.07,
+    "kodak_q75": 17.88,
+    "kodak_q90_444": 18.15,
+    "kodak_q95_prog": 11.49,
+    "camera": 21.3,
+    "progressive": 15.74,
+    "gray": 21.96,
+    "screenshot": 20.26,
+    "total": 19.49
+   },
+   "fails": 1
+  },
+  {
+   "id": "packjpg",
+   "label": "packJPG",
+   "saved": {
+    "kodak_q50": 23.32,
+    "kodak_q75": 18.48,
+    "kodak_q90_444": 18.53,
+    "kodak_q95_prog": 12.02,
+    "camera": 21.05,
+    "progressive": 15.57,
+    "gray": 21.07,
+    "screenshot": 22.46,
+    "total": 19.33
+   },
+   "fails": 0
+  },
+  {
+   "id": "paq8px",
+   "label": "paq8px",
+   "saved": {
+    "kodak_q50": 27.93,
+    "kodak_q75": 23.21,
+    "kodak_q90_444": 24.41,
+    "kodak_q95_prog": 0.94,
+    "camera": 27.43,
+    "progressive": 2.72,
+    "gray": 27.94,
+    "screenshot": 26.62,
+    "total": 19.97
+   },
+   "fails": 0
+  },
+  {
+   "id": "komla",
+   "label": "Komla",
+   "saved": {
+    "kodak_q50": 26.97,
+    "kodak_q75": 22.31,
+    "kodak_q90_444": 22.98,
+    "kodak_q95_prog": 15.45,
+    "camera": 25.77,
+    "progressive": 20.52,
+    "gray": 26.33,
+    "screenshot": 27.73,
+    "total": 24.11
+   },
+   "fails": 0,
+   "komla": true
+  }
+ ]
+}
