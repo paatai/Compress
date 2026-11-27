@@ -856,6 +856,9 @@ fn decompress_fast(c: FastContainer, threads: usize) -> Result<Vec<u8>, String> 
     if !f.progressive && l.scans.len() == 1 && l.scans[0].comps.len() == f.comps.len() {
         return decompress_stream(&c, &l, &geom, &rows, sides.pop().unwrap(), threads);
     }
+    if f.progressive {
+        return decompress_prog(&c, &l, &geom, &rows, sides, threads);
+    }
     let mut coefs: Vec<Vec<i16>> = f.comps.iter().map(|comp| vec![0i16; comp.pw * comp.ph * 64]).collect();
     {
         let parts = split_rows(f, &rows, &mut coefs);
@@ -1016,6 +1019,78 @@ fn decompress_stream(c: &FastContainer, l: &Layout, geom: &StripeGeom, rows: &[(
         return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
     }
     out.extend_from_slice(&c.blob[s.blob_pos..]);
+    finish_fast(c, out, threads)
+}
+
+/// Feeds the coefficients of every stripe, in order, to `emit`: decoded into per-stripe buffers
+/// by up to `threads` threads, a bounded number ahead of the consumer.
+fn for_each_stripe(f: &Frame, c: &FastContainer, geom: &StripeGeom, rows: &[(usize, usize)], threads: usize, mut emit: impl FnMut(usize, &Vec<Vec<i16>>) -> Result<(), String>) -> Result<(), String> {
+    let alloc = |k: usize| -> Vec<Vec<i16>> {
+        let (my0, my1) = rows[k];
+        f.comps.iter().map(|comp| vec![0i16; (my1 - my0) * comp.v * comp.pw * 64]).collect()
+    };
+    let decode = |k: usize, bufs: &mut Vec<Vec<i16>>| -> Result<(), String> {
+        let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
+        geom.decode(rows[k], c.stripes[k].0, c.stripes[k].1, &mut planes)
+    };
+    if threads > 1 && rows.len() > 1 {
+        return pipeline(
+            rows.len(),
+            threads,
+            threads + 2,
+            |k| {
+                let mut b = alloc(k);
+                decode(k, &mut b)?;
+                Ok(b)
+            },
+            |k, b| emit(k, &b),
+        );
+    }
+    let mut b = alloc(0);
+    for k in 0..rows.len() {
+        if k > 0 {
+            let (my0, my1) = rows[k];
+            for (buf, comp) in b.iter_mut().zip(&f.comps) {
+                buf.clear();
+                buf.resize((my1 - my0) * comp.v * comp.pw * 64, 0);
+            }
+        }
+        decode(k, &mut b)?;
+        emit(k, &b)?;
+    }
+    Ok(())
+}
+
+/// Decompresses a progressive file stripe by stripe: every scan has its own encoder, fed each
+/// stripe in turn, and the scans are joined at the end.
+fn decompress_prog(c: &FastContainer, l: &Layout, geom: &StripeGeom, rows: &[(usize, usize)], sides: Vec<huff::Side>, threads: usize) -> Result<Vec<u8>, String> {
+    let f = &l.frame;
+    let mut chs: Vec<huff::Choices> = sides.into_iter().map(huff::Choices::replay).collect();
+    let mut encs: Vec<huff::ProgScan> = l.scans.iter().zip(chs.iter_mut()).map(|(s, ch)| huff::ProgScan::new(s, f, ch, Vec::with_capacity(s.blob_pos.min(4096) + c.len / (l.scans.len() * 2) + 64))).collect();
+    let last = rows.len() - 1;
+    for_each_stripe(f, c, geom, rows, threads, |k, bufs| {
+        let (my0, my1) = rows[k];
+        let at = |ci: usize, bx: usize, by: usize| -> &[i16; 64] {
+            let comp = &f.comps[ci];
+            bufs[ci][((by - my0 * comp.v) * comp.pw + bx) * 64..][..64].try_into().unwrap()
+        };
+        for (e, s) in encs.iter_mut().zip(&l.scans) {
+            e.rows(f, s, my0, my1, k == last, at)?;
+        }
+        Ok(())
+    })?;
+    let mut out = Vec::with_capacity(c.len + 64);
+    let mut bpos = 0;
+    for (e, s) in encs.into_iter().zip(&l.scans) {
+        out.extend_from_slice(&c.blob[bpos..s.blob_pos]);
+        bpos = s.blob_pos;
+        let data = e.finish(s)?;
+        out.extend_from_slice(&data);
+        if out.len() > c.len {
+            return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
+        }
+    }
+    out.extend_from_slice(&c.blob[bpos..]);
     finish_fast(c, out, threads)
 }
 

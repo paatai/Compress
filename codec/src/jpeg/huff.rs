@@ -512,120 +512,206 @@ impl<'a, 'c> SeqScan<'a, 'c> {
     }
 }
 
+/// Incremental encoder of a progressive scan, fed the coefficients of consecutive MCU rows.
+/// It writes into its own buffer (`finish` returns it), so all scans of a file can be fed
+/// stripe by stripe.
+pub struct ProgScan<'a, 'c> {
+    out: Vec<u8>,
+    c: u64,
+    n: u32,
+    dcs: Vec<Option<Codes>>,
+    acs: Vec<Option<Codes>>,
+    /// interleaved DC scan: (scan component, component, h, v) of every block of an MCU
+    units: Vec<(usize, usize, usize, usize)>,
+    pred: [i32; 4],
+    rst: usize,
+    /// MCUs (interleaved) or blocks encoded so far
+    m: usize,
+    st: Prog,
+    br: Vec<u8>,
+    /// AC scan: the last block fed so far, waiting for the next one (its successor decides
+    /// whether an end-of-band run may continue)
+    pending: Option<Box<[i16; 64]>>,
+    ch: &'a mut Choices<'c>,
+}
+
+impl<'a, 'c> ProgScan<'a, 'c> {
+    pub fn new(s: &Scan, f: &Frame, ch: &'a mut Choices<'c>, out: Vec<u8>) -> Self {
+        let mut units = Vec::new();
+        if s.comps.len() > 1 {
+            for (j, &ci) in s.comps.iter().enumerate() {
+                let c = &f.comps[ci];
+                for v in 0..c.v {
+                    for h in 0..c.h {
+                        units.push((j, ci, h, v));
+                    }
+                }
+            }
+        }
+        ProgScan {
+            out,
+            c: 0,
+            n: 0,
+            dcs: s.dc.iter().map(|h| h.as_ref().map(Codes::new)).collect(),
+            acs: s.ac.iter().map(|h| h.as_ref().map(Codes::new)).collect(),
+            units,
+            pred: [0; 4],
+            rst: 0,
+            m: 0,
+            st: Prog { eobrun: 0, be: Vec::new() },
+            br: Vec::new(),
+            pending: None,
+            ch,
+        }
+    }
+
+    fn restart(&mut self, w: &mut Bw, s: &Scan, m: usize) -> Result<(), String> {
+        if s.ri > 0 && m > 0 && m % s.ri == 0 {
+            if s.ss > 0 {
+                w.room(512 + self.st.be.len() / 2);
+                emit_eobrun(w, self.acs[0].as_ref().ok_or("missing Huffman table")?, &mut self.st)?;
+            }
+            let n = w.pad_len();
+            let p = self.ch.pad(n);
+            w.flush(p);
+            w.out.push(0xFF);
+            w.out.push(0xD0 + (self.rst % 8) as u8);
+            self.rst += 1;
+            self.pred = [0; 4];
+        }
+        Ok(())
+    }
+
+    /// AC scan: block `m` with its successor `next` (None at the end of the scan).
+    fn ac_block(&mut self, w: &mut Bw, s: &Scan, count: usize, m: usize, blk: &[i16; 64], next: Option<&[i16; 64]>) -> Result<(), String> {
+        self.restart(w, s, m)?;
+        let interval_end = if s.ri > 0 { (m / s.ri + 1) * s.ri } else { count }.min(count);
+        let free = m + 1 < interval_end && next.is_some_and(|b| pure(b, s));
+        let ac = self.acs[0].as_ref().ok_or("missing Huffman table")?;
+        if s.ah == 0 {
+            encode_ac_first(w, s, ac, blk, &mut self.st, free, self.ch)?;
+        } else {
+            encode_ac_refine(w, s, ac, blk, &mut self.st, free, self.ch, &mut self.br)?;
+        }
+        self.m = m + 1;
+        Ok(())
+    }
+
+    /// Encodes what the scan codes in frame MCU rows `my0..my1` (`last`: these are the last
+    /// rows); `blk(c, bx, by)` returns a block of component c (absolute block coordinates).
+    pub fn rows<'b>(&mut self, f: &Frame, s: &Scan, my0: usize, my1: usize, last: bool, blk: impl Fn(usize, usize, usize) -> &'b [i16; 64]) -> Result<(), String> {
+        let mut out = std::mem::take(&mut self.out);
+        let mut w = Bw { out: &mut out, c: self.c, n: self.n };
+        let res = self.rows_into(&mut w, f, s, my0, my1, last, blk);
+        self.c = w.c;
+        self.n = w.n;
+        self.out = out;
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rows_into<'b>(&mut self, w: &mut Bw, f: &Frame, s: &Scan, my0: usize, my1: usize, last: bool, blk: impl Fn(usize, usize, usize) -> &'b [i16; 64]) -> Result<(), String> {
+        if !self.units.is_empty() {
+            for my in my0..my1 {
+                for mx in 0..f.mcux {
+                    self.restart(w, s, self.m)?;
+                    for k in 0..self.units.len() {
+                        let (j, ci, h, v) = self.units[k];
+                        let c = &f.comps[ci];
+                        let b = blk(ci, mx * c.h + h, my * c.v + v);
+                        w.room(64);
+                        if s.ah == 0 {
+                            encode_dc(w, self.dcs[j].as_ref().ok_or("missing Huffman table")?, (b[0] as i32) >> s.al, &mut self.pred[j])?;
+                        } else {
+                            w.put(((b[0] as i32) >> s.al) as u32 & 1, 1);
+                        }
+                    }
+                    self.m += 1;
+                }
+            }
+            return Ok(());
+        }
+        let ci = s.comps[0];
+        let c = &f.comps[ci];
+        let (r0, r1) = ((my0 * c.v).min(c.bh), (my1 * c.v).min(c.bh));
+        if s.ss == 0 {
+            for by in r0..r1 {
+                for bx in 0..c.bw {
+                    self.restart(w, s, self.m)?;
+                    let b = blk(ci, bx, by);
+                    w.room(64);
+                    if s.ah == 0 {
+                        encode_dc(w, self.dcs[0].as_ref().ok_or("missing Huffman table")?, (b[0] as i32) >> s.al, &mut self.pred[0])?;
+                    } else {
+                        w.put(((b[0] as i32) >> s.al) as u32 & 1, 1);
+                    }
+                    self.m += 1;
+                }
+            }
+            return Ok(());
+        }
+        let (bw, count) = (c.bw, c.bw * c.bh);
+        let (m0, m1) = (r0 * bw, r1 * bw);
+        let at = |m: usize| blk(ci, m % bw, m / bw);
+        if let Some(p) = self.pending.take() {
+            if m0 < m1 {
+                self.ac_block(w, s, count, self.m, &p, Some(at(m0)))?;
+            } else if last {
+                self.ac_block(w, s, count, self.m, &p, None)?;
+            } else {
+                self.pending = Some(p);
+                return Ok(());
+            }
+        }
+        for m in m0..m1 {
+            if m + 1 < m1 {
+                self.ac_block(w, s, count, m, at(m), Some(at(m + 1)))?;
+            } else if last {
+                self.ac_block(w, s, count, m, at(m), None)?;
+            } else {
+                self.pending = Some(Box::new(*at(m)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends the scan and returns its bytes.
+    pub fn finish(mut self, s: &Scan) -> Result<Vec<u8>, String> {
+        let mut out = std::mem::take(&mut self.out);
+        let mut w = Bw { out: &mut out, c: self.c, n: self.n };
+        if s.ss > 0 {
+            if let Some(p) = self.pending.take() {
+                let count = usize::MAX;
+                self.ac_block(&mut w, s, count, self.m, &p, None)?;
+            }
+            w.room(512 + self.st.be.len() / 2);
+            emit_eobrun(&mut w, self.acs[0].as_ref().ok_or("missing Huffman table")?, &mut self.st)?;
+        }
+        let n = w.pad_len();
+        let p = self.ch.pad(n);
+        w.flush(p);
+        w.out.extend_from_slice(&self.ch.side.garbage);
+        Ok(out)
+    }
+}
+
 /// Regenerates the entropy-coded bytes of one scan and appends them to `out`. `coefs[c]`: the
 /// coefficients of component c (`pw * ph` blocks of 64, natural order).
 pub fn encode_scan(f: &Frame, s: &Scan, coefs: &[&[i16]], ch: &mut Choices, out: &mut Vec<u8>) -> Result<(), String> {
+    let blk = |ci: usize, bx: usize, by: usize| -> &[i16; 64] { coefs[ci][(by * f.comps[ci].pw + bx) * 64..][..64].try_into().unwrap() };
     if !f.progressive {
-        let blk = |ci: usize, bx: usize, by: usize| -> &[i16; 64] { coefs[ci][(by * f.comps[ci].pw + bx) * 64..][..64].try_into().unwrap() };
         let mut enc = SeqScan::new(s, f, ch, out)?;
         enc.rows(f, s, 0, f.mcuy, blk)?;
         enc.finish();
         return Ok(());
     }
-    let mut w = Bw::new(out);
-    let dcs: Vec<Option<Codes>> = s.dc.iter().map(|h| h.as_ref().map(Codes::new)).collect();
-    let acs: Vec<Option<Codes>> = s.ac.iter().map(|h| h.as_ref().map(Codes::new)).collect();
-    let mut pred = [0i32; 4];
-    let mut st = Prog { eobrun: 0, be: Vec::new() };
-    let mut br = Vec::new();
-    let blk_at = |ci: usize, bx: usize, by: usize| -> &[i16; 64] {
-        let pw = f.comps[ci].pw;
-        coefs[ci][(by * pw + bx) * 64..][..64].try_into().unwrap()
-    };
-    if s.comps.len() > 1 {
-        let mut units: Vec<(usize, usize, usize, usize)> = Vec::new();
-        for (j, &ci) in s.comps.iter().enumerate() {
-            let c = &f.comps[ci];
-            for v in 0..c.v {
-                for h in 0..c.h {
-                    units.push((j, ci, h, v));
-                }
-            }
+    let mut enc = ProgScan::new(s, f, ch, std::mem::take(out));
+    let res = enc.rows(f, s, 0, f.mcuy, true, blk);
+    match res.and_then(|_| enc.finish(s)) {
+        Ok(v) => {
+            *out = v;
+            Ok(())
         }
-        let count = f.mcux * f.mcuy;
-        let mut rst = 0usize;
-        for m in 0..count {
-            if s.ri > 0 && m > 0 && m % s.ri == 0 {
-                let n = w.pad_len();
-                let p = ch.pad(n);
-                w.flush(p);
-                w.out.push(0xFF);
-                w.out.push(0xD0 + (rst % 8) as u8);
-                rst += 1;
-                pred = [0; 4];
-            }
-            let (mx, my) = (m % f.mcux, m / f.mcux);
-            for &(j, ci, h, v) in &units {
-                let c = &f.comps[ci];
-                let blk = blk_at(ci, mx * c.h + h, my * c.v + v);
-                if !f.progressive {
-                    encode_seq(&mut w, dcs[j].as_ref().unwrap(), acs[j].as_ref().unwrap(), blk, &mut pred[j])?;
-                } else if s.ah == 0 {
-                    w.room(64);
-                    encode_dc(&mut w, dcs[j].as_ref().unwrap(), (blk[0] as i32) >> s.al, &mut pred[j])?;
-                } else {
-                    w.room(64);
-                    w.put(((blk[0] as i32) >> s.al) as u32 & 1, 1);
-                }
-            }
-        }
-    } else {
-        let ci = s.comps[0];
-        let c = &f.comps[ci];
-        let (bw, bh) = (c.bw, c.bh);
-        let count = bw * bh;
-        let ac_scan = f.progressive && s.ss > 0;
-        let mut rst = 0usize;
-        let mut next_pure = ac_scan && count > 0 && pure(blk_at(ci, 0, 0), s);
-        for m in 0..count {
-            if s.ri > 0 && m > 0 && m % s.ri == 0 {
-                if ac_scan {
-                    w.room(512 + st.be.len() / 2);
-                    emit_eobrun(&mut w, acs[0].as_ref().unwrap(), &mut st)?;
-                }
-                let n = w.pad_len();
-                let p = ch.pad(n);
-                w.flush(p);
-                w.out.push(0xFF);
-                w.out.push(0xD0 + (rst % 8) as u8);
-                rst += 1;
-                pred = [0; 4];
-            }
-            let blk = blk_at(ci, m % bw, m / bw);
-            if !f.progressive {
-                encode_seq(&mut w, dcs[0].as_ref().unwrap(), acs[0].as_ref().unwrap(), blk, &mut pred[0])?;
-            } else if !ac_scan {
-                w.room(64);
-                if s.ah == 0 {
-                    encode_dc(&mut w, dcs[0].as_ref().unwrap(), (blk[0] as i32) >> s.al, &mut pred[0])?;
-                } else {
-                    w.put(((blk[0] as i32) >> s.al) as u32 & 1, 1);
-                }
-            } else {
-                let interval_end = if s.ri > 0 { (m / s.ri + 1) * s.ri } else { count }.min(count);
-                let free = if m + 1 < count {
-                    next_pure = pure(blk_at(ci, (m + 1) % bw, (m + 1) / bw), s);
-                    m + 1 < interval_end && next_pure
-                } else {
-                    false
-                };
-                let _ = next_pure;
-                let ac = acs[0].as_ref().unwrap();
-                if s.ah == 0 {
-                    encode_ac_first(&mut w, s, ac, blk, &mut st, free, ch)?;
-                } else {
-                    encode_ac_refine(&mut w, s, ac, blk, &mut st, free, ch, &mut br)?;
-                }
-            }
-        }
-        if ac_scan {
-            w.room(512 + st.be.len() / 2);
-            emit_eobrun(&mut w, acs[0].as_ref().unwrap(), &mut st)?;
-        }
+        Err(e) => Err(e),
     }
-    let n = w.pad_len();
-    let p = ch.pad(n);
-    w.flush(p);
-    w.out.extend_from_slice(&ch.side.garbage);
-    Ok(())
 }

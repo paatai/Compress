@@ -121,6 +121,7 @@ fn training() -> bool {
 }
 
 /// Distributions with their update counts.
+#[derive(Clone)]
 pub struct Table {
     cdf: Vec<Cdf>,
     cnt: Vec<u8>,
@@ -172,6 +173,7 @@ fn adapt_bit(p: Bit, b: u32) -> Bit {
 }
 
 /// Binary probabilities.
+#[derive(Clone)]
 pub struct Bits {
     p: Vec<Bit>,
     /// counts of zeros and ones per probability (training only)
@@ -744,6 +746,7 @@ fn pbucket(p: i32) -> usize {
 static PRIORS: &[u8] = include_bytes!("fast_priors.bin");
 
 /// Adaptive distributions of one stripe.
+#[derive(Clone)]
 pub struct Model {
     nz_hi: Table,
     nz_lo: Table,
@@ -766,7 +769,16 @@ impl Default for Model {
 static ZERO_BLOCK: [i16; 64] = [0; 64];
 
 impl Model {
+    /// A model with the learned initial distributions (flat ones while training).
     pub fn new() -> Model {
+        static TEMPLATE: std::sync::OnceLock<Model> = std::sync::OnceLock::new();
+        if training() {
+            return Model::build();
+        }
+        TEMPLATE.get_or_init(Model::build).clone()
+    }
+
+    fn build() -> Model {
         let geo: Vec<u32> = (0..NTOK as u32).map(|t| 1 << (14 - t)).collect();
         let flat8 = Cdf::new(8, &[8; 8]);
         let mut m = Model {
