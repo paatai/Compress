@@ -80,7 +80,7 @@ def job(args):
                 ok = hashlib.sha256(open(os.path.join(td, "dec.jpg"), "rb").read()).digest() == hashlib.sha256(open(img, "rb").read()).digest()
                 res.update(bytes=out, enc_s=round(enc_s, 3), dec_s=round(dec_s, 3), ok=ok)
             except Exception as e:
-                res.update(bytes=None, enc_s=0, dec_s=0, ok=False, error=str(e)[:200])
+                res.update(bytes=None, enc_s=0, dec_s=0, ok=False, error=str(e).replace(ROOT + os.sep, "")[:200])
             return res
     finally:
         if sem:
