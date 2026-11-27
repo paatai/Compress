@@ -503,6 +503,11 @@ impl<'a, 'c> SeqScan<'a, 'c> {
         Ok(())
     }
 
+    /// Bytes in the output so far.
+    pub fn len(&self) -> usize {
+        self.w.out.len()
+    }
+
     /// Final padding and the bytes after it.
     pub fn finish(mut self) {
         let n = self.w.pad_len();
@@ -673,6 +678,11 @@ impl<'a, 'c> ProgScan<'a, 'c> {
             }
         }
         Ok(())
+    }
+
+    /// Bytes written so far.
+    pub fn len(&self) -> usize {
+        self.out.len()
     }
 
     /// Ends the scan and returns its bytes.

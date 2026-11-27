@@ -134,3 +134,82 @@ fn synthetic_and_multi_stripe() {
     assert!(jpeg::stripe_rows(&l.frame).len() > 1);
     roundtrip(&big, jpeg::MODE_JPEG);
 }
+
+/// Fast mode: compresses with 1 and 4 threads (the output must not depend on the thread count),
+/// decompresses with both and requires the exact original bytes.
+fn roundtrip_fast(data: &[u8], expect_mode: u8) -> Vec<u8> {
+    let (packed, info) = jpeg::compress_fast(data, 1);
+    assert_eq!(info.mode, expect_mode, "unexpected mode ({})", info.note);
+    let (packed4, _) = jpeg::compress_fast(data, 4);
+    assert!(packed == packed4, "output depends on the number of threads");
+    for threads in [1, 4] {
+        let back = jpeg::decompress_with(&packed, threads).expect("decompress");
+        assert!(back == data, "restored file differs from the original");
+    }
+    packed
+}
+
+#[test]
+fn fast_fixtures_restore_byte_for_byte() {
+    for name in ["tiny_420.jpg", "tiny_progressive_444.jpg", "tiny_gray_restart.jpg", "tiny_meta.jpg"] {
+        let data = fixture(name);
+        let packed = roundtrip_fast(&data, jpeg::MODE_FAST);
+        assert!(packed.len() < data.len(), "{name}: {} -> {}", data.len(), packed.len());
+    }
+}
+
+#[test]
+fn fast_jpeg_after_the_end_of_image() {
+    let mut data = fixture("tiny_420.jpg");
+    data.extend_from_slice(&fixture("tiny_progressive_444.jpg"));
+    roundtrip_fast(&data, jpeg::MODE_FAST);
+    let mut data = fixture("tiny_meta.jpg");
+    data.extend_from_slice(b"some bytes after the image");
+    roundtrip_fast(&data, jpeg::MODE_FAST);
+}
+
+#[test]
+fn fast_unsupported_or_damaged_input_is_stored() {
+    let data = fixture("tiny_420.jpg");
+    roundtrip_fast(&data[..data.len() * 2 / 3], jpeg::MODE_BYTES);
+    roundtrip_fast(&[0xFF, 0xD8, 0xFF, 0xE0], jpeg::MODE_RAW);
+    let mut s = 7u32;
+    let noise: Vec<u8> = [0xFF, 0xD8, 0xFF].into_iter().chain((0..5000).map(|_| {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (s >> 24) as u8
+    }))
+    .collect();
+    roundtrip_fast(&noise, jpeg::MODE_RAW);
+}
+
+#[test]
+fn fast_damaged_container_never_restores_wrong_bytes() {
+    for name in ["tiny_progressive_444.jpg", "tiny_420.jpg"] {
+        let data = fixture(name);
+        let (packed, _) = jpeg::compress_fast(&data, 1);
+        let mut detected = 0;
+        for pos in 0..packed.len() {
+            for bit in [0x01, 0x10, 0x80] {
+                let mut bad = packed.clone();
+                bad[pos] ^= bit;
+                match jpeg::decompress_with(&bad, 1) {
+                    Ok(back) => assert!(back == data, "{name}: flipped byte {pos} gave a different file without an error"),
+                    Err(_) => detected += 1,
+                }
+            }
+        }
+        assert!(detected >= 3 * packed.len() - 48, "{name}: only {detected} of {} damaged files were rejected", 3 * packed.len());
+        for cut in [1, 3, packed.len() / 2] {
+            assert!(jpeg::decompress_with(&packed[..packed.len() - cut], 1).is_err());
+        }
+    }
+}
+
+#[test]
+fn fast_synthetic_and_multi_stripe() {
+    roundtrip_fast(&synthetic_jpeg(100, 61, 3), jpeg::MODE_FAST);
+    let big = synthetic_jpeg(4096, 2400, 9);
+    let l = format::parse(&big, true).unwrap();
+    assert!(jpeg::fast_stripes(&l.frame).len() > 4);
+    roundtrip_fast(&big, jpeg::MODE_FAST);
+}
