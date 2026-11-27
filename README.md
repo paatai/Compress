@@ -85,12 +85,14 @@ in the browser on 8 cores (measured in headless Chrome while other jobs were run
 
 ### Web app
 
-Drop PNG or BMP files on the page. Each file is compressed, then the `.komla` file is decoded
-again in the browser and its pixels are compared with the original by SHA-256 before it is
-offered as verified. The page also shows the size of the original file, ZIP -9 of the same
-pixels, and (one click) lossless WebP and JPEG XL computed in your browser with WebAssembly
-builds of libwebp and libjxl. Drop a `.komla` file to get a PNG with the exact original pixels;
-"Check against original…" compares it with the file you started from.
+Drop PNG, BMP or JPEG files on the page. Each file is compressed, then the `.komla` file is
+decoded again in the browser and compared with the original by SHA-256 (the pixels of a PNG or
+BMP, the whole file of a JPEG) before it is offered as verified. For PNG and BMP the page also
+shows the size of the original file, ZIP -9 of the same pixels, and (one click) lossless WebP
+and JPEG XL computed in your browser with WebAssembly builds of libwebp and libjxl; for a JPEG
+it shows how much smaller the `.komla` file is. Drop a `.komla` file to restore the original:
+a JPEG comes back as the identical JPG file, a PNG or BMP as a PNG with the exact original
+pixels. "Check against original…" compares the result with the file you started from.
 
 Run locally:
 
@@ -116,16 +118,33 @@ komla decompress scan.komla -o scan.png
 komla info photo.png.komla        # mode, stripes, checksum, bits per pixel
 komla bench *.png                 # compress, decompress and verify, with timings
 komla pixhash a.png b.png         # SHA-256 of the pixels, independent of the file format
+
+komla compress photo.jpg          # writes photo.jpg.komla
+komla decompress photo.jpg.komla  # restores photo.jpg, identical to the original file
+komla bench *.jpg                 # compress, decompress, compare files by SHA-256, timings
 ```
 
-Decompression always checks the CRC-32 of the pixels stored in the file and fails loudly on any
-mismatch. The `.github/workflows/release.yml` workflow builds macOS (Apple Silicon and Intel) and
+Decompression always checks the CRC-32 stored in the file (of the pixels for PNG/BMP, of the
+whole original file for JPEG) and fails loudly on any mismatch. The `.github/workflows/release.yml` workflow builds macOS (Apple Silicon and Intel) and
 Linux binaries when a `v*` tag is pushed.
 
-**What is preserved:** the exact pixel values (8/16-bit gray, gray+alpha, RGB, RGBA; palette
-and low-bit-depth PNGs are restored as 8-bit gray/RGB/RGBA with identical colours, including
-the RGB values under fully transparent pixels). Not preserved: PNG metadata chunks (text, ICC
-profile, gamma), animation frames after the first, and the original PNG/BMP byte stream.
+**What is preserved:** for PNG and BMP, the exact pixel values (8/16-bit gray, gray+alpha,
+RGB, RGBA; palette and low-bit-depth PNGs are restored as 8-bit gray/RGB/RGBA with identical
+colours, including the RGB values under fully transparent pixels). Not preserved: PNG metadata
+chunks (text, ICC profile, gamma), animation frames after the first, and the original PNG/BMP
+byte stream. For JPEG, everything: the restored file is the original file, byte for byte.
+
+## Formats
+
+| Input | What `.komla` stores | Restores |
+|---|---|---|
+| PNG (all colour types, 1–16 bit, interlaced), BMP (1/4/8/24/32-bit, uncompressed) | the pixels, coded by the image model | the exact pixels, as PNG (or BMP) |
+| JPEG: baseline and extended sequential, progressive (spectral selection and successive approximation), Huffman coded, 8-bit, 1–4 components, any sampling factors, restart markers | the quantized DCT coefficients, coded by the JPEG model, plus everything needed to rebuild the file: all marker segments verbatim (EXIF, ICC, XMP, comments, tables), padding bits, bytes after the end of the image, how end-of-band runs were split | the original file, byte for byte |
+| Any other JPEG (arithmetic coded, lossless or hierarchical, 12-bit, truncated or damaged) | the file itself, coded with a general-purpose byte model | the original file, byte for byte |
+
+A JPEG is only recompressed after Komla has regenerated every scan from the decoded
+coefficients and found it identical to the input; otherwise it is stored. Either way the
+`.komla` file records the length and CRC-32 of the original file, which decompression checks.
 
 ## How it works
 
@@ -205,7 +224,82 @@ slower, is still 4.8% smaller on 768×512 crops of the development photos and 34
 development screenshots and graphics. Komla trades that last bit of compression for being
 practical in a browser.
 
+### Lossless JPEG recompression
+
+1. **Exact re-encoding.** The file is split into its marker segments, which are kept as they
+   are, and the entropy-coded scans, which are Huffman-decoded into the quantized DCT
+   coefficients: baseline and extended sequential scans, and progressive DC/AC first and
+   refinement scans with end-of-band runs, all with restart markers. Everything the
+   coefficients do not determine is recorded as side information: the padding bits before
+   each restart marker and at the end of each scan, bytes between scan data and the next
+   marker, and, in progressive scans, where each end-of-band run was cut wherever the encoder
+   had a choice (coded against libjpeg's rule, so it costs nothing for libjpeg files). An
+   encoder that follows libjpeg's rules regenerates every scan from the coefficients and the
+   side information; Komla only keeps the recompressed form if that reproduces the input byte
+   for byte, and stores the file otherwise.
+2. **Coding order.** Luma is coded before chroma, blocks in raster order. Inside a block: the
+   number of nonzero coefficients among the 49 with u, v ≥ 1, those coefficients in zigzag
+   order, then the first row and the first column (each with its own nonzero count), and DC
+   last, the order Lepton uses: the first row/column and DC are best predicted once the rest of
+   the block is known.
+3. **Predictions.**
+   - Every 7×7 coefficient gets a signed prediction from an online least-squares fit per
+     position (exponential forgetting, refitted every 32 updates) whose inputs are the same
+     column of the block above, the same row of the block to the left, the two corner blocks
+     and the coefficients of this block already coded in the same row, column and diagonals.
+     This alone saved 0.6–0.8 points.
+   - Every first-row/first-column coefficient: a least-squares fit from the neighbour's
+     column/row and this block's coefficients in that column/row (it learns the boundary
+     continuity that Lepton hard-codes, per image), blended with the classic continuity
+     predictions with and without gradient extrapolation and with the same coefficient in the
+     neighbouring blocks, weighted by inverse squared recent error.
+   - DC: from the boundary pixels of the blocks above and to the left given this block's AC
+     (with and without gradient), the median of the neighbours' DC, and a least-squares
+     combination of these.
+   - Chroma: the co-located luma pixels are downsampled to the chroma resolution and
+     transformed; each chroma coefficient is predicted from that with a scale fitted on
+     neighbouring blocks, and Cr also from Cb.
+4. **Context mixing.** Values are coded as zero?, exponent in unary, mantissa bits and sign.
+   Each binary decision is predicted by 16 context models (neighbour values and magnitudes,
+   nonzero coefficients still to come, prediction buckets, block activity, ...), by a context
+   that places the prediction relative to the threshold the decision tests, and by the
+   probabilities a logistic and a Laplace distribution centred on the prediction give the
+   decision (scale from the tracked prediction error). Four gated logistic mixers, a second
+   mixing layer and three APMs give the final probability. Nonzero counts have their own
+   model, which also sees how many coefficients the least-squares fits expect to be nonzero.
+5. **Stripes.** JPEGs above about 131 000 blocks (about 5.6 megapixels at 4:2:0) are split
+   into bands of MCU rows that are coded independently, on several threads or browser workers.
+6. **Everything else** (marker segments such as EXIF, ICC and XMP, bytes after the end of the
+   image, and JPEGs that are stored) goes through a general-purpose byte coder: orders 0–6 and a
+   word context, a match model, mixing and APMs.
+7. **Determinism.** Integer arithmetic, except the least-squares fits, which use IEEE-754 basic
+   operations in a fixed order like the image model; native and WebAssembly output are
+   identical (checked in CI on x86-64 Linux and ARM macOS).
+
+What helped, measured on the development sets while building it (Kodak re-encodes / a third
+of the Commons photos; points of saving):
+
+| Change | Effect |
+|---|---|
+| Edge and DC predictors blended by recent error; decision context relative to the prediction | +0.1 |
+| Chroma predicted from luma (and Cr from Cb) | +0.27 |
+| Neighbour activity and nonzero-tail contexts; faster mixer learning at the start | +0.12 |
+| Logistic probability of each decision around the prediction, and a mixer selected by it | +0.33 |
+| Least-squares prediction of the 7×7 coefficients | +0.57 / +0.75 |
+| Least-squares prediction of the first row and column, used as centre of the distribution | +0.18 / +0.29 |
+| Least-squares DC combination, third APM, Laplace probability input, count contexts from the fits | +0.2 / +0.1 |
+| Context tables capped at 2^16 blocks (about 60 MB per stripe model instead of 115 MB) | −0.01 |
+
+Tried and dropped: coding first-row/column coefficients as residuals from their prediction
+instead of using the prediction as context (−1.2 / −1.6), bit-history counters (no gain, 50%
+slower), linear-domain mixer inputs (−1.5), seeding new contexts with the position's overall
+statistics (−0.2), coding all nonzero counts first so that blocks can see the counts of the
+blocks to the right and below (0), phase-continuity sign contexts (0), least-squares inputs
+from blocks two steps away (0).
+
 ## Reproducing the benchmark
+
+Lossless image compression (PNG/BMP):
 
 ```bash
 bench/install-baselines.sh          # downloads/builds the exact baseline encoders into bench/.tools
@@ -217,9 +311,30 @@ python3 bench/make_report.py        # writes bench/results/REPORT.md and the sit
 ```
 
 `run_benchmark.py` caches results in `bench/results/<set>.jsonl`; `--force komla` re-runs one
-codec. Tests: `cargo test --release` (round trips, corrupt input), `node tests/cross_target.mjs`
-(native and WebAssembly give identical files), `python3 tests/make_edge_cases.py` (1×1 images,
-16-bit, palettes with transparency, interlaced PNG, BMP variants).
+codec.
+
+JPEG recompression:
+
+```bash
+bench/install-baselines.sh          # cjxl/djxl (libjxl 0.13.0)
+bench/install-jpeg-baselines.sh     # libjpeg-turbo 3.2.1, Lepton (C++ and Rust), packJPG, paq8px, brunsli
+python3 bench/fetch_jpeg_datasets.py   # encodes the Kodak sets, downloads the Commons files, checks hashes
+cargo build --release -p komla-cli
+python3 bench/run_jpeg_benchmark.py --set test   # every tool, every file, byte-exact checks
+python3 bench/run_jpeg_benchmark.py --set dev
+python3 bench/make_jpeg_report.py   # writes bench/results/JPEG_REPORT.md and the site's table
+```
+
+`bench/select_jpegs.py` is the script that chose the Commons files (it queries Wikimedia
+Commons; its output is `bench/datasets/jpeg_commons.json`). paq8px is slow (about 0.01 MB/s
+per file on large photos); `PAQ8PX_JOBS` sets how many copies run at once (2.5 GB each).
+
+Tests: `cargo test --release` (round trips, corrupt input, JPEG fixtures, stored fallback,
+every single-byte corruption of a `.komla` JPEG file), `node tests/cross_target.mjs` (native and
+WebAssembly give identical files, for images and JPEGs), `python3 tests/make_edge_cases.py`
+(1×1 images, 16-bit, palettes with transparency, interlaced PNG, BMP variants, JPEG variants
+including progressive with restart markers, EXIF/ICC/comments, trailing data and a truncated
+file), `node web/e2e/jpeg.mjs` (browser round trip of JPEG files).
 
 ## Putting the web app online
 
@@ -237,11 +352,12 @@ headers (it does not use SharedArrayBuffer); parallelism comes from one Web Work
 ## Repository layout
 
 ```
-codec/   the codec library (Rust): models, range coder, container, PNG/BMP I/O
+codec/   the codec library (Rust): models, range coder, container, PNG/BMP I/O;
+         codec/src/jpeg: JPEG parsing and bit-exact re-encoding, coefficient model, container
 cli/     the komla command-line tool
 wasm/    C-ABI WebAssembly bindings used by the web app
 web/     Vite + React + Tailwind + shadcn/ui app (workers in web/src/workers)
-bench/   baseline installer, dataset manifests and fetcher, benchmark runner, results
+bench/   baseline installers, dataset manifests and fetchers, benchmark runners, results
 tests/   cross-target determinism test and edge-case generator
 ```
 
