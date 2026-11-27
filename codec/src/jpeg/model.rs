@@ -291,7 +291,7 @@ impl Model {
         let t = tables();
         let tu = tune();
         let total: usize = rows.iter().zip(f.comps.iter()).map(|(r, c)| (r.1 - r.0) * c.pw).sum();
-        let cap = (usize::BITS - total.max(1).leading_zeros()).clamp(12, if tu[6] > 0 { tu[6] as u32 } else { 16 });
+        let cap = (usize::BITS - total.max(1).leading_zeros()).clamp(12, 16);
         let lb = [14u32, 16, 16, 16, 16, 16, 16, 16, 20, 20, 10, 16, 16, 18, 16, 16];
         let tabs = lb.iter().map(|&b| CtxTable::with_init(b.min(cap), SLOT_BITS, tu[0] as u32, CTR_INIT | tu[9] as u32)).collect();
         let nzt = (0..5).map(|_| CtxTable::with_init(12.min(cap), 6, tu[4] as u32, CTR_INIT | tu[9] as u32)).collect();

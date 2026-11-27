@@ -7,3 +7,5 @@ web/src/wasm/komla.wasm
 *.komla
 .DS_Store
 bench/data/
+bench/.select_cache.json
+bench/results/*.partial
