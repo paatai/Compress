@@ -43,7 +43,7 @@ const DYN_B: usize = 24;
 const DYN_C: usize = 8;
 
 /// Model parameters; KOMLA_JTUNE="i=v,..." overrides them for experiments (both sides must agree).
-const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 0, 0, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 16, 1, 16, 0, 0, 0];
+const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 0, 0, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 16, 1, 16, 1, 2, 0];
 
 fn tune() -> &'static [i32; 24] {
     static T: std::sync::OnceLock<[i32; 24]> = std::sync::OnceLock::new();
@@ -256,8 +256,13 @@ pub struct Model {
     ls_on: bool,
     /// prediction for the sign decision (defaults to `pred8`)
     spred8: i32,
-    edge_err: Vec<[i32; 6]>,
-    dc_err: [[i32; 5]; 2],
+    edge_err: Vec<[i32; 7]>,
+    /// edge coefficients predicted by online least squares (per class, edge and position)
+    els: Vec<Ols>,
+    els_feats: Vec<Vec<(u8, u8)>>,
+    dc_err: [[i32; 6]; 2],
+    /// DC predicted by online least squares from the DC predictors and the neighbours' DC
+    dls: Vec<Ols>,
     gcfl: [[i64; 4]; 4],
     planes: Vec<Plane>,
     /// cost accounting (KOMLA_STATS): bits per decision class, current class base
@@ -355,8 +360,11 @@ impl Model {
             ls_err: vec![256; 2 * 49],
             ls_on: tu[19] != 0,
             spred8: 0,
-            edge_err: vec![[256; 6]; 3 * 2 * 8],
-            dc_err: [[256; 5]; 2],
+            edge_err: vec![[256; 7]; 3 * 2 * 8],
+            els: (0..2 * 2 * 8).map(|i| Ols::new(edge_ls_feats(i / 16, (i / 8) % 2, (i % 8).max(1)).len(), 1.0 - 1.0 / tu[16].max(16) as f64, tu[17] as f64, tu[18].max(1) as u32)).collect(),
+            els_feats: (0..2 * 2 * 8).map(|i| edge_ls_feats(i / 16, (i / 8) % 2, (i % 8).max(1))).collect(),
+            dc_err: [[256; 6]; 2],
+            dls: (0..2).map(|_| Ols::new(10, 1.0 - 1.0 / tu[16].max(16) as f64, tu[17] as f64, tu[18].max(1) as u32)).collect(),
             gcfl: [[0; 4]; 4],
             planes,
             stats: if std::env::var_os("KOMLA_STATS").is_some() { Some(Box::new([0.0; 16])) } else { None },
@@ -858,17 +866,41 @@ impl Model {
             let side = if edge == 0 { &l } else { &a };
             let idx = |i: usize| if edge == 0 { i } else { i * 8 };
             // predictions of all seven coefficients of this edge (1/8 quantization steps)
-            let mut pr = [[0i32; 6]; 8];
+            let mut pr = [[0i32; 7]; 8];
             let pcls = ci.min(2);
-            let avail = [has_n, has_n, has_n, has_s, !luma, has_cc];
+            let avail = [has_n, has_n, has_n, has_s, !luma, has_cc, (has_n || has_s) && self.ls_on];
             let mut bl = [(0i32, 0i32); 8];
             let mut npred = 0u32;
             let mut spred = 0u32;
             for i in 1..8 {
                 let n = idx(i);
                 let (p1, p2) = if has_n { self.edge_pred(&cur, nb, edge, i, &q) } else { (0, 0) };
-                pr[i] = [p1, p2, 8 * nb[n] as i32, 8 * side[n] as i32, pc8[n], pr8[n]];
+                let pls = if self.ls_on {
+                    let ei = (ucls * 2 + edge) * 8 + i;
+                    let mut x = [0f64; 40];
+                    for (f, &(src, idx)) in self.els_feats[ei].iter().enumerate() {
+                        let idx = idx as usize;
+                        x[f] = match src {
+                            0 => (a[idx] as i32 * q[idx]) as f64,
+                            1 => (l[idx] as i32 * q[idx]) as f64,
+                            2 => (al[idx] as i32 * q[idx]) as f64,
+                            3 => (ar[idx] as i32 * q[idx]) as f64,
+                            4 => (cur[idx] as i32 * q[idx]) as f64,
+                            5 => lc[idx] as f64,
+                            6 => cc[idx] as f64,
+                            _ => 64.0,
+                        };
+                    }
+                    let pr = self.els[ei].predict(&x) * 8.0 / q[n] as f64;
+                    if pr.is_finite() { pr.round().clamp(-1e6, 1e6) as i32 } else { 0 }
+                } else {
+                    0
+                };
+                pr[i] = [p1, p2, 8 * nb[n] as i32, 8 * side[n] as i32, pc8[n], pr8[n], pls];
                 bl[i] = blend(&pr[i], &avail, &self.edge_err[(pcls * 2 + edge) * 8 + i]);
+                if tune()[21] == 3 && self.ls_on {
+                    bl[i].0 = pls;
+                }
                 npred += (bl[i].0.unsigned_abs() >= 4) as u32;
                 spred += bl[i].0.unsigned_abs() >> 3;
             }
@@ -907,7 +939,7 @@ impl Model {
                     cur[n] = 0;
                     continue;
                 }
-                let [p1, p2, pn, ps, pc, pcc] = pr[i];
+                let [p1, p2, pn, ps, pc, pcc, _] = pr[i];
                 let px = if has_cc { pcc } else { pc };
                 let (pbl, econf) = bl[i];
                 let vn = nb[n] as i32;
@@ -938,9 +970,10 @@ impl Model {
                 }
                 self.sel = [(1 + edge) * 2 + ucls, k as usize * 2 + ucls, 48 + pb(pbl) as usize / 2];
                 self.actx = [128 + (pb(pbl) as usize) * 2 + ucls, 256 + (pb(pbl) as usize) * 4 + (conf as usize).min(3)];
-                self.pred8 = pbl;
-                self.spred8 = pbl;
-                self.pmu8 = pbl;
+                let pc_ = if tune()[21] >= 1 && self.ls_on { pr[i][6] } else if tune()[21] == 2 && self.ls_on { (pbl + pr[i][6]) / 2 } else { pbl };
+                self.pred8 = pc_;
+                self.spred8 = pc_;
+                self.pmu8 = pc_;
                 self.ps8 = (econf * tune()[13] / 64).max(2);
                 self.dyn_base = PART_EDGE * SLOTS * DYN_B * DYN_C + conf as usize;
                 self.part = 6;
@@ -963,11 +996,17 @@ impl Model {
                     d[6] += 1.0;
                 }
             }
+            if self.ls_on {
+                for i in 1..8 {
+                    let n = idx(i);
+                    self.els[(ucls * 2 + edge) * 8 + i].update((cur[n] as i32 * q[n]) as f64);
+                }
+            }
             // learn the predictors' errors and record this block's prediction errors
             let errs = &mut self.edge_err[(pcls * 2 + edge) * 8..(pcls * 2 + edge) * 8 + 8];
             for i in 1..8 {
                 let v8 = 8 * cur[idx(i)] as i32;
-                for j in 0..6 {
+                for j in 0..7 {
                     if avail[j] {
                         track(&mut errs[i][j], v8 - pr[i][j]);
                     }
@@ -979,8 +1018,8 @@ impl Model {
         // ---- 4. DC from the neighbours' boundary pixels and this block's AC
         let pix0 = self.idct(&cur, &q, false);
         let q0 = q[0];
-        let mut dp = [0i32; 5];
-        let mut dav = [false; 5];
+        let mut dp = [0i32; 6];
+        let mut dav = [false; 6];
         if has_a {
             let ba = self.planes[ci].border[bi - w];
             let (mut sg, mut s0) = (0i64, 0i64);
@@ -1022,7 +1061,30 @@ impl Model {
             };
             dav[4] = true;
         }
-        let (pdc, econf) = blend(&dp, &dav, &self.dc_err[ucls]);
+        let dmode = if self.ls_on { tune()[22] } else { 0 };
+        if dmode > 0 && (has_a || has_l) {
+            let (b0, _) = blend(&dp[..5], &dav[..5], &self.dc_err[ucls][..5]);
+            let f = |avail: bool, v: i32| if avail { v as f64 } else { b0 as f64 };
+            let x = [
+                f(dav[0], dp[0]),
+                f(dav[1], dp[1]),
+                f(dav[2], dp[2]),
+                f(dav[3], dp[3]),
+                f(dav[4], dp[4]),
+                f(has_a, 8 * a[0] as i32),
+                f(has_l, 8 * l[0] as i32),
+                f(has_a && has_l, 8 * al[0] as i32),
+                f(has_a && bx + 1 < w, 8 * ar[0] as i32),
+                64.0,
+            ];
+            let pr = self.dls[ucls].predict(&x);
+            dp[5] = if pr.is_finite() { pr.round().clamp(-1e7, 1e7) as i32 } else { b0 };
+            dav[5] = true;
+        }
+        let (mut pdc, econf) = blend(&dp, &dav, &self.dc_err[ucls]);
+        if dmode == 1 && dav[5] {
+            pdc = dp[5];
+        }
         let pred_dc = r8(pdc);
         let (mut mx, mut mn) = (i32::MIN, i32::MAX);
         for j in 0..4 {
@@ -1071,10 +1133,13 @@ impl Model {
             let v = pred_dc + r;
             self.planes[ci].dcres[bi] = r.clamp(-32767, 32767) as i16;
             let v8 = 8 * v;
-            for j in 0..5 {
+            for j in 0..6 {
                 if dav[j] {
                     track(&mut self.dc_err[ucls][j], v8 - dp[j]);
                 }
+            }
+            if dav[5] {
+                self.dls[ucls].update(v8 as f64);
             }
             v
         } else {
@@ -1244,6 +1309,31 @@ fn ls_feats(class: usize, j: usize) -> Vec<(u8, u8)> {
     }
     f.push((7, 0));
     f
+}
+
+/// Least-squares features of edge coefficient `i` (edge 0: first row, predicted across the
+/// top boundary; edge 1: first column): the neighbour's coefficients in the same column/row,
+/// the other neighbour's edge, this block's 7x7 coefficients in that column/row, the corner
+/// blocks, chroma predictions and a constant (sources as in `ls_feats`).
+fn edge_ls_feats(class: usize, edge: usize, i: usize) -> Vec<(u8, u8)> {
+    let at = |f: usize, g: usize| (if edge == 0 { g * 8 + f } else { f * 8 + g }) as u8;
+    let (across, along) = if edge == 0 { (0, 1) } else { (1, 0) };
+    let mut v = Vec::new();
+    for g in 0..8 {
+        v.push((across, at(i, g)));
+        v.push((along, at(g, 0)));
+    }
+    for g in 1..8 {
+        v.push((4, at(i, g)));
+    }
+    v.push((2, at(i, 0)));
+    v.push((3, at(i, 0)));
+    if class == 1 {
+        v.push((5, at(i, 0)));
+        v.push((6, at(i, 0)));
+    }
+    v.push((7, 0));
+    v
 }
 
 /// Zigzag position of each natural index.
