@@ -1619,33 +1619,52 @@ pub fn decompress_file(inp: &std::fs::File, out: &mut std::fs::File, threads: us
     out.put(0, &data)
 }
 
-/// Training: the summed symbol statistics of the fast model over `files` (see
-/// `fast::build_priors`).
-pub fn fast_train(files: &[Vec<u8>]) -> Vec<(usize, Vec<u64>)> {
+/// Training: the summed symbol statistics of the fast model over `files` and its interior
+/// prediction weights (see `fast::build_priors`). A first pass fits the weights, a second one
+/// collects the statistics of the model that uses them.
+pub fn fast_train(files: &[Vec<u8>]) -> (Vec<(usize, Vec<u64>)>, Vec<i16>) {
     fast::TRAIN.store(true, std::sync::atomic::Ordering::Relaxed);
-    let mut totals: Vec<(usize, Vec<u64>)> = Vec::new();
-    for data in files {
-        let Ok(l) = format::parse(data, true) else { continue };
-        let Ok((mut coefs, _)) = format::decode_scans(&l, data) else { continue };
-        let rows = fast_stripes(&l.frame);
-        let geom = StripeGeom::new(&l);
-        for (k, mut p) in split_rows(&l.frame, &rows, &mut coefs).into_iter().enumerate() {
-            let mut e = fast::Enc::<fast::Base>::new();
-            let held: Vec<usize> = geom.v.iter().map(|&v| v * (rows[k].1 - rows[k].0)).collect();
-            let Ok(m) = fast::code_stripe(&mut e, &mut p, &held, &geom.width, &geom.v, &geom.extents(rows[k].0), &geom.q, rows[k].1 - rows[k].0, |_, _| Ok(())) else { continue };
-            let st = m.stats();
-            if totals.is_empty() {
-                totals = st.iter().map(|(n, c)| (*n, vec![0u64; c.len()])).collect();
-            }
-            for (t, (_, c)) in totals.iter_mut().zip(st) {
-                for (a, b) in t.1.iter_mut().zip(c) {
-                    *a += b as u64;
-                }
+    *fast::TRAIN_LSW.lock().unwrap() = Vec::new();
+    let pass = |each: &mut dyn FnMut(&fast::Model)| {
+        for data in files {
+            let Ok(l) = format::parse(data, true) else { continue };
+            let Ok((mut coefs, _)) = format::decode_scans(&l, data) else { continue };
+            let rows = fast_stripes(&l.frame);
+            let geom = StripeGeom::new(&l);
+            for (k, mut p) in split_rows(&l.frame, &rows, &mut coefs).into_iter().enumerate() {
+                let mut e = fast::Enc::<fast::Base>::new();
+                let held: Vec<usize> = geom.v.iter().map(|&v| v * (rows[k].1 - rows[k].0)).collect();
+                let Ok(m) = fast::code_stripe(&mut e, &mut p, &held, &geom.width, &geom.v, &geom.extents(rows[k].0), &geom.q, rows[k].1 - rows[k].0, |_, _| Ok(())) else { continue };
+                each(&m);
             }
         }
-    }
+    };
+    let mut sums: Vec<f64> = Vec::new();
+    pass(&mut |m| {
+        let s = m.ls_sums();
+        if sums.is_empty() {
+            sums = vec![0.0; s.len()];
+        }
+        for (a, b) in sums.iter_mut().zip(s) {
+            *a += b;
+        }
+    });
+    let lsw = fast::solve_weights(&sums);
+    *fast::TRAIN_LSW.lock().unwrap() = lsw.clone();
+    let mut totals: Vec<(usize, Vec<u64>)> = Vec::new();
+    pass(&mut |m| {
+        let st = m.stats();
+        if totals.is_empty() {
+            totals = st.iter().map(|(n, c)| (*n, vec![0u64; c.len()])).collect();
+        }
+        for (t, (_, c)) in totals.iter_mut().zip(st) {
+            for (a, b) in t.1.iter_mut().zip(c) {
+                *a += b as u64;
+            }
+        }
+    });
     fast::TRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
-    totals
+    (totals, lsw)
 }
 
 /// Describes a .komla JPEG container of either mode without decoding the image; also returns

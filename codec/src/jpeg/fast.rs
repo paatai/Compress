@@ -168,7 +168,7 @@ const BIT_SHIFT: u32 = 6;
 #[inline(always)]
 fn adapt_bit(p: Bit, b: u32) -> Bit {
     let q = p as i32;
-    let t = if b != 0 { 1 } else { PROB_ONE as i32 - 1 };
+    let t = std::hint::select_unpredictable(b != 0, 1, PROB_ONE as i32 - 1);
     (q + ((t - q) >> BIT_SHIFT)) as Bit
 }
 
@@ -194,15 +194,6 @@ impl Bits {
         // SAFETY: every index is computed from components that are each masked or clamped to
         // the table's dimensions (checked by the debug assertion).
         io.bit(unsafe { self.p.get_unchecked_mut(i) }, b)
-    }
-    /// Loads the probabilities (each followed by an update count, unused here).
-    fn load(&mut self, p: &mut &[u8]) -> Option<()> {
-        for x in self.p.iter_mut() {
-            let (b, rest) = p.split_at_checked(3)?;
-            *x = u16::from_le_bytes([b[0], b[1]]).clamp(1, PROB_ONE as u16 - 1);
-            *p = rest;
-        }
-        Some(())
     }
 }
 
@@ -255,7 +246,7 @@ impl CountedBits {
         let (p, k) = unsafe { (self.p.get_unchecked_mut(i), self.cnt.get_unchecked_mut(i)) };
         // the coder's own update (at the fixed rate) goes to a copy
         let r = io.bit(&mut { *p }, b);
-        let t = if r != 0 { 1 } else { PROB_ONE as i32 - 1 };
+        let t = std::hint::select_unpredictable(r != 0, 1, PROB_ONE as i32 - 1);
         *p = (*p as i32 + ((t - *p as i32) >> BIT_SHIFTS[(*k & 127) as usize])) as Bit;
         *k += (*k < BIT_LIMIT) as u8;
         r
@@ -277,6 +268,19 @@ impl CountedBits {
 pub trait Lanes {
     fn find(c: &[u16; 16], slot: u16) -> usize;
     fn update(c: &mut [u16; 16], j: usize, lo: &[u16; 16], hi: &[u16; 16], shift: u32);
+    /// For each column u (`rows` false) the sums over the rows g of x[g][u] w[0][g][u] -
+    /// y[g][u] w[2][g][u] and of x[g][u] w[1][g][u] - y[g][u] w[3][g][u], or the same for each
+    /// row over the columns (`rows` true), wrapping (natural order).
+    #[inline(always)]
+    fn sums(x: &[i16; 64], y: &[i16; 64], w: [&[i32; 64]; 4], rows: bool) -> [[i32; 8]; 2] {
+        let mut s = [[0i32; 8]; 2];
+        for k in 0..64 {
+            let (a, b, i) = (x[k] as i32, y[k] as i32, if rows { k / 8 } else { k % 8 });
+            s[0][i] = s[0][i].wrapping_add(a.wrapping_mul(w[0][k])).wrapping_sub(b.wrapping_mul(w[2][k]));
+            s[1][i] = s[1][i].wrapping_add(a.wrapping_mul(w[1][k])).wrapping_sub(b.wrapping_mul(w[3][k]));
+        }
+        s
+    }
 }
 
 /// SSE2 on x86-64, SIMD128 on WebAssembly, scalar elsewhere.
@@ -309,6 +313,11 @@ impl Lanes for Avx2 {
         // SAFETY: as above.
         unsafe { avx2::update(c, j, lo, hi, shift) }
     }
+    #[inline(always)]
+    fn sums(x: &[i16; 64], y: &[i16; 64], w: [&[i32; 64]; 4], rows: bool) -> [[i32; 8]; 2] {
+        // SAFETY: as above.
+        unsafe { avx2::sums(x, y, w, rows) }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -333,6 +342,39 @@ mod avx2 {
         let t = _mm256_blendv_epi8(_mm256_loadu_si256(lo.as_ptr() as *const __m256i), _mm256_loadu_si256(hi.as_ptr() as *const __m256i), m);
         let d = _mm256_sra_epi16(_mm256_sub_epi16(t, v), _mm_cvtsi32_si128(shift as i32));
         _mm256_storeu_si256(p, _mm256_add_epi16(v, d));
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn sums(x: &[i16; 64], y: &[i16; 64], w: [&[i32; 64]; 4], rows: bool) -> [[i32; 8]; 2] {
+        let mut p = [[_mm256_setzero_si256(); 8]; 2];
+        for r in 0..8 {
+            let a = _mm256_cvtepi16_epi32(_mm_loadu_si128(x.as_ptr().add(r * 8) as *const __m128i));
+            let b = _mm256_cvtepi16_epi32(_mm_loadu_si128(y.as_ptr().add(r * 8) as *const __m128i));
+            for s in 0..2 {
+                let wa = _mm256_loadu_si256(w[s].as_ptr().add(r * 8) as *const __m256i);
+                let wb = _mm256_loadu_si256(w[s + 2].as_ptr().add(r * 8) as *const __m256i);
+                p[s][r] = _mm256_sub_epi32(_mm256_mullo_epi32(a, wa), _mm256_mullo_epi32(b, wb));
+            }
+        }
+        let mut out = [[0i32; 8]; 2];
+        for s in 0..2 {
+            let q = &p[s];
+            let v = if rows {
+                // pairwise: rows 0-3 and 4-7 by halves of the columns, then the halves
+                let lo = _mm256_hadd_epi32(_mm256_hadd_epi32(q[0], q[1]), _mm256_hadd_epi32(q[2], q[3]));
+                let hi = _mm256_hadd_epi32(_mm256_hadd_epi32(q[4], q[5]), _mm256_hadd_epi32(q[6], q[7]));
+                _mm256_add_epi32(_mm256_permute2x128_si256::<0x20>(lo, hi), _mm256_permute2x128_si256::<0x31>(lo, hi))
+            } else {
+                let mut v = q[0];
+                for r in 1..8 {
+                    v = _mm256_add_epi32(v, q[r]);
+                }
+                v
+            };
+            _mm256_storeu_si256(out[s].as_mut_ptr() as *mut __m256i, v);
+        }
+        out
     }
 }
 
@@ -445,6 +487,7 @@ mod simd {
 /// ignores them and returns what it decodes.
 pub trait Io {
     const DEC: bool;
+    type L: Lanes;
     /// Symbol `s` of an alphabet of `n` symbols; `cnt` counts the distribution's updates.
     fn sym(&mut self, c: &mut Cdf, cnt: &mut u8, n: usize, s: usize) -> usize;
     /// Bit `b` with adaptive probability `p`.
@@ -530,6 +573,7 @@ impl<L: Lanes> Enc<L> {
 }
 
 impl<L: Lanes> Io for Enc<L> {
+    type L = L;
     const DEC: bool = false;
     #[inline(always)]
     fn sym(&mut self, c: &mut Cdf, cnt: &mut u8, n: usize, s: usize) -> usize {
@@ -542,7 +586,7 @@ impl<L: Lanes> Io for Enc<L> {
     #[inline(always)]
     fn bit(&mut self, p: &mut Bit, b: u32) -> u32 {
         let q = *p as u32;
-        self.push(if b != 0 { q | ((PROB_ONE - q - 1) << 16) } else { (q - 1) << 16 });
+        self.push(std::hint::select_unpredictable(b != 0, q | ((PROB_ONE - q - 1) << 16), (q - 1) << 16));
         *p = adapt_bit(*p, b);
         b
     }
@@ -609,7 +653,7 @@ impl<'a, L: Lanes> Dec<'a, L> {
     #[inline(always)]
     fn renorm(&mut self, x: u32) -> u32 {
         let r = (x < RANS_L) as u32;
-        let w = self.peek() & 0u32.wrapping_sub(r);
+        let w = std::hint::select_unpredictable(r != 0, self.peek(), 0);
         self.pos += 2 * r as usize;
         (x << (r << 4)) | w
     }
@@ -620,6 +664,7 @@ impl<'a, L: Lanes> Dec<'a, L> {
 }
 
 impl<L: Lanes> Io for Dec<'_, L> {
+    type L = L;
     const DEC: bool = true;
     #[inline(always)]
     fn sym(&mut self, c: &mut Cdf, cnt: &mut u8, n: usize, _s: usize) -> usize {
@@ -639,7 +684,7 @@ impl<L: Lanes> Io for Dec<'_, L> {
         let slot = x & (PROB_ONE - 1);
         let q = *p as u32;
         let b = (slot >= q) as u32;
-        let (start, freq) = if b != 0 { (q, PROB_ONE - q) } else { (0, q) };
+        let (start, freq) = std::hint::select_unpredictable(b != 0, (q, PROB_ONE - q), (0, q));
         let x = self.renorm(freq * (x >> PROB_BITS) + slot - start);
         self.x0 = self.x1;
         self.x1 = x;
@@ -949,47 +994,6 @@ const COS0: [i64; 8] = [2896, 4017, 3784, 3406, 2896, 2276, 1567, 799];
 const COS7: [i64; 8] = [2896, -4017, 3784, -3406, 2896, -2276, 1567, -799];
 const COS1: [i64; 8] = [2896, 3406, 1567, -799, -2896, -4017, -3784, -2276];
 const COS6: [i64; 8] = [2896, -3406, 1567, 799, -2896, 4017, -3784, 2276];
-/// Edge prediction weights: each side's profile extrapolated to the boundary, (1 - g) times
-/// the last sample plus g times the linear extrapolation from the last two (g = EDGE_G / 4).
-const EDGE_G: i64 = 4;
-/// The same for DC (g = DC_G / 4).
-const DC_G: i64 = 3;
-const DC_FAR: [i64; 8] = {
-    let mut t = [0i64; 8];
-    let mut j = 0;
-    while j < 8 {
-        t[j] = COS7[j] + DC_G * (COS7[j] - COS6[j]) / 8;
-        j += 1;
-    }
-    t
-};
-const DC_NEAR: [i64; 8] = {
-    let mut t = [0i64; 8];
-    let mut j = 0;
-    while j < 8 {
-        t[j] = COS0[j] + DC_G * (COS0[j] - COS1[j]) / 8;
-        j += 1;
-    }
-    t
-};
-const EDGE_FAR: [i64; 8] = {
-    let mut t = [0i64; 8];
-    let mut j = 0;
-    while j < 8 {
-        t[j] = COS7[j] + EDGE_G * (COS7[j] - COS6[j]) / 8;
-        j += 1;
-    }
-    t
-};
-const EDGE_NEAR: [i64; 8] = {
-    let mut t = [0i64; 8];
-    let mut j = 0;
-    while j < 8 {
-        t[j] = COS0[j] + EDGE_G * (COS0[j] - COS1[j]) / 8;
-        j += 1;
-    }
-    t
-};
 
 /// What a block's right and lower neighbours use: its nonzero counts.
 #[derive(Clone, Copy, Default)]
@@ -1001,10 +1005,20 @@ pub struct Info {
     dct: u8,
 }
 
-#[inline(always)]
-fn div_round(n: i64, r: i64) -> i32 {
-    ((((n >> 8).clamp(-(1 << 40), 1 << 40) * r) + (1 << 23)) >> 24).clamp(-32767, 32767) as i32
-}
+/// Candidate weights g of the gradient in the edge extrapolation, in eighths: each side's profile
+/// at the boundary is (1 - g) times its last sample plus g times the linear extrapolation from the
+/// last two. Each edge position uses the one with the smallest recent error (decaying sum, by
+/// EG_SHIFT).
+const EGS: [i64; 5] = [0, 2, 4, 6, 8];
+const NEG: usize = 5;
+const EG_SHIFT: u32 = 5;
+/// Sign contexts of DC (after those of the edges).
+const ESIGN_DC: usize = 2 * 2 * NTOK * 7 * 4 * 2 * 2;
+/// Mantissa contexts of the edges and DC: top bit, then second bit from EMANT2 on.
+const EMANT2: usize = 6 * 5 * 7;
+/// The same for the DC extrapolation of each side.
+const DGS: [i64; 5] = [0, 2, 3, 4, 6];
+const NDG: usize = 5;
 
 /// Bucket of a predicted magnitude.
 #[inline(always)]
@@ -1012,6 +1026,131 @@ fn pbucket(p: i32) -> usize {
     bitlen(p.unsigned_abs()).min(NPB as u32 - 1) as usize
 }
 const NPB: usize = 8;
+
+/// Inputs of the interior value prediction of each position (index into INTERIOR, row v and
+/// column u >= 1), in dequantized units: the above block's column u at its last pixel row (the
+/// frequency-u profile there), the gradient of its last rows at frequency u, and the sums of
+/// this block's coefficients (g, u), g < v, with g even and odd (all coded before it); then the
+/// same for row v from the block to the left. Weights in units of 2^-12, learned by
+/// `komla jtrain`.
+pub const NLSW: usize = 8;
+const NLS: usize = 2 * 49 * NLSW;
+
+/// Bucket of the magnitude of a predicted interior value (1/16 quantization steps): below
+/// 1/8, then by octaves up to 16 steps and more.
+const NPS: usize = 9;
+/// Bucket of a coded interior magnitude by token: 1, 2, 3, 4-7, 8-15, 16 and more.
+const SAB: [u8; 16] = [0, 0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5];
+const NSAB: usize = 6;
+const MU_SHIFT: u32 = 6;
+
+/// The interior value prediction of one component with its quantization table folded in.
+pub struct Pred {
+    /// q[v][u] times basis v (u) at the last sample, in 2^-12 (natural order)
+    qc: [i32; 64],
+    /// q[v][u] times the gradient of basis v (u) at the last sample, in 2^-12
+    gc: [i32; 64],
+    gr: [i32; 64],
+    qr: [i32; 64],
+    /// dequantization factors
+    q: [i32; 64],
+    /// q[v][u] times basis v (u) at the first sample, and its gradient there, in 2^-12, none for
+    /// v = 0 (u = 0): the weights of a block's own coefficients in the edge extrapolation
+    qc0: [i32; 64],
+    gc0: [i32; 64],
+    qr0: [i32; 64],
+    gr0: [i32; 64],
+    /// per interior position, the weights of its inputs (in the order of NLSW) in units of
+    /// 2^-16 of 1/16 quantization step of the predicted coefficient per dequantized unit
+    w: [[i32; NLSW]; 49],
+    /// steps of the sign-sign adaptation of `w` to the image (a fraction of the learned weights)
+    mu: [i32; 49],
+}
+
+impl Pred {
+    fn new(lsw: &[i16], cls: usize, q: &[u16; 64]) -> Pred {
+        let mut p = Pred { qc: [0; 64], gc: [0; 64], gr: [0; 64], qr: [0; 64], q: [0; 64], qc0: [0; 64], gc0: [0; 64], qr0: [0; 64], gr0: [0; 64], w: [[0; NLSW]; 49], mu: [0; 49] };
+        for k in 0..64 {
+            let x = q[k] as i64;
+            p.qc[k] = (x * COS7[k / 8]) as i32;
+            p.qr[k] = (x * COS7[k % 8]) as i32;
+            p.gc[k] = (x * (COS7[k / 8] - COS6[k / 8])) as i32;
+            p.gr[k] = (x * (COS7[k % 8] - COS6[k % 8])) as i32;
+            p.q[k] = x as i32;
+            let (v, u) = (k / 8, k % 8);
+            if v > 0 {
+                p.qc0[k] = (x * COS0[v]) as i32;
+                p.gc0[k] = (x * (COS0[v] - COS1[v])) as i32;
+            }
+            if u > 0 {
+                p.qr0[k] = (x * COS0[u]) as i32;
+                p.gr0[k] = (x * (COS0[u] - COS1[u])) as i32;
+            }
+        }
+        for j in 0..49 {
+            let qt = q[INTERIOR[j] as usize].max(1) as i64;
+            for k in 0..NLSW {
+                let n = (lsw[(cls * 49 + j) * NLSW + k] as i64) << 8;
+                p.w[j][k] = (n + qt / 2).div_euclid(qt) as i32;
+            }
+            let m = p.w[j].iter().map(|&w| w.unsigned_abs()).sum::<u32>() / NLSW as u32;
+            p.mu[j] = (m >> MU_SHIFT).max(1) as i32;
+        }
+        p
+    }
+}
+
+/// Least-squares fit of the interior prediction weights from the summed normal equations of
+/// `Model::ls_sums` (training only).
+pub fn solve_weights(sums: &[f64]) -> Vec<i16> {
+    const N: usize = NLSW;
+    let mut out = vec![0i16; NLS];
+    for (k, s) in sums.chunks(N * N + N).enumerate() {
+        let mut a = vec![0f64; N * N];
+        let mut b = s[N * N..].to_vec();
+        a.copy_from_slice(&s[..N * N]);
+        let tr: f64 = (0..N).map(|i| a[i * N + i]).sum();
+        for i in 0..N {
+            a[i * N + i] += 1e-3 * tr / N as f64 + 1e-6;
+        }
+        // Gaussian elimination with partial pivoting
+        for c in 0..N {
+            let piv = (c..N).max_by(|&x, &y| a[x * N + c].abs().total_cmp(&a[y * N + c].abs())).unwrap();
+            if piv != c {
+                for j in 0..N {
+                    a.swap(c * N + j, piv * N + j);
+                }
+                b.swap(c, piv);
+            }
+            let d = a[c * N + c];
+            if d.abs() < 1e-300 {
+                continue;
+            }
+            for r in c + 1..N {
+                let f = a[r * N + c] / d;
+                if f != 0.0 {
+                    for j in c..N {
+                        a[r * N + j] -= f * a[c * N + j];
+                    }
+                    b[r] -= f * b[c];
+                }
+            }
+        }
+        let mut w = vec![0f64; N];
+        for c in (0..N).rev() {
+            let d = a[c * N + c];
+            let s: f64 = (c + 1..N).map(|j| a[c * N + j] * w[j]).sum();
+            w[c] = if d.abs() < 1e-300 { 0.0 } else { (b[c] - s) / d };
+        }
+        for i in 0..N {
+            out[k * N + i] = (w[i] * 4096.0).round().clamp(-32767.0, 32767.0) as i16;
+        }
+    }
+    out
+}
+
+/// Weights for the model while training (set between the passes of `komla jtrain`).
+pub static TRAIN_LSW: std::sync::Mutex<Vec<i16>> = std::sync::Mutex::new(Vec::new());
 
 /// Initial distributions learned from the training set (see `komla jtrain`); empty: flat.
 static PRIORS: &[u8] = include_bytes!("fast_priors.bin");
@@ -1026,10 +1165,22 @@ pub struct Model {
     nze: Table,
     ezero: CountedBits,
     emag: Table,
-    esign: Bits,
+    esign: CountedBits,
     esc: Table,
     dc: Table,
-    emant: Bits,
+    emant: CountedBits,
+    isign: CountedBits,
+    imant: CountedBits,
+    /// interior prediction weights (see NLSW)
+    lsw: Vec<i16>,
+    /// normal equations of the interior prediction (training only)
+    ls_acc: Vec<f64>,
+    /// recent errors of the candidate edge extrapolations (see EGS) per class, edge and position
+    eg: Vec<[u32; NEG]>,
+    /// the same for DC (see DGS) per class and side, and for the weights of the two sides
+    edc: [[u32; NDG]; 16],
+    edw: [[u32; NDG]; 8],
+    edm: [[u32; NDG]; 8],
 }
 
 impl Default for Model {
@@ -1061,31 +1212,104 @@ impl Model {
             nze: Table::new(2 * 2 * 8 * 8, 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
             ezero: CountedBits::new(2 * 2 * 7 * 4 * NPB * NAQ * NBE),
             emag: Table::new(2 * 2 * 4 * NTOK * NAQ * NBE, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
-            esign: Bits::new(2 * 2 * NTOK * 7 * 2),
+            esign: CountedBits::new(ESIGN_DC + 2 * 4 * 5 * 5 * 2),
             esc: Table::new(4, 8, flat8),
             dc: Table::new(2 * 8 * 4 * 4, NTOK, Cdf::new(NTOK, &geo)),
-            emant: Bits::new(2 * 2 * 5 * 5),
+            emant: CountedBits::new(EMANT2 * 2),
+            isign: CountedBits::new(2 * 8 * NPS * NSAB),
+            imant: CountedBits::new(2 * 11 * 5 * 2),
+            lsw: vec![0; NLS],
+            ls_acc: if training() { vec![0.0; 2 * 49 * (NLSW * NLSW + NLSW)] } else { Vec::new() },
+            eg: vec![[1, 1, 0, 1, 1]; 64],
+            edc: [[1, 1, 0, 1, 1]; 16],
+            edw: [[1, 1, 0, 1, 1]; 8],
+            edm: [[0, 1, 1, 1, 1]; 8],
         };
-        if !training() && !PRIORS.is_empty() {
+        if training() {
+            let w = TRAIN_LSW.lock().unwrap();
+            if w.len() == NLS {
+                m.lsw.copy_from_slice(&w);
+            }
+        } else if !PRIORS.is_empty() {
             let mut p = PRIORS;
-            let ok = m.nz_hi.load(&mut p).and_then(|_| m.nz_lo.load(&mut p)).and_then(|_| m.zero.load(&mut p)).and_then(|_| m.mag.load(&mut p)).and_then(|_| m.nze.load(&mut p)).and_then(|_| m.ezero.load(&mut p)).and_then(|_| m.emag.load(&mut p)).and_then(|_| m.esign.load(&mut p)).and_then(|_| m.esc.load(&mut p)).and_then(|_| m.dc.load(&mut p)).and_then(|_| m.emant.load(&mut p));
-            assert!(ok.is_some() && p.is_empty(), "priors do not match the model");
+            let ok = m.nz_hi.load(&mut p).and_then(|_| m.nz_lo.load(&mut p)).and_then(|_| m.zero.load(&mut p)).and_then(|_| m.mag.load(&mut p)).and_then(|_| m.nze.load(&mut p)).and_then(|_| m.ezero.load(&mut p)).and_then(|_| m.emag.load(&mut p)).and_then(|_| m.esign.load(&mut p)).and_then(|_| m.esc.load(&mut p)).and_then(|_| m.dc.load(&mut p)).and_then(|_| m.emant.load(&mut p)).and_then(|_| m.isign.load(&mut p)).and_then(|_| m.imant.load(&mut p));
+            assert!(ok.is_some() && p.len() == 2 * NLS, "priors do not match the model");
+            for (w, b) in m.lsw.iter_mut().zip(p.chunks_exact(2)) {
+                *w = i16::from_le_bytes([b[0], b[1]]);
+            }
         }
         m
+    }
+
+    /// The summed normal equations of the interior prediction (training only).
+    pub fn ls_sums(&self) -> &[f64] {
+        &self.ls_acc
+    }
+
+    /// Adds a coded interior value `y` (dequantized) with inputs `x` to the normal equations.
+    #[cold]
+    fn ls_add(&mut self, cls: usize, j: usize, x: &[f64; NLSW], y: f64) {
+        let s = &mut self.ls_acc[(cls * 49 + j) * (NLSW * NLSW + NLSW)..][..NLSW * NLSW + NLSW];
+        for a in 0..NLSW {
+            if x[a] != 0.0 {
+                for b in 0..NLSW {
+                    s[a * NLSW + b] += x[a] * x[b];
+                }
+                s[NLSW * NLSW + a] += x[a] * y;
+            }
+        }
     }
 
     /// Symbol statistics of every table, in the order of the priors file: for each table its
     /// alphabet size (2 for binary probabilities) and the counts per context and symbol.
     pub fn stats(&self) -> Vec<(usize, Vec<u32>)> {
         let t = |x: &Table| (x.n, x.stats.clone());
-        let b = |x: &Bits| (2, x.stats.clone());
         let c = |x: &CountedBits| (2, x.stats.clone());
-        vec![t(&self.nz_hi), t(&self.nz_lo), c(&self.zero), t(&self.mag), t(&self.nze), c(&self.ezero), t(&self.emag), b(&self.esign), t(&self.esc), t(&self.dc), b(&self.emant)]
+        vec![t(&self.nz_hi), t(&self.nz_lo), c(&self.zero), t(&self.mag), t(&self.nze), c(&self.ezero), t(&self.emag), c(&self.esign), t(&self.esc), t(&self.dc), c(&self.emant), c(&self.isign), c(&self.imant)]
+    }
+
+    /// Codes the sign of an interior value (`t` = its token, `v` the value), as agreement with
+    /// the sign of the prediction `pneg` in context `ctx`, the top mantissa bit by where the
+    /// predicted magnitude `pa` (1/16 steps) falls in the token's range, and the other mantissa
+    /// bits raw.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn irest<I: Io>(&mut self, io: &mut I, t: usize, v: i32, esc_ctx: usize, cls: usize, ctx: usize, pneg: bool, pa: u32) -> i32 {
+        let a = v.unsigned_abs();
+        let (base, low) = if t == ESC {
+            let e = if I::DEC { 0 } else { bitlen(a) as usize };
+            let e = 8 + self.esc.sym(io, esc_ctx, 8, e.saturating_sub(8));
+            (1u32 << (e - 1), e as u32 - 1)
+        } else {
+            (BASE[t], LOW[t])
+        };
+        let flip = self.isign.bit(io, ctx, (v < 0) as u32 ^ pneg as u32);
+        let m = if low > 0 {
+            // where the prediction (1/16 steps) falls in the class and then in the chosen half
+            // (2^sh steps each), if the sign agreed with it
+            let rel = |lo: u32, sh: u32| ((2 + ((pa as i32 - (lo << 4) as i32) >> (sh + 4)).min(2)).max(1) as usize) * (flip ^ 1) as usize;
+            let half = 1u32 << (low - 1);
+            let d = a.wrapping_sub(base);
+            let mb = (cls * 11 + t.min(14) - 4) * 5;
+            let top = self.imant.bit(io, mb + rel(base, low - 1), (d >> (low - 1)) & 1);
+            if low > 1 {
+                let sec = self.imant.bit(io, 110 + mb + rel(base + (top << (low - 1)), low - 2), (d >> (low - 2)) & 1);
+                let r = if low > 2 { io.raw(d & ((half >> 1) - 1), low - 2) } else { 0 };
+                base + ((top << (low - 1)) | (sec << (low - 2)) | r)
+            } else {
+                base + (top << (low - 1))
+            }
+        } else {
+            base
+        };
+        let s = -((flip ^ pneg as u32) as i32);
+        (m as i32 ^ s) - s
     }
 
     /// Codes a magnitude class and the raw bits of a value (`t` = its token, `v` the value);
-    /// `sign`: raw, or predicted (`Some((sign context, predicted negative, predicted magnitude,
-    /// mantissa context))`), in which case the top mantissa bit is also coded with a probability.
+    /// `sign`: raw, or predicted (`Some((sign context, predicted negative, predicted magnitude in
+    /// 1/16 steps, mantissa context))`), in which case the top two mantissa bits are also coded
+    /// with a probability.
     #[inline(always)]
     fn rest<I: Io>(&mut self, io: &mut I, t: usize, v: i32, esc_ctx: usize, sign: Option<(usize, bool, u32, usize)>) -> i32 {
         let a = v.unsigned_abs();
@@ -1101,23 +1325,21 @@ impl Model {
             Some((ctx, pneg, pm, mctx)) => {
                 let flip = self.esign.bit(io, ctx, neg ^ pneg as u32);
                 let m = if low > 0 {
-                    // where the prediction falls in the class, if the sign agreed with it
+                    // where the prediction (1/16 steps) falls in the class and then in the
+                    // chosen half, by halves of the halves (2^sh steps each), if the sign agreed
+                    // with it
+                    let rel = |lo: u32, sh: u32| ((2 + ((pm as i32 - (lo << 4) as i32) >> (sh + 3)).min(4)).max(1) as usize) * (flip ^ 1) as usize;
                     let half = 1u32 << (low - 1);
-                    let rel = if flip != 0 {
-                        0
-                    } else if pm < base {
-                        1
-                    } else if pm < base + half {
-                        2
-                    } else if pm < base + 2 * half {
-                        3
-                    } else {
-                        4
-                    };
                     let d = a.wrapping_sub(base);
-                    let top = self.emant.bit(io, (mctx * 5 + (low as usize).min(5) - 1) * 5 + rel, (d >> (low - 1)) & 1);
-                    let r = if low > 1 { io.raw(d & (half - 1), low - 1) } else { 0 };
-                    (top << (low - 1)) | r
+                    let lb = (mctx * 5 + (low as usize).min(5) - 1) * 7;
+                    let top = self.emant.bit(io, lb + rel(base, low - 1), (d >> (low - 1)) & 1);
+                    if low > 1 {
+                        let sec = self.emant.bit(io, EMANT2 + lb + rel(base + (top << (low - 1)), low - 2), (d >> (low - 2)) & 1);
+                        let r = if low > 2 { io.raw(d & ((half >> 1) - 1), low - 2) } else { 0 };
+                        (top << (low - 1)) | (sec << (low - 2)) | r
+                    } else {
+                        top << (low - 1)
+                    }
                 } else {
                     0
                 };
@@ -1128,22 +1350,26 @@ impl Model {
                 (r >> low, base + (r & ((1 << low) - 1)))
             }
         };
-        if neg != 0 {
-            -(m as i32)
-        } else {
-            m as i32
-        }
+        let s = -(neg as i32);
+        (m as i32 ^ s) - s
     }
 
     /// Codes the first row (`dir` 0, continuing the block above `nbr`) or first column (`dir` 1,
     /// continuing the block to the left) of a block.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    fn edge<I: Io>(&mut self, io: &mut I, cls: usize, dir: usize, blk: &mut [i16; 64], nbr: Option<&[i16; 64]>, near: (&[i16; 64], &[i16; 64]), q: &[i64; 64], rq: &[i64; 64], nzq: usize, pnz: usize) -> u8 {
+    fn edge<I: Io>(&mut self, io: &mut I, cls: usize, dir: usize, blk: &mut [i16; 64], nbr: Option<&[i16; 64]>, near: (&[i16; 64], &[i16; 64]), pr: &Pred, rq: &[i64; 64], nzq: usize, pnz: usize) -> u8 {
         let step = if dir == 0 { 1 } else { 8 };
         let across = if dir == 0 { 8 } else { 1 };
         let actual = if I::DEC { 0 } else { (1..8).filter(|&i| blk[i * step] != 0).count() };
         let n = self.nze.sym(io, ((cls * 2 + dir) * 8 + nzq) * 8 + pnz, 8, actual);
+        // the sums of the extrapolation below for all positions at once (position 0, DC, is not
+        // coded here), in 32 bits, wrapping: exact for the coefficients of 8- and 12-bit images
+        let [e0, ed] = match (n > 0, nbr) {
+            (true, Some(nb)) if dir == 0 => I::L::sums(nb, blk, [&pr.qc, &pr.gc, &pr.qc0, &pr.gc0], false),
+            (true, Some(nb)) => I::L::sums(nb, blk, [&pr.qr, &pr.gr, &pr.qr0, &pr.gr0], true),
+            _ => [[0; 8]; 2],
+        };
         let mut rem = n;
         let mut i = 1;
         // magnitude of the previous edge coefficient, by token (DC is coded later)
@@ -1152,17 +1378,22 @@ impl Model {
             let pos = i * step;
             // the inverse DCT of this frequency along the edge must continue the neighbour's
             // profile at its far side
-            let p = match nbr {
-                Some(nb) => {
-                    let mut acc = nb[pos] as i64 * q[pos] * EDGE_FAR[0];
-                    for j in 1..8 {
-                        let o = pos + j * across;
-                        acc += (nb[o] as i64 * EDGE_FAR[j] - blk[o] as i64 * EDGE_NEAR[j]) * q[o];
-                    }
-                    div_round(acc, rq[pos])
+            // (the last samples, and the gradient), extrapolated by the weight that predicted
+            // this position best recently
+            let ge = ((cls * 2 + dir) * 8 + i) * 2 + (nzq >= 3) as usize;
+            let (p16, accs, eb) = match nbr {
+                Some(_) => {
+                    // with gradient weight g (eighths): (b0 + g bd) / 2^20 in 1/16 steps
+                    let (b0, bd) = ((e0[i] >> 8) as i64 * rq[pos], ((ed[i] >> 8) as i64 * rq[pos]) >> 3);
+                    let e = &self.eg[ge & 63];
+                    // (the first smallest: the minimum of error * 8 + index, without branches)
+                    let k = (1..NEG).fold(e[0] << 3, |m, c| m.min(e[c] << 3 | c as u32)) as usize & 7;
+                    // and its recent mean error: below 1/2 step, 1, 2, more
+                    (((b0 + EGS[k] * bd + (1 << 19)) >> 20).clamp(-(1 << 20), 1 << 20) as i32, Some((b0, bd)), bitlen(e[k] >> 8).min(3) as usize)
                 }
-                None => 0,
+                None => (0, None, 0),
             };
+            let p = ((p16 + 8) >> 4).clamp(-32767, 32767);
             let pb = pbucket(p);
             let v = blk[pos] as i32;
             // the interior coefficient next to it (same frequency along the edge)
@@ -1177,7 +1408,16 @@ impl Model {
                 let t = 1 + self.emag.sym(io, ((((cls * 2 + dir) * 4 + EZ[i] as usize) * NTOK + tp) * NAQ + adj) * NBE + nm, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
                 // the sign follows the prediction more reliably when the magnitudes agree
                 let dt = (t as i32 - tp as i32).clamp(-3, 3) as usize + 3;
-                let sign = if p != 0 { Some(((((cls * 2 + dir) * NTOK + tp) * 7 + dt) * 2 + (p < 0) as usize, p < 0, p.unsigned_abs(), cls * 2 + dir)) } else { None };
+                // whether the extrapolations without and with the full gradient agree in sign
+                let ag = accs.map_or(0, |(b0, bd)| ((b0 < 0) == (b0 + 8 * bd < 0)) as usize);
+                let sign = if p != 0 {
+                    Some(((((((cls * 2 + dir) * NTOK + tp) * 7 + dt) * 4 + eb) * 2 + ag) * 2 + (p < 0) as usize, p < 0, p16.unsigned_abs(), cls * 2 + dir))
+                } else if p16 != 0 {
+                    // a prediction below half a step, by sixteenths (in place of dt)
+                    Some(((((((cls * 2 + dir) * NTOK) * 7 + (p16.unsigned_abs() as usize - 1).min(6)) * 4 + eb) * 2 + ag) * 2 + (p16 < 0) as usize, p16 < 0, p16.unsigned_abs(), cls * 2 + dir))
+                } else {
+                    None
+                };
                 let x = self.rest(io, t, v, cls * 2, sign);
                 if I::DEC {
                     blk[pos] = x as i16;
@@ -1186,6 +1426,14 @@ impl Model {
                 rem -= 1;
             } else {
                 prev = 0;
+            }
+            if let Some((b0, bd)) = accs {
+                let v = ((blk[pos] as i64) << 24) - b0;
+                let e = &mut self.eg[ge & 63];
+                for (c, x) in e.iter_mut().enumerate() {
+                    let d = ((v - EGS[c] * bd).unsigned_abs() >> 20).min(1024) as u32;
+                    *x = *x - (*x >> EG_SHIFT) + d;
+                }
             }
             i += 1;
         }
@@ -1196,7 +1444,7 @@ impl Model {
     /// outside the stripe); `q`: the component's quantization table. Returns the block's `Info`.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    pub fn block<I: Io>(&mut self, io: &mut I, cls: usize, q: &[i64; 64], rq: &[i64; 64], blk: &mut [i16; 64], a: Option<(&[i16; 64], &Info)>, l: Option<(&[i16; 64], &Info)>, diag: (Option<&[i16; 64]>, Option<&[i16; 64]>), luma: usize, code_dc: bool, code_ac: bool) -> Info {
+    pub fn block<I: Io>(&mut self, io: &mut I, cls: usize, q: &[i64; 64], rq: &[i64; 64], pr: &mut Pred, blk: &mut [i16; 64], a: Option<(&[i16; 64], &Info)>, l: Option<(&[i16; 64], &Info)>, diag: (Option<&[i16; 64]>, Option<&[i16; 64]>), luma: usize, code_dc: bool, code_ac: bool) -> Info {
         let (na, nl) = match (a, l) {
             (Some(a), Some(l)) => (a.0, l.0),
             (Some(a), None) => (a.0, a.0),
@@ -1230,10 +1478,27 @@ impl Model {
             // bucket) and of the interior coefficients of this block coded before it, by token,
             // added as they are coded (first-row and first-column coefficients come later)
             let mut est = [0u16; 64];
+            // the inputs of the interior value prediction (see NLSW) of each column, then of each
+            // row, dequantized (in 32 bits, wrapping: exact for the coefficients of 8- and 12-bit
+            // images, and they vectorize)
+            let mut colv = [[0i32; 4]; 8];
+            let mut rowv = [[0i32; 4]; 8];
             if rem > 0 {
                 let m = |b: &[i16; 64], k: usize| b[k].unsigned_abs().min(4095);
                 for (k, e) in est.iter_mut().enumerate() {
                     *e = 2 * (m(na, k) + m(nl, k)) + m(nal, k) + m(nar, k);
+                }
+                if let Some((ab, _)) = a {
+                    let [sa, ga] = I::L::sums(ab, &ZERO_BLOCK, [&pr.qc, &pr.gc, &pr.qc0, &pr.gc0], false);
+                    for u in 0..8 {
+                        colv[u] = [sa[u] >> 12, ga[u] >> 12, 0, 0];
+                    }
+                }
+                if let Some((lb, _)) = l {
+                    let [s, t] = I::L::sums(lb, &ZERO_BLOCK, [&pr.qr, &pr.gr, &pr.qr0, &pr.gr0], true);
+                    for v in 0..8 {
+                        rowv[v] = [s[v] >> 12, t[v] >> 12, 0, 0];
+                    }
                 }
             }
             let mut i = 0usize;
@@ -1247,11 +1512,39 @@ impl Model {
                 let nb = EQ[e.min(340) as usize] as usize;
                 let v = blk[pos] as i32;
                 if self.zero.bit(io, zrow + i * NEQ + nb, (v != 0) as u32) != 0 {
-                    let t = 1 + self.mag.sym(io, mbase + REM8[rem & 63] as usize + IZE[i] as usize + nb, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
-                    let x = self.rest(io, t, v, cls * 2, None);
+                    let (pv, pu) = (pos / 8, pos % 8);
+                    let (c, r) = (colv[pu], rowv[pv]);
+                    let f = [c[0], c[1], c[2], c[3], r[0], r[1], r[2], r[3]];
+                    let w = &pr.w[i];
+                    let pw = (0..NLSW).fold(0i64, |s, k| s.wrapping_add(w[k] as i64 * f[k] as i64));
+                    let p = pw >> 16;
+                    let pa = p.unsigned_abs().min(1 << 20) as u32;
+                    // the magnitude by the estimate with the predicted magnitude added
+                    let nm = EQ[(e as u32 + (pa >> 1)).min(340) as usize] as usize;
+                    let t = 1 + self.mag.sym(io, mbase + REM8[rem & 63] as usize + IZE[i] as usize + nm, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
+                    let pb = (bitlen(pa >> 1) as usize).min(NPS - 1);
+                    let sctx = ((cls * 8 + IZE[i] as usize / NEQ) * NPS + pb) * NSAB + SAB[t & 15] as usize;
+                    let x = self.irest(io, t, v, cls * 2, cls, sctx, p < 0, pa);
                     if I::DEC {
                         blk[pos] = x as i16;
                     }
+                    let dq = x.wrapping_mul(pr.q[pos]);
+                    let e = ((x as i64) << 20).wrapping_sub(pw);
+                    // the step with the sign of the error, 0 below half a step
+                    let mu = std::hint::select_unpredictable(e < 0, -pr.mu[i], pr.mu[i]);
+                    let d = std::hint::select_unpredictable(e.unsigned_abs() >= 1 << 19, mu, 0);
+                    let w = &mut pr.w[i];
+                    for k in 0..NLSW {
+                        // d with the sign of the input, 0 for a zero input
+                        let m = f[k] >> 31;
+                        w[k] = w[k].wrapping_add(((d ^ m) - m) & -((f[k] != 0) as i32));
+                    }
+                    if !I::DEC && !self.ls_acc.is_empty() {
+                        self.ls_add(cls, i, &f.map(|x| x as f64), dq as f64);
+                    }
+                    let (k, j) = (2 + (pv & 1), 2 + (pu & 1));
+                    colv[pu][k] = colv[pu][k].wrapping_add(dq);
+                    rowv[pv][j] = rowv[pv][j].wrapping_add(dq);
                     let a = TMAG[t & 15];
                     let f = &FWD[i];
                     for (j, &k) in f.iter().enumerate() {
@@ -1266,24 +1559,24 @@ impl Model {
                 i += 1;
             }
             let nzq = NZQ8[nz77 & 63] as usize;
-            info.nzr = self.edge(io, cls, 0, blk, a.map(|x| x.0), (na, nl), q, rq, nzq, avg(|i| i.nzr));
-            info.nzc = self.edge(io, cls, 1, blk, l.map(|x| x.0), (na, nl), q, rq, nzq, avg(|i| i.nzc));
+            info.nzr = self.edge(io, cls, 0, blk, a.map(|x| x.0), (na, nl), pr, rq, nzq, avg(|i| i.nzr));
+            info.nzc = self.edge(io, cls, 1, blk, l.map(|x| x.0), (na, nl), pr, rq, nzq, avg(|i| i.nzc));
         }
         if code_dc {
-            // the mean of the edge column (row) continues the neighbour's last column (row)
-            let from_left = l.map(|(lb, _)| {
-                let acc: i64 = lb[0] as i64 * q[0] * DC_FAR[0] + (1..8).map(|u| (lb[u] as i64 * DC_FAR[u] - blk[u] as i64 * DC_NEAR[u]) * q[u]).sum::<i64>();
-                div_round(acc, rq[0])
-            });
-            let from_above = a.map(|(ab, _)| {
-                let acc: i64 = ab[0] as i64 * q[0] * DC_FAR[0] + (1..8).map(|v| (ab[v * 8] as i64 * DC_FAR[v] - blk[v * 8] as i64 * DC_NEAR[v]) * q[v * 8]).sum::<i64>();
-                div_round(acc, rq[0])
-            });
-            let (pred, ub) = match (from_left, from_above) {
-                (Some(x), Some(y)) => ((x + y) >> 1, 1 + bitlen((x - y).unsigned_abs()).min(6) as usize),
-                (Some(x), None) | (None, Some(x)) => (x, 7),
-                _ => (0, 0),
+            // the mean of the edge column (row) continues the neighbour's last column (row),
+            // extrapolated by the gradient weight that predicted that side best recently
+            let side = |nb: &[i16; 64], st: usize| {
+                let mut a0 = nb[0] as i64 * q[0] * COS7[0];
+                let mut ad = 0i64;
+                for j in 1..8 {
+                    let o = j * st;
+                    let (x, y) = (nb[o] as i64 * q[o], blk[o] as i64 * q[o]);
+                    a0 += x * COS7[j] - y * COS0[j];
+                    ad += x * (COS7[j] - COS6[j]) - y * (COS0[j] - COS1[j]);
+                }
+                ((a0 >> 8) * rq[0], ((ad >> 8) * rq[0]) >> 3)
             };
+            let sides = [l.map(|(lb, _)| side(lb, 1)), a.map(|(ab, _)| side(ab, 8))];
             let nz = (info.nz77 + info.nzr + info.nzc) as u32;
             let nzq = match nz {
                 0 => 0,
@@ -1291,14 +1584,81 @@ impl Model {
                 4..=10 => 2,
                 _ => 3,
             };
+            // the recent errors by class and activity
+            let ec = cls * 4 + nzq;
+            // both sides weighted by quarters (`w` for the left one)
+            let comb = |xy: (Option<i32>, Option<i32>), w: i32| match xy {
+                (Some(x), Some(y)) => Some((x * w + y * (4 - w) + 2) >> 2),
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                _ => None,
+            };
+            let best = |e: &[u32; NDG]| (1..NDG).fold(e[0] << 3, |m, c| m.min(e[c] << 3 | c as u32)) as usize & 7;
+            let mut ps = [None; 2];
+            for (s, p) in ps.iter_mut().enumerate() {
+                if let Some((a0, ad)) = sides[s] {
+                    *p = Some(((a0 + DGS[best(&self.edc[ec * 2 + s])] * ad + (1 << 19)) >> 20).clamp(-(1 << 20), 1 << 20) as i32);
+                }
+            }
+            let xy = (ps[0], ps[1]);
+            let kw = best(&self.edw[ec]);
+            // the median predictor from the neighbours' DC, mixed in by quarters
+            let pm = match (a, l) {
+                (Some((ab, _)), Some((lb, _))) => {
+                    let (da, dl) = (ab[0] as i32, lb[0] as i32);
+                    let g = da + dl - diag.0.map_or((da + dl) >> 1, |b| b[0] as i32);
+                    Some(g.clamp(da.min(dl), da.max(dl)) << 4)
+                }
+                (Some((b, _)), None) | (None, Some((b, _))) => Some((b[0] as i32) << 4),
+                _ => None,
+            };
+            let mix = |p: i32, w: i32| match pm {
+                Some(m) => (p * (4 - w) + m * w + 2) >> 2,
+                None => p,
+            };
+            let pb = comb(xy, kw as i32).unwrap_or(0);
+            let p16 = mix(pb, best(&self.edm[ec]) as i32);
+            let ub = match xy {
+                (Some(x), Some(y)) => 1 + bitlen(((x - y + 8) >> 4).unsigned_abs()).min(6) as usize,
+                (Some(_), None) | (None, Some(_)) => 7,
+                _ => 0,
+            };
+            let pred = ((p16 + 8) >> 4).clamp(-32767, 32767);
             let d = blk[0] as i32 - pred;
             // how well the neighbours' DC was predicted
             let dq = DCQ[avg(|i| i.dct) & 15] as usize;
             let t = self.dc.sym(io, ((cls * 8 + ub) * 4 + nzq) * 4 + dq, NTOK, if I::DEC { 0 } else { token(d.unsigned_abs()) });
             info.dct = t as u8;
-            let x = if t != 0 { self.rest(io, t, d, cls * 2 + 1, None) } else { 0 };
+            // the sign by the rounding of the prediction
+            let f = p16 - (pred << 4);
+            // and by the sides of the rounded prediction the two extrapolations fall on
+            let side_of = |x: Option<i32>| x.map_or(0, |x| (x > pred << 4) as i32 - (x < pred << 4) as i32);
+            let vote = (side_of(xy.0) + side_of(xy.1) + 2) as usize;
+            let sctx = ESIGN_DC + (((cls * 4 + t.min(4) - 1) * 5 + (f.unsigned_abs() as usize + 1) / 2) * 5 + vote) * 2 + (f < 0) as usize;
+            let x = if t != 0 { self.rest(io, t, d, cls * 2 + 1, Some((sctx, f < 0, f.unsigned_abs(), 4 + cls))) } else { 0 };
             if I::DEC {
                 blk[0] = (pred + x) as i16;
+            }
+            let v16 = (blk[0] as i64) << 4;
+            for (s, side) in sides.iter().enumerate() {
+                if let Some((b0, bd)) = *side {
+                    let v = (v16 << 20) - b0;
+                    for (c, x) in self.edc[ec * 2 + s].iter_mut().enumerate() {
+                        let d = ((v - DGS[c] * bd).unsigned_abs() >> 20).min(1024) as u32;
+                        *x = *x - (*x >> EG_SHIFT) + d;
+                    }
+                }
+            }
+            if pm.is_some() {
+                for (c, x) in self.edm[ec].iter_mut().enumerate() {
+                    let d = (v16 - mix(pb, c as i32) as i64).unsigned_abs().min(1024) as u32;
+                    *x = *x - (*x >> EG_SHIFT) + d;
+                }
+            }
+            if let (Some(_), Some(_)) = xy {
+                for (c, x) in self.edw[ec].iter_mut().enumerate() {
+                    let d = (v16 - comb(xy, c as i32).unwrap() as i64).unsigned_abs().min(1024) as u32;
+                    *x = *x - (*x >> EG_SHIFT) + d;
+                }
             }
         }
         info
@@ -1329,6 +1689,7 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], rows: &[usize],
     let mut m = Model::new();
     let qs: Vec<[i64; 64]> = q.iter().map(|t| t.map(|x| x as i64)).collect();
     let rqs: Vec<[i64; 64]> = q.iter().map(|t| t.map(|x| (1i64 << 32) / (COS0[0] * x.max(1) as i64))).collect();
+    let mut preds: Vec<Pred> = q.iter().enumerate().map(|(c, t)| Pred::new(&m.lsw, (c > 0) as usize, t)).collect();
     let mut infos: Vec<Vec<Info>> = width.iter().map(|&w| vec![Info::default(); 2 * w]).collect();
     for my in 0..mcu_rows {
         for c in 0..planes.len() {
@@ -1395,7 +1756,7 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], rows: &[usize],
                     let ar = if bx + 1 < w.min(e.ac_w.max(e.dc_w)) { above.map(|ab| <&[i16; 64]>::try_from(&ab[(bx + 1) * 64..bx * 64 + 128]).unwrap()) } else { None };
                     let luma = hints.get(bx).copied().unwrap_or(0) as usize;
                     io.block();
-                    let info = m.block(io, cls, &qs[c], &rqs[c], blk, a, l, (al, ar), luma, cd, ca);
+                    let info = m.block(io, cls, &qs[c], &rqs[c], &mut preds[c], blk, a, l, (al, ar), luma, cd, ca);
                     now[bx] = info;
                 }
             }
@@ -1416,12 +1777,14 @@ pub struct Geometry<'a> {
     pub mcu_rows: usize,
 }
 
+#[inline(always)]
 fn encode_with<L: Lanes>(planes: &mut [&mut [i16]], g: &Geometry) -> (Vec<u8>, Vec<u8>) {
     let mut e = Enc::<L>::new();
     let _ = code_stripe(&mut e, planes, g.rows, g.width, g.v, g.ext, g.q, g.mcu_rows, |_, _| Ok(()));
     e.finish()
 }
 
+#[inline(always)]
 fn decode_with<L: Lanes>(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry, emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<(), String> {
     let mut d = Dec::<L>::new(rans, raw);
     code_stripe(&mut d, planes, g.rows, g.width, g.v, g.ext, g.q, g.mcu_rows, emit)?;
@@ -1469,10 +1832,11 @@ pub fn decode_stripe(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geo
     decode_with::<Base>(rans, raw, planes, g, emit)
 }
 
-/// Builds the priors file from summed `Model::stats` of a training set of `files` files:
-/// distributions with at least `min` observations start from the observed frequencies, with the
-/// update count of `count0` (binary: `bit_count0`) so that they adapt from there.
-pub fn build_priors(totals: &[(usize, Vec<u64>)], min: u64, count0: u8, bit_count0: u8) -> Vec<u8> {
+/// Builds the priors file from summed `Model::stats` of a training set of `files` files and the
+/// interior prediction weights `lsw`: distributions with at least `min` observations start from
+/// the observed frequencies, with the update count of `count0` (binary: `bit_count0`) so that
+/// they adapt from there.
+pub fn build_priors(totals: &[(usize, Vec<u64>)], lsw: &[i16], min: u64, count0: u8, bit_count0: u8) -> Vec<u8> {
     let was = TRAIN.swap(true, std::sync::atomic::Ordering::Relaxed);
     let fresh = Model::new();
     TRAIN.store(was, std::sync::atomic::Ordering::Relaxed);
@@ -1485,6 +1849,8 @@ pub fn build_priors(totals: &[(usize, Vec<u64>)], min: u64, count0: u8, bit_coun
         .chain([&fresh.emag].iter().map(|t| t.cdf.iter().map(|c| c.0).collect()))
         .chain(std::iter::once(Vec::new()))
         .chain([&fresh.esc, &fresh.dc].iter().map(|t| t.cdf.iter().map(|c| c.0).collect()))
+        .chain(std::iter::once(Vec::new()))
+        .chain(std::iter::once(Vec::new()))
         .chain(std::iter::once(Vec::new()))
         .collect();
     let mut out = Vec::new();
@@ -1510,6 +1876,10 @@ pub fn build_priors(totals: &[(usize, Vec<u64>)], min: u64, count0: u8, bit_coun
                 out.push(if total >= min { count0 } else { 0 });
             }
         }
+    }
+    assert_eq!(lsw.len(), NLS);
+    for w in lsw {
+        out.extend_from_slice(&w.to_le_bytes());
     }
     out
 }
