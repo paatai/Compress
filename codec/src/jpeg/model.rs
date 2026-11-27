@@ -34,7 +34,7 @@ const S_M2: usize = 11;
 const S_M3: usize = 14;
 
 const NCTX: usize = 16;
-const NIN: usize = NCTX + 3;
+const NIN: usize = NCTX + 4;
 
 const PART_INTERIOR: usize = 0;
 const PART_EDGE: usize = 1;
@@ -43,7 +43,7 @@ const DYN_B: usize = 24;
 const DYN_C: usize = 8;
 
 /// Model parameters; KOMLA_JTUNE="i=v,..." overrides them for experiments (both sides must agree).
-const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 0, 2, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 32, 1, 16, 1, 2, 8];
+const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 16, 2, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 32, 1, 16, 1, 2, 8];
 
 fn tune() -> &'static [i32; 24] {
     static T: std::sync::OnceLock<[i32; 24]> = std::sync::OnceLock::new();
@@ -244,8 +244,12 @@ pub struct Model {
     /// (1/8 quantization steps); `ps8 == 0` disables it
     pmu8: i32,
     ps8: i32,
-    /// stretched probability of the current decision under the parametric model
+    /// stretched probability of the current decision under the parametric model (logistic)
     pin: i32,
+    /// the same under a Laplace distribution with the same centre
+    pin2: i32,
+    /// exp(-i/256) * 65536 for the Laplace distribution
+    lap: Vec<u32>,
     /// running mean of |value| x 64 per (class, position, nonzeros left, neighbour magnitude)
     emag: Vec<i32>,
     /// 7x7 coefficients predicted by online least squares (per class and position) from the
@@ -356,6 +360,8 @@ impl Model {
             pmu8: 0,
             ps8: 0,
             pin: 0,
+            pin2: 0,
+            lap: (0..4096).map(|i| (crate::detmath::exp(-(i as f64) / 256.0) * 65536.0).round() as u32).collect(),
             emag: vec![64; 2 * 64 * 12 * 16],
             ls: (0..2 * 49).map(|i| Ols::new(ls_feats(i / 49, i % 49).len(), 1.0 - 1.0 / tu[16].max(16) as f64, tu[17] as f64, tu[18].max(1) as u32)).collect(),
             ls_feats: (0..2 * 49).map(|i| ls_feats(i / 49, i % 49)).collect(),
@@ -415,6 +421,7 @@ impl Model {
         self.x[NCTX] = t.stretch(ctr_p16(self.dyn_t[self.dyn_idx]));
         self.x[NCTX + 1] = 256;
         self.x[NCTX + 2] = self.pin;
+        self.x[NCTX + 3] = self.pin2;
         let d0 = self.m[0].mix(&self.x, self.sel[0] * SLOTS + slot, t);
         let d1 = self.m[1].mix(&self.x, self.sel[1] * SLOTS + slot, t);
         let d2 = self.m[2].mix(&self.x, self.sel[2] * SLOTS + slot, t);
@@ -457,29 +464,45 @@ impl Model {
 
     /// Logistic CDF of the parametric model at x8 (1/8 units), 16-bit.
     #[inline(always)]
-    fn cdf(&self, x8: i64) -> i64 {
-        let d = ((x8 - self.pmu8 as i64) * 256 / self.ps8 as i64).clamp(-2047, 2047) as i32;
-        self.t.squash(d) as i64
+    fn cdf(&self, x8: i64, kind: usize) -> i64 {
+        if kind == 0 {
+            let d = ((x8 - self.pmu8 as i64) * 256 / self.ps8 as i64).clamp(-2047, 2047) as i32;
+            self.t.squash(d) as i64
+        } else {
+            let b8 = (self.ps8 as i64 * tune()[7].max(1) as i64 / 16).max(1);
+            let d = ((x8 - self.pmu8 as i64) * 256 / b8).clamp(-4095, 4095);
+            if d < 0 {
+                (self.lap[(-d) as usize] >> 1) as i64
+            } else {
+                65536 - (self.lap[d as usize] >> 1) as i64
+            }
+        }
     }
 
     /// Parametric probability mass of |value| in [a, b) (b = None: unbounded), a >= 1.
     #[inline(always)]
-    fn mass(&self, a: i64, b: Option<i64>) -> i64 {
+    fn mass(&self, a: i64, b: Option<i64>, kind: usize) -> i64 {
         let (hp, ln) = match b {
-            Some(b) => (self.cdf(8 * b - 4), self.cdf(-8 * b + 4)),
+            Some(b) => (self.cdf(8 * b - 4, kind), self.cdf(-8 * b + 4, kind)),
             None => (65536, 0),
         };
-        (hp - self.cdf(8 * a - 4)) + (self.cdf(-8 * a + 4) - ln)
+        (hp - self.cdf(8 * a - 4, kind)) + (self.cdf(-8 * a + 4, kind) - ln)
     }
 
-    /// Sets the parametric input for a decision with probability num/den of a 1 bit.
     #[inline(always)]
-    fn set_param(&mut self, num: i64, den: i64) {
-        self.pin = if self.ps8 == 0 || den <= 0 {
+    fn stretch_ratio(&self, num: i64, den: i64) -> i32 {
+        if den <= 0 {
             0
         } else {
             self.t.stretch(((num << 16) / den).clamp(32, 65504) as u32)
-        };
+        }
+    }
+
+    /// Sets the parametric inputs for the decision "|value| in [a, b)" given "|value| in [lo, b)".
+    #[inline(always)]
+    fn set_param(&mut self, a: i64, lo: i64, b: Option<i64>) {
+        self.pin = self.stretch_ratio(self.mass(a, b, 0), if lo == 0 { 65536 } else { self.mass(lo, b, 0) });
+        self.pin2 = if tune()[7] > 0 { self.stretch_ratio(self.mass(a, b, 1), if lo == 0 { 65536 } else { self.mass(lo, b, 1) }) } else { 0 };
     }
 
     /// Codes a value given contexts already selected in all tables. `self.pred8` is the
@@ -492,10 +515,11 @@ impl Model {
         if may_be_zero {
             self.set_dyn(S_ZERO, pa - 4);
             if on {
-                self.set_param(self.mass(1, None), 65536);
+                self.set_param(1, 0, None);
             }
             if self.bit(coder, S_ZERO, (a != 0) as u32) == 0 {
                 self.pin = 0;
+                self.pin2 = 0;
                 return 0;
             }
         }
@@ -505,7 +529,7 @@ impl Model {
             let slot = S_EXP + (e as usize).min(7);
             self.set_dyn(slot, pa - ((16i64 << e) - 4));
             if on {
-                self.set_param(self.mass(2 << e, None), self.mass(1 << e, None));
+                self.set_param(2 << e, 1 << e, None);
             }
             if self.bit(coder, slot, (e_true > e) as u32) == 0 {
                 break;
@@ -535,8 +559,7 @@ impl Model {
             let mid = lo + (1i64 << i);
             self.set_dyn(slot, pa - (8 * mid - 4));
             if on {
-                let top = lo + (2i64 << i);
-                self.set_param(self.mass(mid, Some(top)), self.mass(lo, Some(top)));
+                self.set_param(mid, lo, Some(lo + (2i64 << i)));
             }
             if self.bit(coder, slot, bit) != 0 {
                 lo = mid;
@@ -547,12 +570,16 @@ impl Model {
         self.dyn_idx = self.dyn_base / (SLOTS * DYN_B * DYN_C) * (SLOTS * DYN_B * DYN_C) + (S_SIGN * DYN_B + dbucket(self.spred8 as i64)) * DYN_C + mb(close).min(7) as usize;
         if on {
             let m8 = 8 * m as i64;
-            let fp = self.cdf(m8 + 4) - self.cdf(m8 - 4);
-            let fneg = self.cdf(-m8 + 4) - self.cdf(-m8 - 4);
-            self.set_param(fneg, fp + fneg);
+            let (fp, fneg) = (self.cdf(m8 + 4, 0) - self.cdf(m8 - 4, 0), self.cdf(-m8 + 4, 0) - self.cdf(-m8 - 4, 0));
+            self.pin = self.stretch_ratio(fneg, fp + fneg);
+            if tune()[7] > 0 {
+                let (fp, fneg) = (self.cdf(m8 + 4, 1) - self.cdf(m8 - 4, 1), self.cdf(-m8 + 4, 1) - self.cdf(-m8 - 4, 1));
+                self.pin2 = self.stretch_ratio(fneg, fp + fneg);
+            }
         }
         let neg = self.bit(coder, S_SIGN, (v < 0) as u32);
         self.pin = 0;
+        self.pin2 = 0;
         if neg != 0 {
             -m
         } else {
