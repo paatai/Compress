@@ -33,7 +33,7 @@ interface SpeedRow {
   dec_mib: number
   fails: number
 }
-const speed = speedData as { files: number; bytes: number; rows: SpeedRow[] }
+const speed = speedData as { set: string; files: number; bytes: number; rows: SpeedRow[] }
 
 /** Size, speed and peak memory of every tool, one thread and all cores. */
 function SpeedTable() {
@@ -46,8 +46,10 @@ function SpeedTable() {
     <div className="space-y-3">
       <h3 className="text-lg font-semibold tracking-tight">Size, speed and memory</h3>
       <p className="max-w-3xl text-sm text-muted-foreground">
-        The same {speed.files} files, every tool run one process at a time on the same machine. Speed is megabytes of JPEG per second for the whole process; memory is
-        the largest peak of any file. Komla's fast mode beats JPEG XL's lossless JPEG transcoding (default settings) on all four at once.
+        {speed.files} JPEGs ({(speed.bytes / 1e6).toFixed(0)} MB) drawn at random for the final evaluation and run once, after Komla's code was frozen: every tool one
+        process at a time on the same machine, all tools on a file before the next. Speed is megabytes of JPEG per second for the whole process; memory is the largest
+        peak of any file. Komla's fast mode is the fastest and uses the least memory in every column; packJPG and the single-threaded Rust port of Lepton make these
+        files 0.3 and 0.2 points smaller, and paq8px much smaller at a thousandth of the speed.
       </p>
       <div className="overflow-x-auto rounded-xl border">
         <table className="w-full min-w-[44rem] text-sm">
@@ -85,7 +87,8 @@ function SpeedTable() {
         </table>
       </div>
       <p className="text-xs text-muted-foreground">
-        JPEG XL: cjxl --lossless_jpeg=1 at its default effort, djxl; brunsli and packJPG have no threads. Commands and per-group sizes: bench/results/JPEG_SPEED_REPORT.md.
+        JPEG XL: cjxl --lossless_jpeg=1 at its default effort (7), djxl; brunsli and packJPG have no threads; paq8px finished only part of the set in the time
+        available. Development and test sets, failures, commands and per-group sizes: bench/results/JPEG_SPEED_REPORT.md.
       </p>
     </div>
   )

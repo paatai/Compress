@@ -2,17 +2,20 @@
 """Size, time and peak memory of paq8px (single-threaded, very slow) on a JPEG set, several
 files at a time; results in bench/results/jpeg_paq8px_<set>.jsonl.
 
-paq8px takes hours per set, so it cannot join the interleaved timing of run_jpeg_speed.py; its
-times here come from `--jobs` parallel processes and are only indicative. Every output is
-decompressed and compared with the original byte for byte (SHA-256).
+paq8px takes hours per set, so it cannot join the interleaved timing of run_jpeg_speed.py; it
+runs `--jobs` files at a time, and its times are the processor time (user + system) of each
+process, which other work and pauses do not inflate. With `--shuffle SEED` the files run in a
+random order, so that the files done when it is stopped are a random sample of the set. Every
+output is decompressed and compared with the original byte for byte (SHA-256).
 
-usage: run_paq8px.py --set dev|test|heldout [--jobs N] [--skip-known results.jsonl]
+usage: run_paq8px.py --set dev|test|heldout [--jobs N] [--shuffle SEED] [--skip-known results.jsonl]
 """
 import argparse
 import concurrent.futures
 import hashlib
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -25,14 +28,14 @@ PAQ = os.path.join(TOOLS, "paq8px")
 
 
 def timed(cmd, cwd):
+    """Runs cmd under /usr/bin/time; returns (processor seconds, peak RSS in KiB)."""
     tf = os.path.join(cwd, ".time")
-    t0 = time.perf_counter()
-    r = subprocess.run(["/usr/bin/time", "-f", "%M", "-o", tf] + cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    dt = time.perf_counter() - t0
+    r = subprocess.run(["/usr/bin/time", "-f", "%M %U %S", "-o", tf] + cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if r.returncode != 0:
         how = f"crashed (signal {-r.returncode})" if r.returncode < 0 else f"failed (exit code {r.returncode})"
         raise RuntimeError(f"paq8px {how}: {r.stderr.decode(errors='replace')[-300:]}")
-    return dt, int(open(tf).read().split()[-1])
+    rss, user, sys_ = open(tf).read().split()[-3:]
+    return float(user) + float(sys_), int(rss)
 
 
 def one(img):
@@ -46,7 +49,7 @@ def one(img):
             dd, rd = timed([PAQ, "-d", "out.paq8px217", "d/x.jpg"], td)
             if hashlib.sha256(open(os.path.join(td, "d", "x.jpg"), "rb").read()).digest() != want:
                 raise RuntimeError("restored file differs from the original")
-            return {"bytes": size, "enc_s": round(de, 3), "dec_s": round(dd, 3), "enc_rss_kb": re_, "dec_rss_kb": rd, "ok": True}
+            return {"bytes": size, "enc_s": round(de, 3), "dec_s": round(dd, 3), "enc_rss_kb": re_, "dec_rss_kb": rd, "ok": True, "cpu_time": True}
         except Exception as e:
             return {"bytes": None, "enc_s": 0, "dec_s": 0, "enc_rss_kb": 0, "dec_rss_kb": 0, "ok": False, "error": str(e)[:300]}
 
@@ -56,6 +59,7 @@ def main():
     ap.add_argument("--set", default="dev")
     ap.add_argument("--jobs", type=int, default=3)
     ap.add_argument("--skip-known", default="", help="a jsonl file whose paq8px rows are reused")
+    ap.add_argument("--shuffle", type=int, default=0, help="run the files in a random order with this seed")
     args = ap.parse_args()
     base = os.path.join(HERE, "data", "jpeg", args.set)
     rpath = os.path.join(HERE, "results", f"jpeg_paq8px_{args.set}.jsonl")
@@ -77,6 +81,8 @@ def main():
                 rel = os.path.relpath(p, HERE)
                 if rel not in done:
                     imgs.append((p, rel, os.path.basename(dp)))
+    if args.shuffle:
+        random.Random(args.shuffle).shuffle(imgs)
     print(f"{len(imgs)} files to run, {len(done)} known", file=sys.stderr)
 
     def save():
