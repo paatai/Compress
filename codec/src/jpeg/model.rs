@@ -5,19 +5,29 @@
 //! block the order is chosen for prediction, not as in the JPEG stream:
 //!
 //! 1. the number of nonzero coefficients in the 7x7 block of AC coefficients with u, v >= 1,
-//! 2. those 49 coefficients in zigzag order until the count is exhausted,
+//! 2. those 49 coefficients in zigzag order until the count is exhausted, each predicted (with
+//!    sign) by an online least-squares fit per position from the same column of the block
+//!    above, the same row of the block to the left, the corner blocks and the coefficients of
+//!    this block already coded in that row, column and diagonals,
 //! 3. the first row (u, 0) and first column (0, v): each edge's nonzero count, then its values.
-//!    Each edge coefficient is predicted from the neighbouring blocks: by asking that the two
-//!    blocks join smoothly at the shared boundary (with and without extrapolating the gradient),
-//!    and from the same coefficient in the blocks above and to the left. The predictions are
-//!    blended with weights from their recent errors.
+//!    Each edge coefficient is predicted from the neighbouring blocks: by a least-squares fit
+//!    from the neighbour's column/row and this block's coefficients in it, by asking that the
+//!    two blocks join smoothly at the shared boundary (with and without extrapolating the
+//!    gradient), and from the same coefficient in the blocks above and to the left; the
+//!    predictions are blended with weights from their recent errors.
 //! 4. DC, predicted in the same way from the boundary pixels of the neighbouring blocks, given
-//!    this block's AC, and from the neighbours' DC values.
+//!    this block's AC, from the neighbours' DC values, and by a least-squares combination.
+//!
+//! Chroma coefficients are also predicted from the co-located luma (downsampled and
+//! transformed) and, for the second chroma component, from the first.
 //!
 //! Every value is binarised (zero?, exponent in unary, mantissa bits, sign) and every binary
-//! decision is predicted by a dozen adaptive context models, plus one that compares the
-//! prediction with the threshold the decision tests, combined by gated logistic mixers, a second
-//! mixing layer and adaptive probability maps. Only integer arithmetic is used.
+//! decision is predicted by 16 adaptive context models, by one that compares the prediction
+//! with the threshold the decision tests, and by the probabilities that a logistic and a Laplace
+//! distribution around the prediction give the decision; gated logistic mixers, a second mixing
+//! layer and adaptive probability maps combine them. All arithmetic is integer except the
+//! least-squares fits, which use IEEE-754 basic operations in a fixed order (identical results
+//! on every platform and in WebAssembly).
 
 use super::format::{Frame, NATURAL};
 use crate::coder::BitCoder;
@@ -42,27 +52,23 @@ const PART_DC: usize = 2;
 const DYN_B: usize = 24;
 const DYN_C: usize = 8;
 
-/// Model parameters; KOMLA_JTUNE="i=v,..." overrides them for experiments (both sides must agree).
-const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 16, 2, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 32, 1, 16, 1, 2, 8];
-
-fn tune() -> &'static [i32; 24] {
-    static T: std::sync::OnceLock<[i32; 24]> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = TUNE_DEFAULT;
-        if let Ok(s) = std::env::var("KOMLA_JTUNE") {
-            for kv in s.split(',').filter(|s| !s.is_empty()) {
-                if let Some((k, v)) = kv.split_once('=') {
-                    if let (Ok(k), Ok(v)) = (k.parse::<usize>(), v.parse::<i32>()) {
-                        if k < 24 {
-                            t[k] = v;
-                        }
-                    }
-                }
-            }
-        }
-        t
-    })
-}
+/// Hit-count limit of the context counters (adaptation rate 1/(n + 1.5) until then).
+const CTR_LIMIT: u32 = 255;
+/// Learning rates of the first-layer mixers, the final mixer and the count mixer.
+const LR: i32 = 300;
+const LR_FINAL: i32 = 200;
+const LR_COUNT: i32 = 400;
+/// Extra mixer learning rate at the start of a stripe, decaying to 0 over this many blocks.
+const LR_BOOST: i32 = 800;
+const LR_BOOST_BLOCKS: usize = 4000;
+const APM_RATE: u32 = 7;
+/// Least-squares fits: forgetting window (samples), ridge, updates between solves.
+const LS_WINDOW: f64 = 4096.0;
+const LS_RIDGE: f64 = 64.0;
+const LS_INTERVAL: u32 = 32;
+/// A 7x7 coefficient counts as expected nonzero (for the count contexts) if its least-squares
+/// prediction is at least this many eighths of a quantization step.
+const LS_NONZERO8: u32 = 8;
 
 /// cos(m * pi / 16), m = 0..8
 const COS16: [f64; 9] = [
@@ -250,15 +256,12 @@ pub struct Model {
     pin2: i32,
     /// exp(-i/256) * 65536 for the Laplace distribution
     lap: Vec<u32>,
-    /// running mean of |value| x 64 per (class, position, nonzeros left, neighbour magnitude)
-    emag: Vec<i32>,
     /// 7x7 coefficients predicted by online least squares (per class and position) from the
     /// blocks above and to the left, the corner blocks, the coefficients of this block already
     /// coded in the same row and column, and for chroma the predictions from luma / Cb
     ls: Vec<Ols>,
     ls_feats: Vec<Vec<(u8, u8)>>,
     ls_err: Vec<i32>,
-    ls_on: bool,
     /// prediction for the sign decision (defaults to `pred8`)
     spred8: i32,
     edge_err: Vec<[i32; 7]>,
@@ -273,7 +276,6 @@ pub struct Model {
     /// cost accounting (KOMLA_STATS): bits per decision class, current class base
     stats: Option<Box<[f64; 32]>>,
     part: usize,
-    dbg: [[f64; 8]; 8],
 }
 
 const ZERO_BLOCK: [i16; 64] = [0; 64];
@@ -289,12 +291,11 @@ fn cost(p1: u32, bit: u32) -> f64 {
 impl Model {
     pub fn new(f: &Frame, rows: &[(usize, usize)], coded: &[(bool, bool)]) -> Self {
         let t = tables();
-        let tu = tune();
         let total: usize = rows.iter().zip(f.comps.iter()).map(|(r, c)| (r.1 - r.0) * c.pw).sum();
         let cap = (usize::BITS - total.max(1).leading_zeros()).clamp(12, 16);
         let lb = [14u32, 16, 16, 16, 16, 16, 16, 16, 20, 20, 10, 16, 16, 18, 16, 16];
-        let tabs = lb.iter().map(|&b| CtxTable::with_init(b.min(cap), SLOT_BITS, tu[0] as u32, CTR_INIT | tu[9] as u32)).collect();
-        let nzt = (0..5).map(|_| CtxTable::with_init(12.min(cap), 6, tu[4] as u32, CTR_INIT | tu[9] as u32)).collect();
+        let tabs = lb.iter().map(|&b| CtxTable::with_init(b.min(cap), SLOT_BITS, CTR_LIMIT, CTR_INIT | 1)).collect();
+        let nzt = (0..5).map(|_| CtxTable::with_init(12.min(cap), 6, CTR_LIMIT, CTR_INIT | 1)).collect();
         let l0 = &f.comps[0];
         let planes = f
             .comps
@@ -339,20 +340,20 @@ impl Model {
             tabs,
             nzt,
             m: [
-                Mixer::new(NIN, SLOTS * 8, tu[1], tu[10]),
-                Mixer::new(NIN, SLOTS * 130, tu[1], tu[10]),
-                Mixer::new(NIN, SLOTS * 80, tu[1], tu[10]),
-                Mixer::new(NIN, SLOTS * 3 * 16, tu[1], tu[10]),
+                Mixer::new(NIN, SLOTS * 8, LR, 1 << 13),
+                Mixer::new(NIN, SLOTS * 130, LR, 1 << 13),
+                Mixer::new(NIN, SLOTS * 80, LR, 1 << 13),
+                Mixer::new(NIN, SLOTS * 3 * 16, LR, 1 << 13),
             ],
-            mf: Mixer::new(5, SLOTS * 8, tu[2], 18000),
-            apm1: Apm::new(SLOTS * 256, tu[3] as u32, t),
-            apm2: Apm::new(SLOTS * 512, tu[3] as u32, t),
-            apm3: Apm::new(SLOTS * 3 * 32, tu[3] as u32, t),
+            mf: Mixer::new(5, SLOTS * 8, LR_FINAL, 18000),
+            apm1: Apm::new(SLOTS * 256, APM_RATE, t),
+            apm2: Apm::new(SLOTS * 512, APM_RATE, t),
+            apm3: Apm::new(SLOTS * 3 * 32, APM_RATE, t),
             x: [0; NIN],
             sel: [0; 3],
             actx: [0; 2],
-            nzm: Mixer::new(6, 64 * 8, tu[5], 1 << 14),
-            nzapm: Apm::new(64 * 32, tu[3] as u32, t),
+            nzm: Mixer::new(6, 64 * 8, LR_COUNT, 1 << 14),
+            nzapm: Apm::new(64 * 32, APM_RATE, t),
             dyn_t: vec![CTR_INIT; 3 * SLOTS * DYN_B * DYN_C],
             dyn_base: 0,
             dyn_idx: 0,
@@ -362,22 +363,19 @@ impl Model {
             pin: 0,
             pin2: 0,
             lap: (0..4096).map(|i| (crate::detmath::exp(-(i as f64) / 256.0) * 65536.0).round() as u32).collect(),
-            emag: vec![64; 2 * 64 * 12 * 16],
-            ls: (0..2 * 49).map(|i| Ols::new(ls_feats(i / 49, i % 49).len(), 1.0 - 1.0 / tu[16].max(16) as f64, tu[17] as f64, tu[18].max(1) as u32)).collect(),
+            ls: (0..2 * 49).map(|i| Ols::new(ls_feats(i / 49, i % 49).len(), 1.0 - 1.0 / LS_WINDOW, LS_RIDGE, LS_INTERVAL)).collect(),
             ls_feats: (0..2 * 49).map(|i| ls_feats(i / 49, i % 49)).collect(),
             ls_err: vec![256; 2 * 49],
-            ls_on: tu[19] != 0,
             spred8: 0,
             edge_err: vec![[256; 7]; 3 * 2 * 8],
-            els: (0..2 * 2 * 8).map(|i| Ols::new(edge_ls_feats(i / 16, (i / 8) % 2, (i % 8).max(1)).len(), 1.0 - 1.0 / tu[16].max(16) as f64, tu[17] as f64, tu[18].max(1) as u32)).collect(),
+            els: (0..2 * 2 * 8).map(|i| Ols::new(edge_ls_feats(i / 16, (i / 8) % 2, (i % 8).max(1)).len(), 1.0 - 1.0 / LS_WINDOW, LS_RIDGE, LS_INTERVAL)).collect(),
             els_feats: (0..2 * 2 * 8).map(|i| edge_ls_feats(i / 16, (i / 8) % 2, (i % 8).max(1))).collect(),
             dc_err: [[256; 6]; 2],
-            dls: (0..2).map(|_| Ols::new(10, 1.0 - 1.0 / tu[16].max(16) as f64, tu[17] as f64, tu[18].max(1) as u32)).collect(),
+            dls: (0..2).map(|_| Ols::new(10, 1.0 - 1.0 / LS_WINDOW, LS_RIDGE, LS_INTERVAL)).collect(),
             gcfl: [[0; 4]; 4],
             planes,
             stats: if std::env::var_os("KOMLA_STATS").is_some() { Some(Box::new([0.0; 32])) } else { None },
             part: 1,
-            dbg: [[0.0; 8]; 8],
         }
     }
 
@@ -389,10 +387,6 @@ impl Model {
                 out += &format!("  {name:<14} {:>10.0} B {:>6.2}%  {:>10.0} decisions {:.3} bits each\n", s[i] / 8.0, 100.0 * s[i] / total.max(1.0), s[16 + i], s[i] / s[16 + i].max(1.0));
             }
             eprint!("{out}");
-            for (i, d) in self.dbg.iter().enumerate().skip(1) {
-                let n = d[6].max(1.0) * 8.0;
-                eprintln!("  edge i={i}: |F| {:.3}  |F-P| lak {:.3} grad {:.3} nb {:.3} side {:.3} blend {:.3}", d[0] / n, d[1] / n, d[2] / n, d[3] / n, d[4] / n, d[5] / n);
-            }
         }
     }
 
@@ -434,7 +428,7 @@ impl Model {
         let pc = self.apm2.pp(df, self.actx[1] * SLOTS + slot);
         let part = self.dyn_base / (SLOTS * DYN_B * DYN_C);
         let pd = self.apm3.pp(df, (part * 32 + ((self.pin + 2048) >> 7).clamp(0, 31) as usize) * SLOTS + slot);
-        let p = if tune()[8] == 1 { clamp_p((3 * p0 + 2 * pa + 2 * pc + pd) >> 3) } else if tune()[8] == 2 { clamp_p((p0 + pa + pc + pd) >> 2) } else { clamp_p((2 * p0 + pa + pc) >> 2) };
+        let p = clamp_p((p0 + pa + pc + pd) >> 2);
         let b = coder.code(bit, p);
         if let Some(s) = self.stats.as_mut() {
             let kind = match slot {
@@ -469,8 +463,7 @@ impl Model {
             let d = ((x8 - self.pmu8 as i64) * 256 / self.ps8 as i64).clamp(-2047, 2047) as i32;
             self.t.squash(d) as i64
         } else {
-            let b8 = (self.ps8 as i64 * tune()[7].max(1) as i64 / 16).max(1);
-            let d = ((x8 - self.pmu8 as i64) * 256 / b8).clamp(-4095, 4095);
+            let d = ((x8 - self.pmu8 as i64) * 256 / self.ps8 as i64).clamp(-4095, 4095);
             if d < 0 {
                 (self.lap[(-d) as usize] >> 1) as i64
             } else {
@@ -502,7 +495,7 @@ impl Model {
     #[inline(always)]
     fn set_param(&mut self, a: i64, lo: i64, b: Option<i64>) {
         self.pin = self.stretch_ratio(self.mass(a, b, 0), if lo == 0 { 65536 } else { self.mass(lo, b, 0) });
-        self.pin2 = if tune()[7] > 0 { self.stretch_ratio(self.mass(a, b, 1), if lo == 0 { 65536 } else { self.mass(lo, b, 1) }) } else { 0 };
+        self.pin2 = self.stretch_ratio(self.mass(a, b, 1), if lo == 0 { 65536 } else { self.mass(lo, b, 1) });
     }
 
     /// Codes a value given contexts already selected in all tables. `self.pred8` is the
@@ -572,10 +565,8 @@ impl Model {
             let m8 = 8 * m as i64;
             let (fp, fneg) = (self.cdf(m8 + 4, 0) - self.cdf(m8 - 4, 0), self.cdf(-m8 + 4, 0) - self.cdf(-m8 - 4, 0));
             self.pin = self.stretch_ratio(fneg, fp + fneg);
-            if tune()[7] > 0 {
-                let (fp, fneg) = (self.cdf(m8 + 4, 1) - self.cdf(m8 - 4, 1), self.cdf(-m8 + 4, 1) - self.cdf(-m8 - 4, 1));
-                self.pin2 = self.stretch_ratio(fneg, fp + fneg);
-            }
+            let (fp, fneg) = (self.cdf(m8 + 4, 1) - self.cdf(m8 - 4, 1), self.cdf(-m8 + 4, 1) - self.cdf(-m8 - 4, 1));
+            self.pin2 = self.stretch_ratio(fneg, fp + fneg);
         }
         let neg = self.bit(coder, S_SIGN, (v < 0) as u32);
         self.pin = 0;
@@ -626,8 +617,7 @@ impl Model {
     pub fn code<C: BitCoder>(&mut self, coder: &mut C, planes: &mut [&mut [i16]], progress: &mut dyn FnMut(f32)) {
         let total: usize = self.planes.iter().map(|p| p.w * p.h).sum::<usize>().max(1);
         let mut done = 0usize;
-        let tu = tune();
-        let (lr0, boost, span) = (tu[1], tu[11], tu[12].max(1) as usize);
+        let (lr0, boost, span) = (LR, LR_BOOST, LR_BOOST_BLOCKS);
         for ci in 0..self.planes.len() {
             let (w, h) = (self.planes[ci].w, self.planes[ci].h);
             for by in 0..h {
@@ -766,37 +756,22 @@ impl Model {
             // how many 7x7 coefficients the least-squares models expect to be nonzero, from the
             // neighbours alone (this block's own features still zero)
             let (mut npr, mut spr) = (0u32, 0u32);
-            if self.ls_on && tune()[23] > 0 {
-                let zero = [0i16; 64];
-                for j in 0..49 {
-                    let lsi = ucls * 49 + j;
-                    let mut x = [0f64; 44];
-                    for (f, &(src, idx)) in self.ls_feats[lsi].iter().enumerate() {
-                        let idx = idx as usize;
-                        x[f] = match src {
-                            0 => (a[idx] as i32 * q[idx]) as f64,
-                            1 => (l[idx] as i32 * q[idx]) as f64,
-                            2 => (al[idx] as i32 * q[idx]) as f64,
-                            3 => (ar[idx] as i32 * q[idx]) as f64,
-                            4 => (zero[idx] as i32 * q[idx]) as f64,
-                            5 => lc[idx] as f64,
-                            6 => cc[idx] as f64,
-                            _ => 64.0,
-                        };
-                    }
-                    let n = INTERIOR[j];
-                    let pr = (self.ls[lsi].predict(&x) * 8.0 / q[n] as f64).abs();
-                    let pr = if pr.is_finite() { pr.min(1e6) as u32 } else { 0 };
-                    npr += (pr >= tune()[23] as u32) as u32;
-                    spr += pr >> 3;
-                }
+            let zero = [0i16; 64];
+            for j in 0..49 {
+                let lsi = ucls * 49 + j;
+                let x = ls_input(&self.ls_feats[lsi], [&a, &l, &al, &ar, &zero], &q, &lc, &cc);
+                let n = INTERIOR[j];
+                let pr = (self.ls[lsi].predict(&x) * 8.0 / q[n] as f64).abs();
+                let pr = if pr.is_finite() { pr.min(1e6) as u32 } else { 0 };
+                npr += (pr >= LS_NONZERO8) as u32;
+                spr += pr >> 3;
             }
             let hs = [
                 pred * 2 + cls,
                 hash2(1, (nz_a.min(31) << 6) | (nz_l.min(31) << 1) | cls),
                 hash2(2, (lnz.min(49) << 8) | (mb(lact) << 4) | (cls << 3) | (has_a as u32) << 1 | has_l as u32),
                 hash2(3, (nz_al << 8) | (nz_ar << 1) | cls),
-                if self.ls_on && tune()[23] > 0 { hash2(5, (npr << 10) | (mb(spr) << 6) | (nzb(pred) << 2) | cls) } else { hash2(4, (pred << 4) | (mb(lact) << 1) | cls) },
+                hash2(5, (npr << 10) | (mb(spr) << 6) | (nzb(pred) << 2) | cls),
             ];
             self.count(coder, nz_true, &hs, 49, ucls * 2 + (has_a && has_l) as usize, nzb(pred) as usize * 2 + ucls)
         } else {
@@ -830,44 +805,17 @@ impl Model {
             let c9 = if u > 1 && v > 1 { cur[n - 9] as i32 } else { 0 };
             let px = if has_cc { pr8[n] } else { pc8[n] };
             let lsi = ucls * 49 + j;
-            let use_ls = self.ls_on;
-            let pls = if use_ls {
-                let mut x = [0f64; 44];
-                for (i, &(src, idx)) in self.ls_feats[lsi].iter().enumerate() {
-                    let idx = idx as usize;
-                    x[i] = match src {
-                        0 => (a[idx] as i32 * q[idx]) as f64,
-                        1 => (l[idx] as i32 * q[idx]) as f64,
-                        2 => (al[idx] as i32 * q[idx]) as f64,
-                        3 => (ar[idx] as i32 * q[idx]) as f64,
-                        4 => (cur[idx] as i32 * q[idx]) as f64,
-                        5 => lc[idx] as f64,
-                        6 => cc[idx] as f64,
-                        _ => 64.0,
-                    };
-                }
-                let pr = self.ls[lsi].predict(&x) * 8.0 / q[n] as f64;
-                if pr.is_finite() { pr.round().clamp(-1e6, 1e6) as i32 } else { 0 }
-            } else {
-                0
-            };
+            let x = ls_input(&self.ls_feats[lsi], [&a, &l, &al, &ar, &cur], &q, &lc, &cc);
+            let pls = ls_round(self.ls[lsi].predict(&x) * 8.0 / q[n] as f64);
             let lsconf = mb((self.ls_err[lsi] >> 5) as u32).min(7);
             let prev_c = if j > 0 { cur[INTERIOR[j - 1]] as i32 } else { 0 };
             let (tail_a, tail_l) = ((mask_a >> k).count_ones().min(7), (mask_l >> k).count_ones().min(7));
             let hs: [u32; NCTX] = [
                 (k << 9) | (nzb(left) << 5) | (mb(wavg) << 1) | cls,
                 hash2(10 + k, (mb(c1.unsigned_abs()) << 12) | (mb(c8.unsigned_abs()) << 8) | (left.min(7) << 1) | cls),
-                if self.ls_on {
-                    hash2(20 + k, (pb(pls) << 8) | (mb(wavg) << 3) | (lsconf.min(3) << 1) | cls)
-                } else {
-                    hash2(20 + k, (((clip(va, 4) + 4) as u32) << 8) | (((clip(vl, 4) + 4) as u32) << 4) | (cls << 1))
-                },
+                hash2(20 + k, (pb(pls) << 8) | (mb(wavg) << 3) | (lsconf.min(3) << 1) | cls),
                 hash2(30 + k, (nz77.min(49) << 8) | ((nz77 - left).min(31) << 2) | cls),
-                if self.ls_on {
-                    hash2(40 + k, (((clip(r8(pls), 15) + 16) as u32) << 10) | (nzb(left) << 5) | (lsconf << 1) | cls)
-                } else {
-                    hash2(40 + k, (mb(var.unsigned_abs()) << 12) | (mb(val.unsigned_abs()) << 8) | (mb(wavg) << 2) | cls)
-                },
+                hash2(40 + k, (((clip(r8(pls), 15) + 16) as u32) << 10) | (nzb(left) << 5) | (lsconf << 1) | cls),
                 hash2(50 + k, (mb(act) << 8) | (nzb(left) << 2) | cls),
                 hash2(60 + k, if luma { (mb(rem) << 8) | (run.min(15) << 2) } else { (pb(px) << 8) | (nzb(left) << 3) | 1 }),
                 hash2(70 + k, (run.min(15) << 8) | (nzb(left) << 3) | cls),
@@ -878,11 +826,7 @@ impl Model {
                 hash2(120 + k, (mb(act_a) << 10) | (mb(act_l) << 6) | (nzb(left) << 2) | cls),
                 hash2(130 + k, (((clip(prev_c, 8) + 8) as u32) << 12) | (mb(last_nz) << 8) | (run.min(15) << 2) | cls),
                 hash2(140 + k, (mb(va.unsigned_abs() + vl.unsigned_abs()) << 10) | (mb(c1.unsigned_abs() + c8.unsigned_abs()) << 6) | (nzb(left) << 2) | cls),
-                if self.ls_on {
-                    hash2(150 + k, (pb(pls) << 10) | (nzb(left) << 5) | (lsconf << 1) | cls)
-                } else {
-                    hash2(150 + k, (tail_a << 12) | (tail_l << 9) | (mb(wavg) << 5) | (left.min(7) << 1) | cls)
-                },
+                hash2(150 + k, (pb(pls) << 10) | (nzb(left) << 5) | (lsconf << 1) | cls),
             ];
             for (i, &h) in hs.iter().enumerate() {
                 self.tabs[i].set(h);
@@ -890,28 +834,16 @@ impl Model {
             self.sel = [ucls, k as usize * 2 + ucls, (nzb(left) as usize) * 4 + (mb(wavg) as usize).min(3)];
             self.actx = [k as usize * 2 + ucls, (mb(wavg) as usize) * 16 + nzb(left) as usize];
             self.pred8 = if luma { 2 * wavg as i32 } else { px };
-            self.pmu8 = if use_ls { pls } else if luma { 0 } else { px };
-            self.spred8 = if use_ls { pls } else { self.pred8 };
-            let ei = ((ucls * 64 + k as usize) * 12 + nzb(left) as usize) * 16 + mb(wavg) as usize;
-            self.ps8 = match tune()[15] {
-                0 => 0,
-                f if f > 0 => (wavg as i32 * f / 16).max(2),
-                f => (self.emag[ei] * -f / 64 / 11).max(2),
-            };
-            if use_ls && tune()[20] > 0 {
-                self.ps8 = (self.ls_err[lsi] * tune()[20] / 64).max(2);
-            }
+            self.pmu8 = pls;
+            self.spred8 = pls;
+            self.ps8 = (self.ls_err[lsi] / 4).max(2);
             self.dyn_base = PART_INTERIOR * SLOTS * DYN_B * DYN_C + (k as usize >> 3).min(7);
             let forced = left == rem;
             self.part = 1;
             let val = self.value(coder, cur[n] as i32, !forced);
             cur[n] = val as i16;
-            let em = &mut self.emag[ei];
-            *em += (64 * val.unsigned_abs().min(1 << 16) as i32 - *em) >> 5;
-            if use_ls {
-                self.ls[lsi].update((val * q[n]) as f64);
-                track(&mut self.ls_err[lsi], 8 * val - pls);
-            }
+            self.ls[lsi].update((val * q[n]) as f64);
+            track(&mut self.ls_err[lsi], 8 * val - pls);
             if val != 0 {
                 left -= 1;
                 act += val.unsigned_abs();
@@ -935,39 +867,18 @@ impl Model {
             // predictions of all seven coefficients of this edge (1/8 quantization steps)
             let mut pr = [[0i32; 7]; 8];
             let pcls = ci.min(2);
-            let avail = [has_n, has_n, has_n, has_s, !luma, has_cc, (has_n || has_s) && self.ls_on];
+            let avail = [has_n, has_n, has_n, has_s, !luma, has_cc, has_n || has_s];
             let mut bl = [(0i32, 0i32); 8];
             let mut npred = 0u32;
             let mut spred = 0u32;
             for i in 1..8 {
                 let n = idx(i);
                 let (p1, p2) = if has_n { self.edge_pred(&cur, nb, edge, i, &q) } else { (0, 0) };
-                let pls = if self.ls_on {
-                    let ei = (ucls * 2 + edge) * 8 + i;
-                    let mut x = [0f64; 40];
-                    for (f, &(src, idx)) in self.els_feats[ei].iter().enumerate() {
-                        let idx = idx as usize;
-                        x[f] = match src {
-                            0 => (a[idx] as i32 * q[idx]) as f64,
-                            1 => (l[idx] as i32 * q[idx]) as f64,
-                            2 => (al[idx] as i32 * q[idx]) as f64,
-                            3 => (ar[idx] as i32 * q[idx]) as f64,
-                            4 => (cur[idx] as i32 * q[idx]) as f64,
-                            5 => lc[idx] as f64,
-                            6 => cc[idx] as f64,
-                            _ => 64.0,
-                        };
-                    }
-                    let pr = self.els[ei].predict(&x) * 8.0 / q[n] as f64;
-                    if pr.is_finite() { pr.round().clamp(-1e6, 1e6) as i32 } else { 0 }
-                } else {
-                    0
-                };
+                let ei = (ucls * 2 + edge) * 8 + i;
+                let x = ls_input(&self.els_feats[ei], [&a, &l, &al, &ar, &cur], &q, &lc, &cc);
+                let pls = ls_round(self.els[ei].predict(&x) * 8.0 / q[n] as f64);
                 pr[i] = [p1, p2, 8 * nb[n] as i32, 8 * side[n] as i32, pc8[n], pr8[n], pls];
                 bl[i] = blend(&pr[i], &avail, &self.edge_err[(pcls * 2 + edge) * 8 + i]);
-                if tune()[21] == 3 && self.ls_on {
-                    bl[i].0 = pls;
-                }
                 npred += (bl[i].0.unsigned_abs() >= 4) as u32;
                 spred += bl[i].0.unsigned_abs() >> 3;
             }
@@ -1037,11 +948,11 @@ impl Model {
                 }
                 self.sel = [(1 + edge) * 2 + ucls, k as usize * 2 + ucls, 48 + pb(pbl) as usize / 2];
                 self.actx = [128 + (pb(pbl) as usize) * 2 + ucls, 256 + (pb(pbl) as usize) * 4 + (conf as usize).min(3)];
-                let pc_ = if tune()[21] >= 1 && self.ls_on { pr[i][6] } else if tune()[21] == 2 && self.ls_on { (pbl + pr[i][6]) / 2 } else { pbl };
+                let pc_ = pr[i][6];
                 self.pred8 = pc_;
                 self.spred8 = pc_;
                 self.pmu8 = pc_;
-                self.ps8 = (econf * tune()[13] / 64).max(2);
+                self.ps8 = (econf * 12 / 64).max(2);
                 self.dyn_base = PART_EDGE * SLOTS * DYN_B * DYN_C + conf as usize;
                 self.part = 6;
                 let val = self.value(coder, cur[n] as i32, left != 8 - i as u32);
@@ -1051,23 +962,9 @@ impl Model {
                     act += val.unsigned_abs();
                 }
             }
-            if self.stats.is_some() && has_n && has_s && luma {
-                for i in 1..8 {
-                    let v8 = 8 * cur[idx(i)] as i32;
-                    let d = &mut self.dbg[i];
-                    d[0] += v8.unsigned_abs() as f64;
-                    for j in 0..4 {
-                        d[1 + j] += (v8 - pr[i][j]).unsigned_abs() as f64;
-                    }
-                    d[5] += (v8 - bl[i].0).unsigned_abs() as f64;
-                    d[6] += 1.0;
-                }
-            }
-            if self.ls_on {
-                for i in 1..8 {
-                    let n = idx(i);
-                    self.els[(ucls * 2 + edge) * 8 + i].update((cur[n] as i32 * q[n]) as f64);
-                }
+            for i in 1..8 {
+                let n = idx(i);
+                self.els[(ucls * 2 + edge) * 8 + i].update((cur[n] as i32 * q[n]) as f64);
             }
             // learn the predictors' errors and record this block's prediction errors
             let errs = &mut self.edge_err[(pcls * 2 + edge) * 8..(pcls * 2 + edge) * 8 + 8];
@@ -1128,8 +1025,7 @@ impl Model {
             };
             dav[4] = true;
         }
-        let dmode = if self.ls_on { tune()[22] } else { 0 };
-        if dmode > 0 && (has_a || has_l) {
+        if has_a || has_l {
             let (b0, _) = blend(&dp[..5], &dav[..5], &self.dc_err[ucls][..5]);
             let f = |avail: bool, v: i32| if avail { v as f64 } else { b0 as f64 };
             let x = [
@@ -1148,10 +1044,7 @@ impl Model {
             dp[5] = if pr.is_finite() { pr.round().clamp(-1e7, 1e7) as i32 } else { b0 };
             dav[5] = true;
         }
-        let (mut pdc, econf) = blend(&dp, &dav, &self.dc_err[ucls]);
-        if dmode == 1 && dav[5] {
-            pdc = dp[5];
-        }
+        let (pdc, econf) = blend(&dp, &dav, &self.dc_err[ucls]);
         let pred_dc = r8(pdc);
         let (mut mx, mut mn) = (i32::MIN, i32::MAX);
         for j in 0..4 {
@@ -1193,7 +1086,7 @@ impl Model {
             self.pred8 = pdc - 8 * pred_dc;
             self.spred8 = self.pred8;
             self.pmu8 = pdc - 8 * pred_dc;
-            self.ps8 = (econf * tune()[14] / 64).max(2);
+            self.ps8 = (econf * 12 / 64).max(2);
             self.dyn_base = PART_DC * SLOTS * DYN_B * DYN_C + (conf as usize).min(7);
             self.part = 10;
             let r = self.value(coder, cur[0] as i32 - pred_dc, true);
@@ -1346,6 +1239,31 @@ impl Model {
             }
         }
         out
+    }
+}
+
+/// Least-squares input vector: the features named by (source, natural index), dequantized.
+/// `blocks`: above, left, above-left, above-right, this block.
+fn ls_input(feats: &[(u8, u8)], blocks: [&[i16; 64]; 5], q: &[i32; 64], lc: &[i64; 64], cc: &[i64; 64]) -> [f64; 44] {
+    let mut x = [0f64; 44];
+    for (i, &(src, idx)) in feats.iter().enumerate() {
+        let idx = idx as usize;
+        x[i] = match src {
+            0..=4 => (blocks[src as usize][idx] as i32 * q[idx]) as f64,
+            5 => lc[idx] as f64,
+            6 => cc[idx] as f64,
+            _ => 64.0,
+        };
+    }
+    x
+}
+
+/// A least-squares prediction in 1/8 quantization steps.
+fn ls_round(pr: f64) -> i32 {
+    if pr.is_finite() {
+        pr.round().clamp(-1e6, 1e6) as i32
+    } else {
+        0
     }
 }
 
