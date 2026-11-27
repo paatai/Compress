@@ -478,6 +478,22 @@ impl<'a, 'c> SeqScan<'a, 'c> {
     /// Encodes the MCUs of frame MCU rows `my0..my1`; `blk(c, bx, by)` returns a block of
     /// component c (absolute block coordinates).
     pub fn rows<'b>(&mut self, f: &Frame, s: &Scan, my0: usize, my1: usize, blk: impl Fn(usize, usize, usize) -> &'b [i16; 64]) -> Result<(), String> {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU has every feature the function is compiled for.
+            return unsafe { self.rows_bmi(f, s, my0, my1, blk) };
+        }
+        self.rows_impl(f, s, my0, my1, blk)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    unsafe fn rows_bmi<'b>(&mut self, f: &Frame, s: &Scan, my0: usize, my1: usize, blk: impl Fn(usize, usize, usize) -> &'b [i16; 64]) -> Result<(), String> {
+        self.rows_impl(f, s, my0, my1, blk)
+    }
+
+    #[inline(always)]
+    fn rows_impl<'b>(&mut self, f: &Frame, s: &Scan, my0: usize, my1: usize, blk: impl Fn(usize, usize, usize) -> &'b [i16; 64]) -> Result<(), String> {
         if !self.units.is_empty() {
             for my in my0..my1 {
                 for mx in 0..f.mcux {
@@ -607,6 +623,14 @@ impl<'a, 'c> ProgScan<'a, 'c> {
     pub fn rows<'b>(&mut self, f: &Frame, s: &Scan, my0: usize, my1: usize, last: bool, blk: impl Fn(usize, usize, usize) -> &'b [i16; 64]) -> Result<(), String> {
         let mut out = std::mem::take(&mut self.out);
         let mut w = Bw { out: &mut out, c: self.c, n: self.n };
+        #[cfg(target_arch = "x86_64")]
+        let res = if std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU has every feature the function is compiled for.
+            unsafe { self.rows_bmi(&mut w, f, s, my0, my1, last, blk) }
+        } else {
+            self.rows_into(&mut w, f, s, my0, my1, last, blk)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
         let res = self.rows_into(&mut w, f, s, my0, my1, last, blk);
         self.c = w.c;
         self.n = w.n;
@@ -614,7 +638,15 @@ impl<'a, 'c> ProgScan<'a, 'c> {
         res
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
     #[allow(clippy::too_many_arguments)]
+    unsafe fn rows_bmi<'b>(&mut self, w: &mut Bw, f: &Frame, s: &Scan, my0: usize, my1: usize, last: bool, blk: impl Fn(usize, usize, usize) -> &'b [i16; 64]) -> Result<(), String> {
+        self.rows_into(w, f, s, my0, my1, last, blk)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     fn rows_into<'b>(&mut self, w: &mut Bw, f: &Frame, s: &Scan, my0: usize, my1: usize, last: bool, blk: impl Fn(usize, usize, usize) -> &'b [i16; 64]) -> Result<(), String> {
         if !self.units.is_empty() {
             for my in my0..my1 {

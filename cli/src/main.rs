@@ -36,8 +36,6 @@ fn main() {
         "info" => cmd_info(&args[1..]),
         "bench" => cmd_bench(&args[1..]),
         "pixhash" => cmd_pixhash(&args[1..]),
-        "jfast" => cmd_jfast(&args[1..]),
-        "jblob" => cmd_jblob(&args[1..]),
         "jtrain" => cmd_jtrain(&args[1..]),
         "--version" | "-V" => {
             println!("komla {}", env!("CARGO_PKG_VERSION"));
@@ -228,60 +226,6 @@ fn cmd_jtrain(args: &[String]) -> Result<(), String> {
     let output = output.ok_or("-o output file needed")?;
     std::fs::write(&output, &priors).map_err(|e| e.to_string())?;
     println!("{} files, {} bytes of priors -> {}", files.len(), priors.len(), output.display());
-    Ok(())
-}
-
-/// Development aid: header blob coding speed.
-fn cmd_jblob(args: &[String]) -> Result<(), String> {
-    let (mut tin, mut tout, mut te, mut td) = (0usize, 0usize, 0f64, 0f64);
-    for a in args {
-        let bytes = read(Path::new(a))?;
-        let Ok(l) = jpeg::format::parse(&bytes, true) else { continue };
-        let t0 = Instant::now();
-        let c = jpeg::bytecm::encode(&l.blob);
-        let e = t0.elapsed().as_secs_f64();
-        let t1 = Instant::now();
-        let d = jpeg::bytecm::decode(&c, l.blob.len())?;
-        let dd = t1.elapsed().as_secs_f64();
-        assert_eq!(d, l.blob);
-        tin += l.blob.len();
-        tout += c.len();
-        te += e;
-        td += dd;
-    }
-    println!("blob {tin} -> {tout} ({:.1}%), enc {:.2} MB/s, dec {:.2} MB/s", 100.0 * tout as f64 / tin as f64, tin as f64 / te / 1e6, tin as f64 / td / 1e6);
-    Ok(())
-}
-
-/// Development aid: fast-model size and stage timings for JPEG files.
-fn cmd_jfast(args: &[String]) -> Result<(), String> {
-    let (mut tin, mut tout, mut th, mut te, mut td, mut traw) = (0usize, 0usize, 0f64, 0f64, 0f64, 0usize);
-    for a in args {
-        let bytes = read(Path::new(a))?;
-        let blob = jpeg::format::parse(&bytes, true).map(|l| jpeg::bytecm::encode(&l.blob).len()).unwrap_or(0);
-        match jpeg::fast_experiment(&bytes) {
-            Ok((ar, raw, h, e, d)) => {
-                let total = ar + raw + blob;
-                println!("{a}\t{}\t{ar}\t{raw}\t{blob}\t{:.2}%\thuff {:.1} ms\tenc {:.1} ms\tdec {:.1} ms", bytes.len(), 100.0 * (1.0 - total as f64 / bytes.len() as f64), h * 1e3, e * 1e3, d * 1e3);
-                tin += bytes.len();
-                tout += total;
-                traw += raw;
-                th += h;
-                te += e;
-                td += d;
-            }
-            Err(e) => println!("{a}\terror: {e}"),
-        }
-    }
-    let mb = tin as f64 / 1e6;
-    println!(
-        "TOTAL\t{tin}\t{tout}\t{:.3}% smaller\traw {:.1}% of output\thuffman decode {:.1} MB/s\tmodel enc {:.1} MB/s\tmodel dec {:.1} MB/s",
-        100.0 * (1.0 - tout as f64 / tin as f64),
-        100.0 * traw as f64 / tout as f64,
-        mb / th,
-        mb / te,
-        mb / td
-    );
     Ok(())
 }
 

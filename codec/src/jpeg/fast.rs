@@ -375,23 +375,6 @@ mod simd {
     }
 }
 
-/// Development aid: accumulate the cost of each category of symbols (encoder only).
-const STATS: bool = false;
-pub static mut COST: [f64; 8] = [0.0; 8];
-pub static mut CAT: usize = 0;
-#[inline(always)]
-fn cost(freq: u32) {
-    if STATS {
-        unsafe { COST[CAT] += (PROB_ONE as f64 / freq as f64).log2() };
-    }
-}
-#[inline(always)]
-fn cat(c: usize) {
-    if STATS {
-        unsafe { CAT = c };
-    }
-}
-
 /// Source and sink of coded symbols: the encoder codes the symbols it is given, the decoder
 /// ignores them and returns what it decodes.
 pub trait Io {
@@ -421,9 +404,6 @@ impl<L: Lanes> Default for Enc<L> {
 impl<L: Lanes> Enc<L> {
     pub fn new() -> Self {
         Enc { lanes: std::marker::PhantomData, ops: Vec::with_capacity(1 << 16), raw: Vec::with_capacity(1 << 16), racc: 0, rbits: 0 }
-    }
-    pub fn symbols(&self) -> usize {
-        self.ops.len()
     }
     /// Returns (rANS-coded bytes, raw bits).
     pub fn finish(mut self) -> (Vec<u8>, Vec<u8>) {
@@ -464,7 +444,6 @@ impl<L: Lanes> Io for Enc<L> {
     fn sym(&mut self, c: &mut Cdf, cnt: &mut u8, n: usize, s: usize) -> usize {
         debug_assert!(s < n);
         let (start, freq) = c.interval(s);
-        cost(freq);
         self.ops.push(start | ((freq - 1) << 16));
         c.update::<L>(cnt, s, n);
         s
@@ -472,7 +451,6 @@ impl<L: Lanes> Io for Enc<L> {
     #[inline(always)]
     fn bit(&mut self, p: &mut Bit, b: u32) -> u32 {
         let q = *p as u32;
-        cost(if b != 0 { PROB_ONE - q } else { q });
         self.ops.push(if b != 0 { q | ((PROB_ONE - q - 1) << 16) } else { (q - 1) << 16 });
         *p = adapt_bit(*p, b);
         b
@@ -480,9 +458,6 @@ impl<L: Lanes> Io for Enc<L> {
     #[inline(always)]
     fn raw(&mut self, v: u32, n: u32) -> u32 {
         debug_assert!((1..=24).contains(&n) && v >> n == 0);
-        if STATS {
-            unsafe { COST[CAT] += n as f64 };
-        }
         self.racc = (self.racc << n) | v as u64;
         self.rbits += n;
         if self.rbits >= 32 {
@@ -1045,7 +1020,6 @@ impl Model {
         if code_ac {
             let actual = if I::DEC { 0 } else { INTERIOR.iter().filter(|&&p| blk[p as usize] != 0).count() };
             let ctx = (cls * NNZB + NZB[avg(|i| i.nz77) & 63] as usize) * NLUMA + luma;
-            cat(0);
             let hi = self.nz_hi.sym(io, ctx, 7, actual >> 3);
             let lo = self.nz_lo.sym(io, ctx * 7 + hi, 8, actual & 7);
             let nz77 = hi * 8 + lo;
@@ -1064,11 +1038,8 @@ impl Model {
                 // a weighted sum of the magnitudes around the coefficient, inside and outside
                 let nb = EQ[(s + 2 * inner).min(255) as usize] as usize;
                 let v = blk[pos] as i32;
-                cat(1);
                 if self.zero.bit(io, zrow + i * NEQ + nb, (v != 0) as u32) != 0 {
-                    cat(2);
                     let t = 1 + self.mag.sym(io, mrow + IZE[i] as usize + nb, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
-                    cat(3);
                     let x = self.rest(io, t, v, cls * 2, None);
                     if I::DEC {
                         blk[pos] = x as i16;
@@ -1080,7 +1051,6 @@ impl Model {
                 i += 1;
             }
             let nzq = NZQ8[nz77 & 63] as usize;
-            cat(6);
             info.nzr = self.edge(io, cls, 0, blk, a.map(|x| x.0), (na, nl), q, rq, nzq, avg(|i| i.nzr));
             info.nzc = self.edge(io, cls, 1, blk, l.map(|x| x.0), (na, nl), q, rq, nzq, avg(|i| i.nzc));
         }
@@ -1107,9 +1077,7 @@ impl Model {
                 _ => 3,
             };
             let d = blk[0] as i32 - pred;
-            cat(4);
             let t = self.dc.sym(io, cls * 32 + ub * 4 + nzq, NTOK, if I::DEC { 0 } else { token(d.unsigned_abs()) });
-            cat(5);
             let x = if t != 0 { self.rest(io, t, d, cls * 2 + 1, None) } else { 0 };
             if I::DEC {
                 blk[0] = (pred + x) as i16;
