@@ -22,6 +22,7 @@
 //! nested .komla JPEG file (kind 1).
 
 pub mod bytecm;
+pub mod fast;
 pub mod format;
 pub mod model;
 
@@ -531,6 +532,52 @@ pub fn decompress(b: &[u8], progress: &mut dyn FnMut(f32)) -> Result<Vec<u8>, St
         Vec::new()
     };
     finish(&c, stripes)
+}
+
+/// Experiment: codes all coefficients of a JPEG with the fast model in one stripe, decodes them
+/// again and checks they match. Returns (arithmetic bytes, raw bytes, seconds for Huffman
+/// decoding, model encoding, model decoding).
+pub fn fast_experiment(data: &[u8]) -> Result<(usize, usize, f64, f64, f64), String> {
+    if let Ok(v) = std::env::var("KOMLA_SH") {
+        let p: Vec<i32> = v.split(',').map(|x| x.parse().unwrap()).collect();
+        fast::set_shift(p[0], p[1] as u32, p[2] as u32);
+    }
+    let t0 = std::time::Instant::now();
+    let l = format::parse(data, true)?;
+    let (mut coefs, _) = format::decode_scans(&l, data)?;
+    let t_huff = t0.elapsed().as_secs_f64();
+    let f = &l.frame;
+    let cov = coverage(&l);
+    let ext: Vec<fast::Extent> = cov.iter().map(|c| fast::Extent { dc: c.0, ac: c.1, dc_w: c.2 .0, dc_h: c.2 .1, ac_w: c.3 .0, ac_h: c.3 .1 }).collect();
+    let width: Vec<usize> = f.comps.iter().map(|c| c.pw).collect();
+    let v: Vec<usize> = f.comps.iter().map(|c| c.v).collect();
+    let q: Vec<[u16; 64]> = f.comps.iter().map(|c| c.q).collect();
+    let t1 = std::time::Instant::now();
+    let mut e = fast::Enc::new();
+    {
+        let mut planes: Vec<&mut [i16]> = coefs.iter_mut().map(|p| &mut p[..]).collect();
+        fast::code_stripe(&mut e, &mut planes, &width, &v, &ext, &q, f.mcuy);
+    }
+    if std::env::var_os("KOMLA_COUNT").is_some() {
+        let c = unsafe { fast::COST };
+        let t: f64 = c.iter().sum();
+        eprintln!("symbols {} blocks {} | nz {:.1}% zero {:.1}% mag {:.1}% rawac {:.1}% dc {:.1}% rawdc {:.1}% edges {:.1}% | total {:.0} bytes", e.symbols(), coefs.iter().map(|p| p.len() / 64).sum::<usize>(), 100.0*c[0]/t, 100.0*c[1]/t, 100.0*c[2]/t, 100.0*c[3]/t, 100.0*c[4]/t, 100.0*c[5]/t, 100.0*c[6]/t, t/8.0);
+        unsafe { fast::COST = [0.0; 8] };
+    }
+    let (arith, raw) = e.finish();
+    let t_enc = t1.elapsed().as_secs_f64();
+    let t2 = std::time::Instant::now();
+    let mut dec: Vec<Vec<i16>> = coefs.iter().map(|p| vec![0i16; p.len()]).collect();
+    {
+        let mut d = fast::Dec::new(&arith, &raw);
+        let mut planes: Vec<&mut [i16]> = dec.iter_mut().map(|p| &mut p[..]).collect();
+        fast::code_stripe(&mut d, &mut planes, &width, &v, &ext, &q, f.mcuy);
+    }
+    let t_dec = t2.elapsed().as_secs_f64();
+    if dec != coefs {
+        return Err("fast model round trip mismatch".into());
+    }
+    Ok((arith.len(), raw.len(), t_huff, t_enc, t_dec))
 }
 
 /// Describes a .komla JPEG container without decoding it.
