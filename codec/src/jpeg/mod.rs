@@ -22,7 +22,9 @@
 //! nested .komla JPEG file (kind 1).
 
 pub mod bytecm;
+pub mod fast;
 pub mod format;
+pub mod huff;
 pub mod model;
 
 use crate::coder::{Decoder, Encoder};
@@ -531,6 +533,1148 @@ pub fn decompress(b: &[u8], progress: &mut dyn FnMut(f32)) -> Result<Vec<u8>, St
         Vec::new()
     };
     finish(&c, stripes)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fast mode
+//
+//   "KMLA" | 'J' | version | MODE_FAST | varint original length | CRC-32 of the original file
+//   varint header-blob length | varint coded length | header blob (`fast::encode_bytes`)
+//   varint trailer length | trailer kind | varint coded length | coded trailer
+//   varint side-info length | side info (per scan: padding, garbage, end-of-band choices)
+//   varint stripe count | per stripe: varint rANS length, varint raw length | stripe data
+//
+// The side info can be decoded before any scan, so scans and stripes are independent: stripes
+// are coded and decoded in parallel, straight from and into the coefficient planes.
+
+/// Stripes of the fast mode hold about this many blocks (all components).
+pub const FAST_STRIPE_BLOCKS: usize = 1 << 15;
+pub const MODE_FAST: u8 = 3;
+/// Stored with the fast byte model.
+pub const MODE_BYTES: u8 = 4;
+const TRAILER_FAST: u8 = 2;
+
+/// Worker threads: KOMLA_THREADS if set, else the machine's parallelism (1 on WebAssembly).
+pub fn threads() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Some(n) = std::env::var("KOMLA_THREADS").ok().and_then(|s| s.parse::<usize>().ok()) {
+            return n.max(1);
+        }
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    }
+}
+
+/// MCU rows of each fast-mode stripe.
+pub fn fast_stripes(f: &Frame) -> Vec<(usize, usize)> {
+    let per_row: usize = f.comps.iter().map(|c| c.pw * c.v).sum();
+    let n = (per_row * f.mcuy).div_ceil(FAST_STRIPE_BLOCKS).clamp(1, f.mcuy.clamp(1, 256));
+    let rows = f.mcuy.div_ceil(n);
+    (0..n).map(|k| (k * rows, ((k + 1) * rows).min(f.mcuy))).filter(|r| r.0 < r.1).collect()
+}
+
+/// Splits each component's plane into the block rows of every stripe.
+fn split_rows<'a>(f: &Frame, rows: &[(usize, usize)], planes: &'a mut [Vec<i16>]) -> Vec<Vec<&'a mut [i16]>> {
+    let mut out: Vec<Vec<&'a mut [i16]>> = (0..rows.len()).map(|_| Vec::with_capacity(f.comps.len())).collect();
+    for (c, plane) in f.comps.iter().zip(planes.iter_mut()) {
+        let mut rest: &'a mut [i16] = &mut plane[..];
+        for (k, &(my0, my1)) in rows.iter().enumerate() {
+            let n = (my1 - my0) * c.v * c.pw * 64;
+            let (a, b) = std::mem::take(&mut rest).split_at_mut(n);
+            out[k].push(a);
+            rest = b;
+        }
+    }
+    out
+}
+
+struct StripeGeom {
+    width: Vec<usize>,
+    v: Vec<usize>,
+    q: Vec<[u16; 64]>,
+    cov: Vec<(bool, bool, (usize, usize), (usize, usize))>,
+}
+
+impl StripeGeom {
+    fn new(l: &Layout) -> StripeGeom {
+        let f = &l.frame;
+        StripeGeom { width: f.comps.iter().map(|c| c.pw).collect(), v: f.comps.iter().map(|c| c.v).collect(), q: f.comps.iter().map(|c| c.q).collect(), cov: coverage(l) }
+    }
+    fn extents(&self, my0: usize) -> Vec<fast::Extent> {
+        self.cov
+            .iter()
+            .zip(&self.v)
+            .map(|(c, &v)| {
+                let r0 = my0 * v;
+                fast::Extent { dc: c.0, ac: c.1, dc_w: c.2 .0, dc_h: c.2 .1.saturating_sub(r0), ac_w: c.3 .0, ac_h: c.3 .1.saturating_sub(r0) }
+            })
+            .collect()
+    }
+    fn encode(&self, rows: (usize, usize), planes: &mut [&mut [i16]]) -> (Vec<u8>, Vec<u8>) {
+        let ext = self.extents(rows.0);
+        let held: Vec<usize> = self.v.iter().map(|&v| v * (rows.1 - rows.0)).collect();
+        fast::encode_stripe(planes, &fast::Geometry { rows: &held, width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 })
+    }
+    fn decode(&self, rows: (usize, usize), rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]]) -> Result<(), String> {
+        let ext = self.extents(rows.0);
+        let held: Vec<usize> = self.v.iter().map(|&v| v * (rows.1 - rows.0)).collect();
+        fast::decode_stripe(rans, raw, planes, &fast::Geometry { rows: &held, width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 }, |_, _| Ok(()))
+    }
+}
+
+fn zigzag(v: i32) -> u64 {
+    ((v << 1) ^ (v >> 31)) as u32 as u64
+}
+
+fn unzigzag(v: u64) -> i32 {
+    ((v >> 1) as u32 as i32) ^ -((v & 1) as i32)
+}
+
+/// Writes a scan's side info: the length of its entropy-coded data, the choices `s` and, for a
+/// sequential scan, the encoder state at the start of every stripe after the first.
+fn put_side(out: &mut Vec<u8>, s: &huff::Side, scan_len: usize, cps: &[huff::SeqState], ncomp: usize) {
+    put_varint(out, scan_len as u64);
+    put_varint(out, s.pads.len() as u64);
+    out.extend_from_slice(&s.pads);
+    put_varint(out, s.garbage.len() as u64);
+    out.extend_from_slice(&s.garbage);
+    put_varint(out, s.eob_flips.len() as u64);
+    let mut last = 0u32;
+    for &x in &s.eob_flips {
+        put_varint(out, (x - last) as u64);
+        last = x;
+    }
+    let mut at = 0u64;
+    for cp in cps {
+        put_varint(out, cp.bytes - at);
+        at = cp.bytes;
+        put_varint(out, ((cp.bits as u64) << 3) | cp.nbits as u64);
+        for &p in &cp.pred[..ncomp] {
+            put_varint(out, zigzag(p));
+        }
+    }
+}
+
+/// A scan's side info written by `put_side`, with `ncps` encoder states of `ncomp` components.
+fn get_side(b: &[u8], pos: &mut usize, limit: usize, ncps: usize, ncomp: usize) -> Result<(huff::Side, u64, Vec<huff::SeqState>), String> {
+    let mut s = huff::Side::default();
+    let scan_len = get_varint(b, pos)?;
+    if scan_len > limit as u64 {
+        return Err("corrupt .komla file".into());
+    }
+    let n = get_varint(b, pos)?;
+    s.pads = take(b, pos, n)?.to_vec();
+    let n = get_varint(b, pos)?;
+    if n > limit as u64 {
+        return Err("corrupt .komla file".into());
+    }
+    s.garbage = take(b, pos, n)?.to_vec();
+    let n = get_varint(b, pos)?;
+    if n > limit as u64 {
+        return Err("corrupt .komla file".into());
+    }
+    let mut last = 0u64;
+    for _ in 0..n {
+        last += get_varint(b, pos)?;
+        s.eob_flips.push(u32::try_from(last).map_err(|_| "corrupt .komla file")?);
+    }
+    let mut cps = Vec::with_capacity(ncps);
+    let mut at = 0u64;
+    for _ in 0..ncps {
+        at += get_varint(b, pos)?;
+        if at > scan_len {
+            return Err("corrupt .komla file".into());
+        }
+        let nb = get_varint(b, pos)?;
+        let mut cp = huff::SeqState { bytes: at, nbits: (nb & 7) as u32, bits: ((nb >> 3) & 0x7F) as u32, pred: [0; 4] };
+        for p in cp.pred.iter_mut().take(ncomp) {
+            *p = unzigzag(get_varint(b, pos)?);
+        }
+        cps.push(cp);
+    }
+    Ok((s, scan_len, cps))
+}
+
+fn stored_fast(data: &[u8], note: String) -> (Vec<u8>, JpegInfo) {
+    let mut h = Vec::with_capacity(data.len() + 16);
+    h.extend_from_slice(crate::MAGIC);
+    h.push(KIND);
+    h.push(VERSION);
+    let c = fast::encode_bytes(data);
+    let mode = if c[0] == 1 { MODE_BYTES } else { MODE_RAW };
+    h.push(mode);
+    put_varint(&mut h, data.len() as u64);
+    h.extend_from_slice(&crate::crc32(data).to_le_bytes());
+    h.extend_from_slice(if mode == MODE_BYTES { &c } else { data });
+    (h, JpegInfo { mode, note, ..Default::default() })
+}
+
+/// Compresses a JPEG file in the fast mode with up to `threads` threads. Never fails: input
+/// that cannot be recompressed exactly is stored.
+pub fn compress_fast(data: &[u8], threads: usize) -> (Vec<u8>, JpegInfo) {
+    match analyze_fast(data, threads) {
+        Ok(r) => r,
+        Err(e) => stored_fast(data, e),
+    }
+}
+
+/// A stripe on its way through compression: its coefficients and the choices its scans made.
+struct Stripe {
+    k: usize,
+    bufs: Vec<Vec<i16>>,
+    sides: Vec<format::ScanSide>,
+}
+
+/// Regenerates every scan from the stripes `next` yields (in order) and checks that the bytes
+/// match the input, recording the side info that reproduces them; hands each checked stripe to
+/// `pass`. Returns the side info of all scans.
+fn verify_scans(l: &Layout, data: &[u8], rows: &[(usize, usize)], next: &mut dyn FnMut() -> Result<Option<Stripe>, String>, pass: &mut dyn FnMut(Stripe) -> Result<(), String>) -> Result<Vec<u8>, String> {
+    let f = &l.frame;
+    let n = l.scans.len();
+    let mismatch = || "scan data cannot be reproduced exactly from its coefficients".to_string();
+    let mut chs: Vec<huff::Choices> = (0..n).map(|_| huff::Choices::record()).collect();
+    let mut outs: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+    let mut done = vec![0usize; n];
+    let mut cps: Vec<Vec<huff::SeqState>> = (0..n).map(|_| Vec::new()).collect();
+    let check = |i: usize, b: &[u8], done: &mut [usize]| -> Result<(), String> {
+        let s = &l.scans[i];
+        if data[s.seg.0..s.seg.1].get(done[i]..done[i] + b.len()) != Some(b) {
+            return Err(mismatch());
+        }
+        done[i] += b.len();
+        Ok(())
+    };
+    {
+        let mut encs: Vec<ScanEnc> = Vec::with_capacity(n);
+        for ((s, ch), out) in l.scans.iter().zip(chs.iter_mut()).zip(outs.iter_mut()) {
+            encs.push(if f.progressive { ScanEnc::Prog(huff::ProgScan::new(s, f, ch, Vec::new())) } else { ScanEnc::Seq(huff::SeqScan::new(s, f, ch, out)?) });
+        }
+        while let Some(mut st) = next()? {
+            let (my0, my1) = rows[st.k];
+            for (i, (e, s)) in encs.iter_mut().zip(&l.scans).enumerate() {
+                e.choices().feed(&mut st.sides[i]);
+                let bufs = &st.bufs;
+                e.rows(f, s, my0, my1, |ci, bx, by| {
+                    let c = &f.comps[ci];
+                    bufs[ci][((by - my0 * c.v) * c.pw + bx) * 64..][..64].try_into().unwrap()
+                })?;
+                let b = e.bytes();
+                check(i, b, &mut done)?;
+                b.clear();
+                if let ScanEnc::Seq(e) = e {
+                    if st.k + 1 < rows.len() {
+                        cps[i].push(e.state(done[i] as u64));
+                    }
+                }
+            }
+            pass(st)?;
+        }
+        for (i, (e, s)) in encs.into_iter().zip(&l.scans).enumerate() {
+            match e {
+                ScanEnc::Prog(e) => {
+                    let rest = e.finish(s)?;
+                    check(i, &rest, &mut done)?;
+                }
+                ScanEnc::Seq(e) => e.finish(),
+            }
+        }
+    }
+    let mut side = Vec::new();
+    for (i, (ch, s)) in chs.into_iter().zip(&l.scans).enumerate() {
+        check(i, &outs[i], &mut done)?;
+        if done[i] != s.seg.1 - s.seg.0 {
+            return Err(mismatch());
+        }
+        put_side(&mut side, &ch.into_side(), s.seg.1 - s.seg.0, &cps[i], s.comps.len());
+    }
+    Ok(side)
+}
+
+fn analyze_fast(data: &[u8], threads: usize) -> Result<(Vec<u8>, JpegInfo), String> {
+    if data.len() > u32::MAX as usize {
+        return Err("file too large".into());
+    }
+    let l = format::parse(data, true)?;
+    let f = &l.frame;
+    let rows = fast_stripes(f);
+    let geom = StripeGeom::new(&l);
+    let trailer = &data[l.end..];
+    // the header bytes and the trailer (which may be another JPEG)
+    let extras = || {
+        let blob = fast::encode_bytes(&l.blob);
+        let t = match is_jpeg(trailer).then(|| compress_fast(trailer, threads)) {
+            Some((nested, info)) if info.mode == MODE_FAST && nested.len() < trailer.len() => (TRAILER_FAST, nested),
+            _ => (TRAILER_CM, fast::encode_bytes(trailer)),
+        };
+        (blob, t)
+    };
+    let mut decs: Vec<format::ScanDec> = l.scans.iter().map(|s| format::ScanDec::new(f, s, &data[s.seg.0..s.seg.1])).collect();
+    // the coefficients of stripe k, from every scan
+    let mut decode = |k: usize| -> Result<Stripe, String> {
+        let (my0, my1) = rows[k];
+        let mut bufs: Vec<Vec<i16>> = f.comps.iter().map(|c| vec![0i16; (my1 - my0) * c.v * c.pw * 64]).collect();
+        let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
+        for (d, s) in decs.iter_mut().zip(&l.scans) {
+            d.rows(f, s, my0, my1, my0, &mut planes)?;
+            if my1 == f.mcuy {
+                d.finish()?;
+            }
+        }
+        let sides = decs.iter_mut().map(|d| std::mem::take(&mut d.side)).collect();
+        Ok(Stripe { k, bufs, sides })
+    };
+    let encode = |st: &mut Stripe| {
+        let mut planes: Vec<&mut [i16]> = st.bufs.iter_mut().map(|b| &mut b[..]).collect();
+        geom.encode(rows[st.k], &mut planes)
+    };
+    let mut streams: Vec<Option<(Vec<u8>, Vec<u8>)>> = (0..rows.len()).map(|_| None).collect();
+    let (side, (blob, (kind, tc))) = if threads > 1 {
+        stream_mt(&l, data, &rows, threads, &mut decode, &encode, &extras, &mut streams)?
+    } else {
+        let mut k = 0;
+        let mut next = || -> Result<Option<Stripe>, String> {
+            if k == rows.len() {
+                return Ok(None);
+            }
+            k += 1;
+            decode(k - 1).map(Some)
+        };
+        let side = verify_scans(&l, data, &rows, &mut next, &mut |mut st| {
+            streams[st.k] = Some(encode(&mut st));
+            Ok(())
+        })?;
+        (side, extras())
+    };
+    let streams: Vec<(Vec<u8>, Vec<u8>)> = streams.into_iter().collect::<Option<_>>().ok_or("worker thread failed")?;
+    let mut h = Vec::with_capacity(4096 + blob.len() + tc.len() + side.len() + streams.iter().map(|s| s.0.len() + s.1.len()).sum::<usize>());
+    h.extend_from_slice(crate::MAGIC);
+    h.push(KIND);
+    h.push(VERSION);
+    h.push(MODE_FAST);
+    put_varint(&mut h, data.len() as u64);
+    h.extend_from_slice(&crate::crc32(data).to_le_bytes());
+    put_varint(&mut h, l.blob.len() as u64);
+    put_varint(&mut h, blob.len() as u64);
+    h.extend_from_slice(&blob);
+    put_varint(&mut h, trailer.len() as u64);
+    h.push(kind);
+    put_varint(&mut h, tc.len() as u64);
+    h.extend_from_slice(&tc);
+    put_varint(&mut h, side.len() as u64);
+    h.extend_from_slice(&side);
+    put_varint(&mut h, streams.len() as u64);
+    for (r, w) in &streams {
+        put_varint(&mut h, r.len() as u64);
+        put_varint(&mut h, w.len() as u64);
+    }
+    for (r, w) in streams {
+        h.extend_from_slice(&r);
+        h.extend_from_slice(&w);
+    }
+    let info = JpegInfo {
+        width: f.width as u32,
+        height: f.height as u32,
+        components: f.comps.len() as u8,
+        progressive: f.progressive,
+        sampling: sampling(f),
+        stripes: rows.len() as u32,
+        mode: MODE_FAST,
+        note: String::new(),
+    };
+    Ok((h, info))
+}
+
+type Extras = (Vec<u8>, (u8, Vec<u8>));
+
+/// The threaded compression pipeline: this thread decodes stripe after stripe, another checks
+/// them in order, the others code them; at most `threads + 2` stripes are held at a time.
+#[allow(clippy::too_many_arguments)]
+fn stream_mt(
+    l: &Layout,
+    data: &[u8],
+    rows: &[(usize, usize)],
+    threads: usize,
+    decode: &mut (dyn FnMut(usize) -> Result<Stripe, String> + Send),
+    encode: &(dyn Fn(&mut Stripe) -> (Vec<u8>, Vec<u8>) + Sync),
+    extras: &(dyn Fn() -> Extras + Sync),
+    streams: &mut [Option<(Vec<u8>, Vec<u8>)>],
+) -> Result<(Vec<u8>, Extras), String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Condvar, Mutex};
+        let window = threads + 2;
+        let live = (Mutex::new(0usize), Condvar::new());
+        let stop = AtomicBool::new(false);
+        let out: Vec<Mutex<Option<(Vec<u8>, Vec<u8>)>>> = (0..rows.len()).map(|_| Mutex::new(None)).collect();
+        let (to_ver, from_dec) = mpsc::sync_channel::<Stripe>(2);
+        let (to_work, from_ver) = mpsc::channel::<Stripe>();
+        let from_ver = Mutex::new(from_ver);
+        let res = std::thread::scope(|sc| -> Result<(Vec<u8>, Extras), String> {
+            let ex = sc.spawn(extras);
+            let (live, stop, out, from_ver) = (&live, &stop, &out, &from_ver);
+            let ver = sc.spawn(move || {
+                let mut next = || Ok(from_dec.recv().ok());
+                let r = verify_scans(l, data, rows, &mut next, &mut |st| to_work.send(st).map_err(|_| "worker thread failed".to_string()));
+                if r.is_err() {
+                    stop.store(true, Ordering::Relaxed);
+                    live.1.notify_all();
+                }
+                r
+            });
+            for _ in 0..threads.saturating_sub(1).max(1) {
+                sc.spawn(move || loop {
+                    let st = from_ver.lock().unwrap().recv();
+                    let Ok(mut st) = st else { break };
+                    if !stop.load(Ordering::Relaxed) {
+                        let r = encode(&mut st);
+                        *out[st.k].lock().unwrap() = Some(r);
+                    }
+                    drop(st);
+                    *live.0.lock().unwrap() -= 1;
+                    live.1.notify_all();
+                });
+            }
+            let mut res = Ok(());
+            for k in 0..rows.len() {
+                let mut g = live.0.lock().unwrap();
+                while *g >= window && !stop.load(Ordering::Relaxed) {
+                    g = live.1.wait(g).unwrap();
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                *g += 1;
+                drop(g);
+                match decode(k) {
+                    Ok(st) => {
+                        if to_ver.send(st).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        res = Err(e);
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+            drop(to_ver);
+            let side = ver.join().map_err(|_| "worker thread failed".to_string())?;
+            let ex = ex.join().map_err(|_| "worker thread failed".to_string())?;
+            res?;
+            Ok((side?, ex))
+        });
+        for (s, o) in streams.iter_mut().zip(out) {
+            *s = o.into_inner().unwrap();
+        }
+        res
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = threads;
+        let mut k = 0;
+        let mut next = || -> Result<Option<Stripe>, String> {
+            if k == rows.len() {
+                return Ok(None);
+            }
+            k += 1;
+            decode(k - 1).map(Some)
+        };
+        let side = verify_scans(l, data, rows, &mut next, &mut |mut st| {
+            streams[st.k] = Some(encode(&mut st));
+            Ok(())
+        })?;
+        Ok((side, extras()))
+    }
+}
+
+/// Runs `produce` on 0..n with up to `threads` threads (at most `window` items ahead of the
+/// consumer) and feeds the results to `consume` in order.
+fn pipeline<B: Send>(n: usize, threads: usize, window: usize, produce: impl Fn(usize) -> Result<B, String> + Sync, mut consume: impl FnMut(usize, B) -> Result<(), String>) -> Result<(), String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if threads > 1 && n > 1 {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{mpsc, Condvar, Mutex};
+        let next = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let done = (Mutex::new(0usize), Condvar::new());
+        let (tx, rx) = mpsc::channel::<(usize, Result<B, String>)>();
+        return std::thread::scope(|sc| {
+            for _ in 0..threads.min(n) {
+                let tx = tx.clone();
+                let (next, stop, done, produce) = (&next, &stop, &done, &produce);
+                sc.spawn(move || loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    if k >= n {
+                        break;
+                    }
+                    let mut g = done.0.lock().unwrap();
+                    while k >= *g + window && !stop.load(Ordering::Relaxed) {
+                        g = done.1.wait(g).unwrap();
+                    }
+                    drop(g);
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if tx.send((k, produce(k))).is_err() {
+                        break;
+                    }
+                });
+            }
+            drop(tx);
+            let mut pending = std::collections::BTreeMap::new();
+            let mut expect = 0;
+            let mut res = Ok(());
+            while expect < n {
+                let Ok((k, r)) = rx.recv() else { break };
+                pending.insert(k, r);
+                while let Some(r) = pending.remove(&expect) {
+                    if res.is_ok() {
+                        res = r.and_then(|b| consume(expect, b));
+                    }
+                    expect += 1;
+                    *done.0.lock().unwrap() = expect;
+                    done.1.notify_all();
+                }
+                if res.is_err() {
+                    stop.store(true, Ordering::Relaxed);
+                    done.1.notify_all();
+                }
+            }
+            if res.is_ok() && expect < n {
+                res = Err("worker thread failed".into());
+            }
+            res
+        });
+    }
+    let _ = (threads, window);
+    for k in 0..n {
+        consume(k, produce(k)?)?;
+    }
+    Ok(())
+}
+
+/// Random-access input of a .komla file.
+pub trait Input: Sync {
+    fn size(&self) -> u64;
+    /// Fills `buf` from position `pos`.
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> Result<(), String>;
+}
+
+impl Input for &[u8] {
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> Result<(), String> {
+        let p = usize::try_from(pos).map_err(|_| "truncated .komla file")?;
+        let s = p.checked_add(buf.len()).and_then(|e| self.get(p..e)).ok_or("truncated .komla file")?;
+        buf.copy_from_slice(s);
+        Ok(())
+    }
+}
+
+/// A file read in place.
+#[cfg(unix)]
+struct FileIn<'a> {
+    file: &'a std::fs::File,
+    size: u64,
+}
+
+#[cfg(unix)]
+impl Input for FileIn<'_> {
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> Result<(), String> {
+        use std::os::unix::fs::FileExt;
+        if pos.checked_add(buf.len() as u64).is_none_or(|e| e > self.size) {
+            return Err("truncated .komla file".into());
+        }
+        self.file.read_exact_at(buf, pos).map_err(|e| e.to_string())
+    }
+}
+
+/// A byte range of another input (a container nested in a trailer).
+struct Sub<'a> {
+    inner: &'a dyn Input,
+    off: u64,
+    len: u64,
+}
+
+impl Input for Sub<'_> {
+    fn size(&self) -> u64 {
+        self.len
+    }
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> Result<(), String> {
+        if pos.checked_add(buf.len() as u64).is_none_or(|e| e > self.len) {
+            return Err("truncated .komla file".into());
+        }
+        self.inner.read_at(self.off + pos, buf)
+    }
+}
+
+/// Where restored bytes go, by position in the original file.
+pub trait Sink {
+    fn put(&mut self, pos: u64, data: &[u8]) -> Result<(), String>;
+}
+
+impl Sink for Vec<u8> {
+    fn put(&mut self, pos: u64, data: &[u8]) -> Result<(), String> {
+        let p = pos as usize;
+        if self.len() < p + data.len() {
+            self.resize(p + data.len(), 0);
+        }
+        self[p..p + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Sink for std::fs::File {
+    fn put(&mut self, pos: u64, data: &[u8]) -> Result<(), String> {
+        use std::os::unix::fs::FileExt;
+        self.write_all_at(data, pos).map_err(|e| e.to_string())
+    }
+}
+
+/// Sequential reader over an `Input`.
+struct Rd<'a> {
+    inp: &'a dyn Input,
+    pos: u64,
+}
+
+impl Rd<'_> {
+    fn byte(&mut self) -> Result<u8, String> {
+        let mut b = [0u8];
+        self.inp.read_at(self.pos, &mut b)?;
+        self.pos += 1;
+        Ok(b[0])
+    }
+    fn varint(&mut self) -> Result<u64, String> {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = self.byte()?;
+            v |= ((b & 0x7F) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Ok(v);
+            }
+        }
+        Err("corrupt .komla file".into())
+    }
+    fn bytes(&mut self, n: u64) -> Result<Vec<u8>, String> {
+        if n > self.inp.size().saturating_sub(self.pos) {
+            return Err("truncated .komla file".into());
+        }
+        let mut v = vec![0u8; n as usize];
+        self.inp.read_at(self.pos, &mut v)?;
+        self.pos += n;
+        Ok(v)
+    }
+    /// Skips `n` bytes; returns the position they start at.
+    fn skip(&mut self, n: u64) -> Result<u64, String> {
+        let p = self.pos;
+        if n > self.inp.size().saturating_sub(p) {
+            return Err("truncated .komla file".into());
+        }
+        self.pos += n;
+        Ok(p)
+    }
+}
+
+/// The parts of a fast-mode container, with positions in the input.
+struct FastContainer {
+    blob: Vec<u8>,
+    /// kind, position and coded length in the input, restored length
+    trailer: (u8, u64, u64, u64),
+    side: Vec<u8>,
+    /// position, rANS length and raw length of every stripe
+    stripes: Vec<(u64, u64, u64)>,
+}
+
+fn parse_fast(inp: &dyn Input, len: u64, pos: u64) -> Result<FastContainer, String> {
+    let mut r = Rd { inp, pos };
+    let n = r.varint()?;
+    let cl = r.varint()?;
+    if n > len {
+        return Err("corrupt .komla file".into());
+    }
+    let blob = fast::decode_bytes(&r.bytes(cl)?, n as usize)?;
+    let tl = r.varint()?;
+    if tl > len {
+        return Err("corrupt .komla file".into());
+    }
+    let kind = r.byte()?;
+    let cl = r.varint()?;
+    let tpos = r.skip(cl)?;
+    let sl = r.varint()?;
+    if sl > len + 1024 {
+        return Err("corrupt .komla file".into());
+    }
+    let side = r.bytes(sl)?;
+    let n = r.varint()? as usize;
+    if n == 0 || n > 256 {
+        return Err("corrupt stripe table".into());
+    }
+    let mut lens = Vec::with_capacity(n);
+    for _ in 0..n {
+        lens.push((r.varint()?, r.varint()?));
+    }
+    let mut stripes = Vec::with_capacity(n);
+    for (a, b) in lens {
+        let p = r.skip(a.checked_add(b).ok_or("corrupt stripe table")?)?;
+        stripes.push((p, a, b));
+    }
+    Ok(FastContainer { blob, trailer: (kind, tpos, cl, tl), side, stripes })
+}
+
+/// One part of the restored file (a stretch of header bytes, a scan or the trailer), written
+/// in order and checksummed on the way.
+struct Part {
+    start: u64,
+    at: u64,
+    end: u64,
+    crc: u32,
+    /// bytes not yet passed to the sink (they end at `at`); whole chunks write faster
+    buf: Vec<u8>,
+}
+
+/// Bytes a part collects before writing them.
+const PART_CHUNK: usize = 1 << 15;
+
+impl Part {
+    fn new(start: u64, len: u64) -> Part {
+        Part { start, at: start, end: start + len, crc: 0, buf: Vec::new() }
+    }
+    fn write(&mut self, sink: &mut dyn Sink, data: &[u8]) -> Result<(), String> {
+        if self.at + data.len() as u64 > self.end {
+            return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
+        }
+        self.crc = crate::crc32_continue(self.crc, data);
+        self.at += data.len() as u64;
+        if self.buf.is_empty() && data.len() >= PART_CHUNK {
+            return sink.put(self.at - data.len() as u64, data);
+        }
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= PART_CHUNK {
+            self.flush(sink)?;
+        }
+        Ok(())
+    }
+    fn flush(&mut self, sink: &mut dyn Sink) -> Result<(), String> {
+        if !self.buf.is_empty() {
+            sink.put(self.at - self.buf.len() as u64, &self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+enum ScanEnc<'a> {
+    Seq(huff::SeqScan<'a>),
+    Prog(huff::ProgScan<'a>),
+}
+
+impl ScanEnc<'_> {
+    fn rows<'b>(&mut self, f: &Frame, s: &format::Scan, my0: usize, my1: usize, blk: impl Fn(usize, usize, usize) -> &'b [i16; 64]) -> Result<(), String> {
+        match self {
+            ScanEnc::Seq(e) => e.rows(f, s, my0, my1, blk),
+            ScanEnc::Prog(e) => e.rows(f, s, my0, my1, my1 == f.mcuy, blk),
+        }
+    }
+    fn bytes(&mut self) -> &mut Vec<u8> {
+        match self {
+            ScanEnc::Seq(e) => e.bytes(),
+            ScanEnc::Prog(e) => e.bytes(),
+        }
+    }
+    fn choices(&mut self) -> &mut huff::Choices {
+        match self {
+            ScanEnc::Seq(e) => e.choices(),
+            ScanEnc::Prog(e) => e.choices(),
+        }
+    }
+}
+
+/// Nested containers (JPEGs appended to JPEGs) at most this deep.
+const MAX_DEPTH: u32 = 16;
+
+fn damaged() -> String {
+    "checksum mismatch: the .komla file is damaged or incomplete".into()
+}
+
+/// Restores the fast-mode or stored container in `inp` into `sink` at position `base`, with up
+/// to `threads` threads; returns the restored length and CRC-32 (already checked). Nothing is
+/// held in memory beyond a few stripes: scans are written straight to their place in the file.
+fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, depth: u32) -> Result<(u64, u32), String> {
+    if depth > MAX_DEPTH {
+        return Err("corrupt .komla file".into());
+    }
+    let mut r = Rd { inp, pos: 0 };
+    let head = r.bytes(7.min(inp.size()))?;
+    if head.len() < 7 || !is_container(&head) {
+        return Err("not a Komla JPEG file".into());
+    }
+    if head[5] != VERSION {
+        return Err(format!("unsupported Komla JPEG version {}", head[5]));
+    }
+    let len = r.varint()?;
+    let crc = u32::from_le_bytes(r.bytes(4)?.try_into().unwrap());
+    match head[6] {
+        MODE_RAW if inp.size() - r.pos == len => {
+            let mut part = Part::new(base, len);
+            let mut buf = vec![0u8; (len as usize).min(1 << 16)];
+            while part.at - base < len {
+                let n = (len - (part.at - base)).min(buf.len() as u64) as usize;
+                inp.read_at(r.pos + (part.at - base), &mut buf[..n])?;
+                part.write(sink, &buf[..n])?;
+            }
+            part.flush(sink)?;
+            if part.crc != crc {
+                return Err(damaged());
+            }
+            return Ok((len, crc));
+        }
+        MODE_RAW | MODE_BYTES => {
+            let rest = r.bytes(inp.size() - r.pos)?;
+            let out = if head[6] == MODE_RAW { rest } else { fast::decode_bytes(&rest, len as usize)? };
+            if out.len() as u64 != len || crate::crc32(&out) != crc {
+                return Err(damaged());
+            }
+            sink.put(base, &out)?;
+            return Ok((len, crc));
+        }
+        MODE_FAST => {}
+        _ => return Err("not a fast-mode Komla JPEG file".into()),
+    }
+    let c = parse_fast(inp, len, r.pos)?;
+    let l = format::parse(&c.blob, false)?;
+    let f = &l.frame;
+    let rows = fast_stripes(f);
+    if rows.len() != c.stripes.len() {
+        return Err("corrupt stripe table".into());
+    }
+    let ncps = if f.progressive { 0 } else { rows.len() - 1 };
+    let mut sides = Vec::with_capacity(l.scans.len());
+    let mut lens = Vec::with_capacity(l.scans.len());
+    let mut cps = Vec::with_capacity(l.scans.len());
+    let mut pos = 0;
+    for s in &l.scans {
+        let (side, n, cp) = get_side(&c.side, &mut pos, len as usize, ncps, s.comps.len())?;
+        sides.push(side);
+        lens.push(n);
+        cps.push(cp);
+    }
+    // the parts in file order: the header bytes before each scan, the scan, the rest of the
+    // header bytes, the trailer
+    let mut at = base;
+    let mut heads: Vec<(Part, usize, usize)> = Vec::with_capacity(l.scans.len() + 1);
+    let mut scans: Vec<Part> = Vec::with_capacity(l.scans.len());
+    let mut bpos = 0;
+    for (s, &n) in l.scans.iter().zip(&lens) {
+        heads.push((Part::new(at, (s.blob_pos - bpos) as u64), bpos, s.blob_pos));
+        at += (s.blob_pos - bpos) as u64;
+        bpos = s.blob_pos;
+        scans.push(Part::new(at, n));
+        at = at.checked_add(n).ok_or_else(damaged)?;
+    }
+    heads.push((Part::new(at, (c.blob.len() - bpos) as u64), bpos, c.blob.len()));
+    at += (c.blob.len() - bpos) as u64;
+    let mut trailer = Part::new(at, c.trailer.3);
+    if at + c.trailer.3 - base != len {
+        return Err(damaged());
+    }
+    for (p, a, b) in heads.iter_mut() {
+        p.write(sink, &c.blob[*a..*b])?;
+        p.flush(sink)?;
+    }
+    let geom = StripeGeom::new(&l);
+    let read = |k: usize, v: &mut Vec<u8>| -> Result<usize, String> {
+        let (p, a, b) = c.stripes[k];
+        v.resize((a + b) as usize, 0);
+        inp.read_at(p, v)?;
+        Ok(a as usize)
+    };
+    if threads > 1 && rows.len() > 1 && !f.progressive {
+        // sequential scans can be regenerated stripe by stripe from the stored encoder states,
+        // so the threads that decode the stripes also turn them back into scan data
+        pipeline(
+            rows.len(),
+            threads,
+            threads + 2,
+            |k| -> Result<Vec<Vec<u8>>, String> {
+                let (my0, my1) = rows[k];
+                let mut bufs: Vec<Vec<i16>> = f.comps.iter().map(|comp| vec![0i16; (my1 - my0) * comp.v * comp.pw * 64]).collect();
+                {
+                    let mut data = Vec::new();
+                    let split = read(k, &mut data)?;
+                    let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
+                    geom.decode(rows[k], &data[..split], &data[split..], &mut planes)?;
+                }
+                let mut outs = Vec::with_capacity(l.scans.len());
+                for (i, s) in l.scans.iter().enumerate() {
+                    let start = if k > 0 { cps[i][k - 1].bytes } else { 0 };
+                    let end = if k + 1 < rows.len() { cps[i][k].bytes } else { lens[i] };
+                    let mut ch = huff::Choices::replay(sides[i].clone());
+                    let mut out = Vec::with_capacity(end.saturating_sub(start) as usize + 64);
+                    let mut e = huff::SeqScan::new(s, f, &mut ch, &mut out)?;
+                    if k > 0 {
+                        e.resume(f, s, my0, &cps[i][k - 1]);
+                    }
+                    e.rows(f, s, my0, my1, |ci, bx, by| {
+                        let comp = &f.comps[ci];
+                        bufs[ci][((by - my0 * comp.v) * comp.pw + bx) * 64..][..64].try_into().unwrap()
+                    })?;
+                    if k + 1 == rows.len() {
+                        e.finish();
+                    } else {
+                        drop(e);
+                    }
+                    if Some(out.len() as u64) != end.checked_sub(start) {
+                        return Err(damaged());
+                    }
+                    outs.push(out);
+                }
+                Ok(outs)
+            },
+            |_, outs| {
+                for (o, p) in outs.iter().zip(scans.iter_mut()) {
+                    p.write(sink, o)?;
+                }
+                Ok(())
+            },
+        )?;
+        for p in scans.iter_mut() {
+            p.flush(sink)?;
+        }
+    } else {
+        let mut chs: Vec<huff::Choices> = sides.into_iter().map(huff::Choices::replay).collect();
+        let mut outs: Vec<Vec<u8>> = l.scans.iter().map(|_| Vec::new()).collect();
+        let mut encs: Vec<ScanEnc> = Vec::with_capacity(l.scans.len());
+        for ((s, ch), out) in l.scans.iter().zip(chs.iter_mut()).zip(outs.iter_mut()) {
+            encs.push(if f.progressive { ScanEnc::Prog(huff::ProgScan::new(s, f, ch, Vec::new())) } else { ScanEnc::Seq(huff::SeqScan::new(s, f, ch, out)?) });
+        }
+        // feeds frame MCU rows my0..my1 to every scan and writes out what they produce; the
+        // blocks are in `planes`, `held[c]` block rows per component, from MCU row `top` on
+        let mut feed = |top: usize, my0: usize, my1: usize, held: &[usize], planes: &[&mut [i16]], sink: &mut dyn Sink| -> Result<(), String> {
+            for ((e, s), p) in encs.iter_mut().zip(&l.scans).zip(scans.iter_mut()) {
+                e.rows(f, s, my0, my1, |ci, bx, by| {
+                    let comp = &f.comps[ci];
+                    let slot = (by - top * comp.v) % held[ci];
+                    planes[ci][(slot * comp.pw + bx) * 64..][..64].try_into().unwrap()
+                })?;
+                let b = e.bytes();
+                p.write(sink, b)?;
+                b.clear();
+            }
+            Ok(())
+        };
+        if threads > 1 && rows.len() > 1 {
+            pipeline(
+                rows.len(),
+                threads,
+                threads + 2,
+                |k| {
+                    let (my0, my1) = rows[k];
+                    let mut bufs: Vec<Vec<i16>> = f.comps.iter().map(|comp| vec![0i16; (my1 - my0) * comp.v * comp.pw * 64]).collect();
+                    let mut data = Vec::new();
+                    let split = read(k, &mut data)?;
+                    let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
+                    geom.decode(rows[k], &data[..split], &data[split..], &mut planes)?;
+                    Ok(bufs)
+                },
+                |k, mut bufs| {
+                    let (my0, my1) = rows[k];
+                    let held: Vec<usize> = geom.v.iter().map(|&v| v * (my1 - my0)).collect();
+                    let planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
+                    feed(my0, my0, my1, &held, &planes, &mut *sink)
+                },
+            )?;
+        } else {
+            // one thread: decode each stripe into a ring of two MCU rows per component and turn
+            // every MCU row back into scan data at once
+            let held: Vec<usize> = geom.v.iter().map(|&v| 2 * v).collect();
+            let mut ring: Vec<Vec<i16>> = f.comps.iter().zip(&held).map(|(comp, &h)| vec![0i16; h * comp.pw * 64]).collect();
+            let mut data = Vec::new();
+            for k in 0..rows.len() {
+                let (my0, my1) = rows[k];
+                if k > 0 {
+                    for b in ring.iter_mut() {
+                        b.fill(0);
+                    }
+                }
+                let split = read(k, &mut data)?;
+                let ext = geom.extents(my0);
+                let mut planes: Vec<&mut [i16]> = ring.iter_mut().map(|b| &mut b[..]).collect();
+                let g = fast::Geometry { rows: &held, width: &geom.width, v: &geom.v, ext: &ext, q: &geom.q, mcu_rows: my1 - my0 };
+                fast::decode_stripe(&data[..split], &data[split..], &mut planes, &g, |my, planes| feed(my0, my0 + my, my0 + my + 1, &held, planes, &mut *sink))?;
+            }
+        }
+        for ((e, s), p) in encs.into_iter().zip(&l.scans).zip(scans.iter_mut()) {
+            if let ScanEnc::Prog(e) = e {
+                let rest = e.finish(s)?;
+                p.write(sink, &rest)?;
+            } else if let ScanEnc::Seq(e) = e {
+                e.finish();
+            }
+        }
+        for (out, p) in outs.iter().zip(scans.iter_mut()) {
+            p.write(sink, out)?;
+            p.flush(sink)?;
+        }
+    }
+    let (kind, tpos, cl, tl) = c.trailer;
+    match kind {
+        TRAILER_CM => {
+            let mut first = [0u8; 1];
+            inp.read_at(tpos, &mut first)?;
+            if first[0] == 0 && cl == tl + 1 {
+                // stored as it is (such as a video appended to the picture): copied piece by piece
+                let mut buf = vec![0u8; (tl as usize).min(1 << 16)];
+                let mut at = 0u64;
+                while at < tl {
+                    let n = (tl - at).min(buf.len() as u64) as usize;
+                    inp.read_at(tpos + 1 + at, &mut buf[..n])?;
+                    trailer.write(sink, &buf[..n])?;
+                    at += n as u64;
+                }
+            } else {
+                let mut coded = vec![0u8; cl as usize];
+                inp.read_at(tpos, &mut coded)?;
+                let t = fast::decode_bytes(&coded, tl as usize)?;
+                drop(coded);
+                trailer.write(sink, &t)?;
+            }
+            trailer.flush(sink)?;
+        }
+        TRAILER_FAST => {
+            let (n, tcrc) = restore(&Sub { inner: inp, off: tpos, len: cl }, trailer.at, sink, threads, depth + 1)?;
+            if n != tl {
+                return Err(damaged());
+            }
+            trailer.at += n;
+            trailer.crc = tcrc;
+        }
+        _ => return Err("corrupt .komla file".into()),
+    }
+    // the CRC of the whole file from the CRCs of its parts, in file order
+    let mut order: Vec<&Part> = Vec::with_capacity(2 * scans.len() + 2);
+    for (h, s) in heads.iter().zip(scans.iter()) {
+        order.push(&h.0);
+        order.push(s);
+    }
+    order.push(&heads[heads.len() - 1].0);
+    order.push(&trailer);
+    let mut total = 0u32;
+    for p in order {
+        if p.at != p.end {
+            return Err(damaged());
+        }
+        total = crate::crc32_combine(total, p.crc, p.end - p.start);
+    }
+    if total != crc {
+        return Err(damaged());
+    }
+    Ok((len, crc))
+}
+
+/// Decompresses any .komla JPEG container with up to `threads` threads.
+pub fn decompress_with(b: &[u8], threads: usize) -> Result<Vec<u8>, String> {
+    if !is_container(b) {
+        return Err("not a Komla JPEG file".into());
+    }
+    match b.get(6) {
+        Some(&MODE_FAST) | Some(&MODE_BYTES) => {
+            let mut out = Vec::new();
+            restore(&b, 0, &mut out, threads, 0)?;
+            Ok(out)
+        }
+        _ => decompress(b, &mut |_| {}),
+    }
+}
+
+/// Decompresses a .komla JPEG file into `out` without holding either file in memory (fast
+/// mode; other modes are read whole). On error `out` may hold partial data.
+#[cfg(unix)]
+pub fn decompress_file(inp: &std::fs::File, out: &mut std::fs::File, threads: usize) -> Result<(), String> {
+    let size = inp.metadata().map_err(|e| e.to_string())?.len();
+    let inp = FileIn { file: inp, size };
+    let mut head = [0u8; 7];
+    inp.read_at(0, &mut head)?;
+    if !is_container(&head) {
+        return Err("not a Komla JPEG file".into());
+    }
+    if head[6] == MODE_FAST {
+        restore(&inp, 0, out, threads, 0)?;
+        return Ok(());
+    }
+    let mut b = vec![0u8; size as usize];
+    inp.read_at(0, &mut b)?;
+    let data = decompress_with(&b, threads)?;
+    drop(b);
+    out.put(0, &data)
+}
+
+/// Training: the summed symbol statistics of the fast model over `files` (see
+/// `fast::build_priors`).
+pub fn fast_train(files: &[Vec<u8>]) -> Vec<(usize, Vec<u64>)> {
+    fast::TRAIN.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut totals: Vec<(usize, Vec<u64>)> = Vec::new();
+    for data in files {
+        let Ok(l) = format::parse(data, true) else { continue };
+        let Ok((mut coefs, _)) = format::decode_scans(&l, data) else { continue };
+        let rows = fast_stripes(&l.frame);
+        let geom = StripeGeom::new(&l);
+        for (k, mut p) in split_rows(&l.frame, &rows, &mut coefs).into_iter().enumerate() {
+            let mut e = fast::Enc::<fast::Base>::new();
+            let held: Vec<usize> = geom.v.iter().map(|&v| v * (rows[k].1 - rows[k].0)).collect();
+            let Ok(m) = fast::code_stripe(&mut e, &mut p, &held, &geom.width, &geom.v, &geom.extents(rows[k].0), &geom.q, rows[k].1 - rows[k].0, |_, _| Ok(())) else { continue };
+            let st = m.stats();
+            if totals.is_empty() {
+                totals = st.iter().map(|(n, c)| (*n, vec![0u64; c.len()])).collect();
+            }
+            for (t, (_, c)) in totals.iter_mut().zip(st) {
+                for (a, b) in t.1.iter_mut().zip(c) {
+                    *a += b as u64;
+                }
+            }
+        }
+    }
+    fast::TRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
+    totals
+}
+
+/// Describes a .komla JPEG container of either mode without decoding the image; also returns
+/// the original length and CRC-32.
+pub fn summary(b: &[u8]) -> Result<(JpegInfo, usize, u32), String> {
+    match b.get(6) {
+        Some(&MODE_FAST) | Some(&MODE_BYTES) if is_container(b) && b[5] == VERSION => {
+            let mut pos = 7;
+            let len = usize::try_from(get_varint(b, &mut pos)?).map_err(|_| "corrupt .komla file")?;
+            let crc = u32::from_le_bytes(take(b, &mut pos, 4)?.try_into().unwrap());
+            let mut i = JpegInfo { mode: b[6], ..Default::default() };
+            if b[6] == MODE_FAST {
+                let c = parse_fast(&b, len as u64, pos as u64)?;
+                let l = format::parse(&c.blob, false)?;
+                let f = &l.frame;
+                i.width = f.width as u32;
+                i.height = f.height as u32;
+                i.components = f.comps.len() as u8;
+                i.progressive = f.progressive;
+                i.sampling = sampling(f);
+                i.stripes = c.stripes.len() as u32;
+            }
+            Ok((i, len, crc))
+        }
+        _ => {
+            let c = parse_container(b)?;
+            Ok((info(b)?, c.len, c.crc))
+        }
+    }
 }
 
 /// Describes a .komla JPEG container without decoding it.

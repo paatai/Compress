@@ -62,20 +62,112 @@ pub struct Options {
     pub tuning: ct::Tuning,
 }
 
-pub fn crc32(data: &[u8]) -> u32 {
-    let mut table = [0u32; 256];
-    for (i, t) in table.iter_mut().enumerate() {
+/// CRC-32 tables for slicing by 8: `T[k][b]` is the CRC of byte b followed by k zero bytes.
+static CRC_TABLES: [[u32; 256]; 8] = {
+    let mut t = [[0u32; 256]; 8];
+    let mut i = 0;
+    while i < 256 {
         let mut c = i as u32;
-        for _ in 0..8 {
+        let mut j = 0;
+        while j < 8 {
             c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            j += 1;
         }
-        *t = c;
+        t[0][i] = c;
+        i += 1;
     }
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let c = t[k - 1][i];
+            t[k][i] = (c >> 8) ^ t[0][(c & 0xFF) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
+pub fn crc32(data: &[u8]) -> u32 {
+    crc32_continue(0, data)
+}
+
+/// CRC-32 of the data before (whose CRC is `prev`) followed by `data`.
+pub fn crc32_continue(prev: u32, data: &[u8]) -> u32 {
+    let t = &CRC_TABLES;
+    let mut crc = !prev;
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) ^ crc;
+        let hi = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+        crc = t[7][(lo & 0xFF) as usize]
+            ^ t[6][((lo >> 8) & 0xFF) as usize]
+            ^ t[5][((lo >> 16) & 0xFF) as usize]
+            ^ t[4][(lo >> 24) as usize]
+            ^ t[3][(hi & 0xFF) as usize]
+            ^ t[2][((hi >> 8) & 0xFF) as usize]
+            ^ t[1][((hi >> 16) & 0xFF) as usize]
+            ^ t[0][(hi >> 24) as usize];
+    }
+    for &b in chunks.remainder() {
+        crc = t[0][((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc ^ 0xFFFF_FFFF
+}
+
+/// CRC-32 of two pieces joined, from their CRCs and the length of the second (zeros appended to
+/// the first by squaring the one-zero-bit operator over GF(2), as zlib does).
+pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
+    fn times(m: &[u32; 32], mut v: u32) -> u32 {
+        let mut s = 0;
+        let mut i = 0;
+        while v != 0 {
+            if v & 1 != 0 {
+                s ^= m[i];
+            }
+            v >>= 1;
+            i += 1;
+        }
+        s
+    }
+    fn square(m: &[u32; 32]) -> [u32; 32] {
+        let mut r = [0u32; 32];
+        for (i, x) in r.iter_mut().enumerate() {
+            *x = times(m, m[i]);
+        }
+        r
+    }
+    if len2 == 0 {
+        return crc1;
+    }
+    let mut odd = [0u32; 32];
+    odd[0] = 0xEDB8_8320;
+    for (i, x) in odd.iter_mut().enumerate().skip(1) {
+        *x = 1 << (i - 1);
+    }
+    let mut even = square(&odd);
+    odd = square(&even);
+    let (mut c1, mut len) = (crc1, len2);
+    loop {
+        even = square(&odd);
+        if len & 1 != 0 {
+            c1 = times(&even, c1);
+        }
+        len >>= 1;
+        if len == 0 {
+            break;
+        }
+        odd = square(&even);
+        if len & 1 != 0 {
+            c1 = times(&odd, c1);
+        }
+        len >>= 1;
+        if len == 0 {
+            break;
+        }
+    }
+    c1 ^ crc2
 }
 
 fn put_varint(out: &mut Vec<u8>, mut v: u32) {
@@ -686,4 +778,36 @@ pub fn decompress(b: &[u8], opts: &Options, progress: &mut dyn FnMut(f32)) -> Re
     };
     let coded: Vec<u16> = decoded.into_iter().flatten().collect();
     Ok((finish(&info, coded)?, info.source))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn crc32_matches_the_bytewise_definition() {
+        assert_eq!(super::crc32(b"123456789"), 0xCBF4_3926);
+        let data: Vec<u8> = (0..100_003u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in &data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { 0xEDB8_8320 ^ (crc >> 1) } else { crc >> 1 };
+            }
+        }
+        for n in [0, 1, 7, 8, 9, 100_003] {
+            let mut c = 0xFFFF_FFFFu32;
+            for &b in &data[..n] {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            assert_eq!(super::crc32(&data[..n]), !c);
+        }
+        assert_eq!(super::crc32(&data), !crc);
+        for (a, b) in [(0usize, 0usize), (0, 5), (5, 0), (1, 1), (7, 9), (1000, 99_003)] {
+            let (x, y) = (&data[..a], &data[a..a + b]);
+            assert_eq!(super::crc32_continue(super::crc32(x), y), super::crc32(&data[..a + b]));
+            assert_eq!(super::crc32_combine(super::crc32(x), super::crc32(y), y.len() as u64), super::crc32(&data[..a + b]));
+        }
+    }
 }

@@ -1,9 +1,11 @@
+import { useState } from 'react'
 import { Cpu, Lock, ShieldCheck, Terminal } from 'lucide-react'
 import { Benchmark } from '@/components/benchmark'
 import { DropZone } from '@/components/drop-zone'
 import { HowItWorks } from '@/components/how-it-works'
 import { JpegBenchmark } from '@/components/jpeg-benchmark'
 import { JobCard } from '@/components/job-card'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useJobs } from '@/hooks/use-jobs'
 
 function Logo() {
@@ -19,6 +21,8 @@ function Logo() {
 
 export default function App() {
   const { jobs, addFiles, compareFormats, checkOriginal, remove } = useJobs()
+  const [jpegMode, setJpegMode] = useState<'fast' | 'max'>('fast')
+  const add = (files: FileList | File[]) => addFiles(files, jpegMode === 'fast')
 
   return (
     <div
@@ -26,7 +30,7 @@ export default function App() {
       onDragOver={(e) => e.preventDefault()}
       onDrop={(e) => {
         e.preventDefault()
-        if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files)
+        if (e.dataTransfer.files.length) add(e.dataTransfer.files)
       }}
     >
       <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
@@ -61,8 +65,8 @@ export default function App() {
             <h1 className="text-3xl font-semibold tracking-tight text-balance sm:text-5xl">Lossless image compression, smaller than WebP and JPEG XL.</h1>
             <p className="text-lg text-pretty text-muted-foreground">
               Drop a PNG or BMP and get a <code className="rounded bg-muted px-1 py-0.5 text-base">.komla</code> file that decodes back to exactly the same
-              pixels, bit for bit. Drop a JPEG and it shrinks by about a quarter, and comes back as the very same file, byte for byte. Everything runs here in your
-              browser; your images never leave your computer.
+              pixels, bit for bit. Drop a JPEG and it shrinks by a fifth to a quarter, and comes back as the very same file, byte for byte. Everything runs here in
+              your browser; your images never leave your computer.
             </p>
             <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm text-muted-foreground">
               <span className="flex items-center gap-1.5">
@@ -76,7 +80,21 @@ export default function App() {
               </span>
             </div>
           </div>
-          <DropZone onFiles={addFiles} />
+          <DropZone onFiles={add} />
+          <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-2 text-sm text-muted-foreground">
+            <span>JPEG mode</span>
+            <Tabs value={jpegMode} onValueChange={(v) => setJpegMode(v === 'max' ? 'max' : 'fast')}>
+              <TabsList>
+                <TabsTrigger value="fast">Fast</TabsTrigger>
+                <TabsTrigger value="max">Maximum compression</TabsTrigger>
+              </TabsList>
+            </Tabs>
+            <span>
+              {jpegMode === 'fast'
+                ? 'about a fifth smaller, a 12-megapixel photo in about a second'
+                : 'about a quarter smaller, a 12-megapixel photo in ten to twenty seconds'}
+            </span>
+          </div>
           {jobs.length > 0 && (
             <div className="space-y-4">
               {jobs.map((j) => (
@@ -86,8 +104,8 @@ export default function App() {
           )}
           {jobs.length === 0 && (
             <p className="text-center text-sm text-muted-foreground">
-              Supports 8- and 16-bit grayscale, RGB and RGBA PNG (including palette PNGs), uncompressed BMP, and baseline and progressive JPEG. Large photos take a
-              while: a 12-megapixel PNG needs roughly half a minute on a recent laptop, a 12-megapixel JPEG about ten to twenty seconds.
+              Supports 8- and 16-bit grayscale, RGB and RGBA PNG (including palette PNGs), uncompressed BMP, and baseline and progressive JPEG. A 12-megapixel PNG
+              needs roughly half a minute on a recent laptop; a 12-megapixel JPEG about a second in the fast mode, ten to twenty seconds at maximum compression.
             </p>
           )}
         </section>

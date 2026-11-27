@@ -6,7 +6,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
 import type { Job } from '@/hooks/use-jobs'
 import { describeChannels, describeJpeg, download, formatBpp, formatBytes, formatSeconds, jpegName, stripExt } from '@/lib/format'
-import { JPEG_MODE_RECOMPRESSED } from '@/lib/protocol'
+import { JPEG_MODE_FAST, JPEG_MODE_RECOMPRESSED } from '@/lib/protocol'
 import { SizeTable, type SizeRow } from './size-table'
 
 function modeLabel(mode: number, paletteSize: number) {
@@ -63,7 +63,8 @@ export function JobCard({
 
   const canCompare = !isJpeg && job.kind === 'compress' && (job.status === 'done' || job.status === 'verifying') && !!job.samples && job.webp.state === 'idle'
   const restored = isJpeg ? job.jpeg : job.png
-  const stored = isJpeg && jinfo && jinfo.mode !== JPEG_MODE_RECOMPRESSED
+  const recompressed = !!jinfo && (jinfo.mode === JPEG_MODE_RECOMPRESSED || jinfo.mode === JPEG_MODE_FAST)
+  const stored = isJpeg && jinfo && !recompressed
 
   return (
     <Card className="overflow-hidden">
@@ -88,14 +89,14 @@ export function JobCard({
           )}
           {jinfo && (
             <div className="space-y-0.5 text-xs text-muted-foreground">
-              {jinfo.mode === JPEG_MODE_RECOMPRESSED ? (
+              {recompressed ? (
                 <>
                   <div>
                     {jinfo.width} × {jinfo.height} px
                   </div>
                   <div>{describeJpeg(jinfo)}</div>
-                  <div>Mode: lossless JPEG recompression</div>
-                  {jinfo.stripes > 1 && <div>{jinfo.stripes} stripes coded in parallel</div>}
+                  <div>Mode: lossless JPEG recompression{jinfo.mode === JPEG_MODE_FAST ? ', fast' : ', maximum compression'}</div>
+                  {jinfo.stripes > 1 && <div>{jinfo.stripes} stripes{jinfo.mode === JPEG_MODE_FAST ? '' : ' coded in parallel'}</div>}
                 </>
               ) : (
                 <div>Mode: stored as is</div>

@@ -29,7 +29,7 @@ const steps = [
   {
     icon: FileImage,
     title: 'Recompress JPEGs, byte for byte',
-    text: "A JPEG's Huffman-coded data is decoded back to its DCT coefficients. Each block's coefficients are predicted from the neighbouring blocks (least-squares fits learned on the image, smooth boundaries, chroma from luma) and coded with the same context mixing. The decoder regenerates the original Huffman data, headers and metadata exactly.",
+    text: "A JPEG's Huffman-coded data is decoded back to its DCT coefficients. Each block's coefficients are predicted from the neighbouring blocks (least-squares fits learned on the image, smooth boundaries, chroma from luma) and coded with the same context mixing. The fast mode codes one adaptive symbol per coefficient with an rANS coder instead, decoding stripes on all cores straight back into JPEG data. Either way the decoder regenerates the original Huffman data, headers and metadata exactly.",
   },
   {
     icon: Sigma,

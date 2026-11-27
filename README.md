@@ -12,6 +12,17 @@ That is 5.2% less output than paq8px, 6.3% less than Dropbox's Lepton and 9.7% l
 XL's lossless JPEG transcoding. paq8px remains 1.5 points ahead on baseline JPEGs, but it
 cannot model progressive JPEGs, which Komla handles as well as baseline ones.
 
+A **fast JPEG mode** (`komla compress --fast`, and the web app's default) is built for speed and
+little memory. On 66 JPEGs (228 MB) drawn at random for the final evaluation and run once, after
+the code was frozen, it was **the fastest to compress and to decompress and used the least
+memory** of all the tools compared (JPEG XL, Dropbox's Lepton and its Rust port, brunsli,
+packJPG, paq8px), on one core and on eight: for example **6 MiB to decompress** (Lepton 19 MiB,
+the others 266 MiB or more) and **42 MiB to compress** (the others 224 MiB or more). The JPEGs
+got **19.9% smaller**, more than with JPEG XL (18.0%), brunsli (19.7%) and Lepton, but packJPG
+(20.2%) and the single-threaded Rust port of Lepton (20.1%) did slightly better on these files,
+and paq8px (20.7%) better still, at a thousandth of the speed. Details and the development and test sets:
+[below](#fast-mode-size-speed-and-memory).
+
 It comes as
 
 - a **web app** that runs entirely in the browser (the codec is compiled to WebAssembly;
@@ -128,11 +139,73 @@ per-file numbers: `bench/results/jpeg_test.jsonl` and `jpeg_dev.jsonl`.
 | packJPG | packJPG 2.5n |
 | paq8px | paq8px v217: `paq8px -8` |
 
-**Speed.** Single-threaded, Komla compresses and decompresses about 0.37 MB of JPEG per second
-(paq8px 0.01 MB/s, JPEG XL 0.4 MB/s to compress and 9.6 to restore, Lepton 3.3 and 18 MB/s).
-Files above about 5.6 megapixels are split into stripes coded in parallel: in the browser
-(headless Chrome, 8 cores) a 12.6-megapixel photo is compressed and verified in 13 seconds, a
-24-megapixel one in 12.5 seconds.
+**Speed.** Single-threaded, the default (maximum compression) mode compresses and
+decompresses about 0.35 MB of JPEG per second (paq8px 0.01 MB/s). Files above about 5.6
+megapixels are split into stripes coded in parallel: in the browser (headless Chrome, 8
+cores) a 12.6-megapixel photo is compressed and verified in 13 seconds, a 24-megapixel one in
+12.5 seconds. The fast mode below compresses about 39 times and decompresses about 48 times as
+fast on one core (test set; the maximum mode was not timed again in the final evaluation).
+
+### Fast mode: size, speed and memory
+
+Three sets: the *development set* (used for all tuning), the *test set* (held out from tuning,
+but run in earlier evaluations) and a *random held-out set* drawn for the final evaluation: 66
+files (227.6 MB) picked with seed 20261127 from a recorded pool of 9,999 freely licensed
+Wikimedia Commons JPEGs (camera originals of 16 models not used before, edited and featured
+photos, progressive, black-and-white, screenshots, scans and small web images), sharing no
+file with the other sets, and run exactly once, after Komla's code was frozen (commit
+8430279). Every tool ran on every file one process at a time, all tools on one file before
+the next, single-threaded and at its default thread count on 8 cores (x86-64 virtual machine
+with AVX2), files on a RAM disk. Speeds are megabytes of original JPEG per second for the whole
+process (fastest of three runs; the three runs' totals differ by 0.1 to 5.3%), memory is the
+largest peak resident set of any file (`/usr/bin/time`), and every output was restored and
+compared with the original byte for byte. JPEG XL runs at its default effort (7).
+
+Random held-out set:
+
+| Tool | Threads | Smaller | Compress | Decompress | Memory, compress | Memory, decompress | Failed |
+|---|---|---|---|---|---|---|---|
+| **Komla fast** | 1 | **19.88%** | **11.66 MB/s** | **14.78 MB/s** | **42 MiB** | **6 MiB** | 0 |
+| JPEG XL | 1 | 17.99% | 7.35 MB/s | 13.57 MB/s | 964 MiB | 274 MiB | 0 |
+| Lepton (Dropbox) | 1 | 14.82% | 3.40 MB/s | 7.74 MB/s | 224 MiB | 19 MiB | 14 |
+| Lepton (Rust port) | 1 | 20.12% | 9.52 MB/s | 8.68 MB/s | 265 MiB | 505 MiB | 0 |
+| brunsli | 1 | 19.67% | 8.60 MB/s | 10.46 MB/s | 788 MiB | 266 MiB | 0 |
+| packJPG | 1 | 20.20% | 3.28 MB/s | 3.18 MB/s | 271 MiB | 268 MiB | 0 |
+| paq8px | 1 | 20.66% | 0.009 MB/s | 0.009 MB/s | 2791 MiB | 2791 MiB | 0 |
+| **Komla fast** | 8 | **19.88%** | **34.01 MB/s** | **41.40 MB/s** | **80 MiB** | **77 MiB** | 0 |
+| JPEG XL | 8 | 17.99% | 12.31 MB/s | 23.39 MB/s | 957 MiB | 286 MiB | 0 |
+| Lepton (Dropbox) | 8 | 19.78% | 7.50 MB/s | 20.89 MB/s | 290 MiB | 291 MiB | 0 |
+| Lepton (Rust port) | 8 | 19.80% | 21.37 MB/s | 24.80 MB/s | 277 MiB | 505 MiB | 0 |
+
+brunsli, packJPG and paq8px have no threads (their rows apply to both). paq8px needs hours for
+this set, so it ran separately, several files at a time; its times are only indicative.
+Lepton's single-threaded mode refuses 14 files (its own round-trip check fails), which count
+at their original size; no tool crashed or restored a file wrongly, and Komla coded every file
+in its fast mode.
+
+Komla fast against the other tools on all five axes (size, compression speed, decompression
+speed, memory to compress, memory to decompress; speed and memory within 5% count as ties, size
+differences are exact):
+
+| Set | One thread | Eight threads | Not won |
+|---|---|---|---|
+| Random held-out, 66 files | 27 wins, 3 losses | 28 wins, 2 losses | size: paq8px 20.66%, packJPG 20.20% and Lepton's Rust port (one thread) 20.12% against 19.88% |
+| Test, 80 files | 26 wins, 1 tie, 1 loss | 27 wins, 1 loss | size: paq8px 19.97% against 19.68%; one-thread decompression ties JPEG XL (Komla 2.8% slower) |
+| Development, 80 files (tuning set) | 28 wins, 1 tie, 1 loss | 29 wins, 1 loss | size: paq8px 20.75% against 20.66%; one-thread decompression ties JPEG XL (Komla 0.6% faster) |
+
+Tuning risk: on the development set Komla fast makes the files 20.66% smaller and is ahead of
+every tool but paq8px (0.10 points behind) on size; on the held-out set it is 0.24 points behind
+the Rust port of Lepton, 0.32 behind packJPG and 0.78 behind paq8px. Part of that gap may be the tuning (the development set shaped
+the model and its learned starting distributions), part the kind of files: on the held-out set
+Komla fast trails on camera originals, edited photos and scans, and leads on progressive files,
+screenshots and small web images (per-group table in the report). The
+narrowest speed margin is one-thread decompression against JPEG XL: a tie on the development
+and test sets, 9% faster on the held-out set. In the browser (WebAssembly, one worker) a
+10-megapixel, 7.8 MB photo is compressed and verified in 1.3 seconds. All tables (with the
+development and test sets,
+per-group sizes, run-to-run spread and failures):
+[`bench/results/JPEG_SPEED_REPORT.md`](bench/results/JPEG_SPEED_REPORT.md); per-file numbers:
+`bench/results/jpeg_speed_{heldout,test,dev}.jsonl` and `bench/results/jpeg_paq8px_*.jsonl`.
 
 **Data sets** (built and hash-checked by `bench/fetch_jpeg_datasets.py`):
 
@@ -144,6 +217,12 @@ Files above about 5.6 megapixels are split into stripes coded in parallel: in th
   including phones, progressive JPEGs from Quality and Featured images, grayscale JPEGs from
   black-and-white photographs, and JPEG screenshots. Files in a size range are sorted by SHA-1
   and the ones passing the group's check alternate between test and development set.
+- *Random held-out set* (`bench/select_heldout.py`, same licences): the pool and the draw are
+  recorded in `bench/datasets/jpeg_heldout_pool.json.gz` and `bench/datasets/jpeg_heldout.json`;
+  each group's pool, sorted by SHA-1, is shuffled with the seed and the first files passing the
+  group's check are kept. 50 baseline and 16 progressive files; 4:4:4 (29), 4:2:0 (23), 4:2:2 (4),
+  1×2 (1) and grayscale (9); 14 with restart markers, 3 with data after the image; 35 KB to 13.5
+  MB, up to 41.7 megapixels.
 
 ## Using it
 
@@ -154,7 +233,8 @@ decoded again in the browser and compared with the original by SHA-256 (the pixe
 BMP, the whole file of a JPEG) before it is offered as verified. For PNG and BMP the page also
 shows the size of the original file, ZIP -9 of the same pixels, and (one click) lossless WebP
 and JPEG XL computed in your browser with WebAssembly builds of libwebp and libjxl; for a JPEG
-it shows how much smaller the `.komla` file is. Drop a `.komla` file to restore the original:
+it shows how much smaller the `.komla` file is. JPEGs use the fast mode unless "Maximum
+compression" is selected under the drop zone. Drop a `.komla` file to restore the original:
 a JPEG comes back as the identical JPG file, a PNG or BMP as a PNG with the exact original
 pixels. "Check against original…" compares the result with the file you started from.
 
@@ -183,9 +263,10 @@ komla info photo.png.komla        # mode, stripes, checksum, bits per pixel
 komla bench *.png                 # compress, decompress and verify, with timings
 komla pixhash a.png b.png         # SHA-256 of the pixels, independent of the file format
 
-komla compress photo.jpg          # writes photo.jpg.komla
-komla decompress photo.jpg.komla  # restores photo.jpg, identical to the original file
-komla bench *.jpg                 # compress, decompress, compare files by SHA-256, timings
+komla compress photo.jpg          # writes photo.jpg.komla (maximum compression)
+komla compress --fast photo.jpg   # fast mode, on all cores (KOMLA_THREADS=n to limit)
+komla decompress photo.jpg.komla  # restores photo.jpg, identical to the original file (either mode)
+komla bench [--fast] *.jpg        # compress, decompress, compare files by SHA-256, timings
 ```
 
 Decompression always checks the CRC-32 stored in the file (of the pixels for PNG/BMP, of the
@@ -203,7 +284,7 @@ byte stream. For JPEG, everything: the restored file is the original file, byte 
 | Input | What `.komla` stores | Restores |
 |---|---|---|
 | PNG (all colour types, 1–16 bit, interlaced), BMP (1/4/8/24/32-bit, uncompressed) | the pixels, coded by the image model | the exact pixels, as PNG (or BMP) |
-| JPEG: baseline and extended sequential, progressive (spectral selection and successive approximation), Huffman coded, 8-bit, 1–4 components, any sampling factors, restart markers | the quantized DCT coefficients, coded by the JPEG model, plus everything needed to rebuild the file: all marker segments verbatim (EXIF, ICC, XMP, comments, tables), padding bits, bytes after the end of the image, how end-of-band runs were split | the original file, byte for byte |
+| JPEG: baseline and extended sequential, progressive (spectral selection and successive approximation), Huffman coded, 8-bit, 1–4 components, any sampling factors, restart markers | the quantized DCT coefficients, coded by the JPEG model (default) or the fast JPEG model (`--fast`), plus everything needed to rebuild the file: all marker segments verbatim (EXIF, ICC, XMP, comments, tables), padding bits, bytes after the end of the image, how end-of-band runs were split | the original file, byte for byte |
 | Any other JPEG (arithmetic coded, lossless or hierarchical, 12-bit, truncated or damaged) | the file itself, coded with a general-purpose byte model | the original file, byte for byte |
 
 A JPEG is only recompressed after Komla has regenerated every scan from the decoded
@@ -361,6 +442,77 @@ statistics (−0.2), coding all nonzero counts first so that blocks can see the 
 blocks to the right and below (0), phase-continuity sign contexts (0), least-squares inputs
 from blocks two steps away (0).
 
+### Fast JPEG mode
+
+`komla compress --fast` (and the web app's default JPEG mode) uses the same parser, the same
+libjpeg-rule re-encoder and the same verification, with a model built for speed:
+
+1. **One decoding step per coefficient.** Whether a coefficient is zero is a 16-bit adaptive
+   binary probability; a nonzero coefficient's magnitude is one symbol out of 14 classes (the
+   class includes the bit below the leading one), from an adaptive cumulative-frequency
+   distribution; signs and the remaining mantissa bits, which are close to random, go to a
+   separate stream of raw bits. Symbols are coded with two interleaved rANS states: the decoder
+   finds a symbol by comparing the state's slot with the 16 cumulative frequencies in one SIMD
+   operation, with no division, and the distributions adapt with shifts.
+2. **Lepton's coding order and predictions.** Per block: the number of nonzero coefficients
+   among the 49 with u, v ≥ 1, those coefficients in zigzag order, then the first row and the
+   first column with their own counts, and DC last. Each first-row (first-column) coefficient
+   and DC is predicted by extending the block above's (left's) inverse-DCT profile across the
+   block boundary linearly, at that frequency; the prediction picks the contexts and predicts
+   the sign.
+3. **Contexts.** An interior coefficient's context is its position, the number of nonzero
+   coefficients still to come, and a running estimate of its magnitude: the same coefficient in
+   the four neighbouring blocks, plus every coefficient of the block coded so far that lies to
+   its left, above, diagonally, two steps away or just before it on its anti-diagonal (each
+   coded coefficient adds itself to the estimates of the positions after it). Magnitudes also
+   see the anti-diagonal and how dense the remaining nonzero coefficients are. Edge
+   coefficients use the prediction (its class picks the magnitude distribution, and how well
+   the magnitude agrees with it picks the sign probability), the adjacent interior
+   coefficients and the previous edge coefficient, and the same coefficient in the neighbouring
+   blocks; a chroma block's count sees the counts of the luma blocks at the same place.
+4. **Learned starting point.** Every distribution starts from frequencies learned on the
+   development set (`komla jtrain`; 272 KB compiled into the program) instead of a flat
+   guess, which matters for small images and for every stripe.
+5. **Speed and memory.** Images are cut into stripes of about 32 000 blocks, coded and decoded
+   on all cores. Both directions stream. Compressing, every scan has its own incremental
+   Huffman decoder, so the coefficients of one stripe at a time are decoded from all scans; one
+   thread regenerates the scans from the stripes in order and checks them against the input
+   while the other threads code the stripes, with at most a few stripes in memory.
+   Decompressing reads the `.komla` file piece by piece and writes the JPEG straight to its
+   place in the output file: with one thread, every MCU row is turned back into scan data as
+   soon as it is decoded (a ring of two MCU rows); with more, the side info holds each
+   sequential scan's encoder state at every stripe boundary, so the threads that decode the
+   stripes also regenerate their scan data, and only the writing is in order. Scan data is
+   regenerated by walking the nonzero coefficients through 64-bit masks and writing whole
+   words. On x86-64 the hot loops also exist compiled for AVX2/BMI2, chosen at run time;
+   WebAssembly uses SIMD128.
+6. **Determinism.** Integer arithmetic only: SSE2, AVX2, scalar and WebAssembly code paths
+   produce the same files.
+
+What helped, on the development set (2-fold cross-validated, so the learned starting points
+never saw the files they were scored on):
+
+| Step | Saved |
+|---|---|
+| Multi-symbol model with Lepton's order, edge/DC continuity prediction, no learned priors | 18.04% |
+| Learned starting distributions | 18.39% |
+| Diagonal neighbours in the interior context | 18.51% |
+| Coefficients above/left in the same block, combined with the neighbours into one magnitude estimate | 18.97% |
+| Edge contexts: adjacent interior coefficient; chroma counts from luma | 19.27% |
+| Edge contexts: the same coefficient in the neighbouring blocks | 19.39% |
+| Edge prediction extrapolated linearly across the boundary instead of continued flat | 19.58% |
+| The same for DC | 19.70% |
+| Edge magnitudes and signs by the class of the prediction; magnitudes by anti-diagonal and the remaining count; diagonal and farther coefficients of the same block in the estimate | 20.44% |
+| Running magnitude estimate, density of the remaining coefficients, wider edge neighbourhood (and fewer, larger tables: same speed) | 20.57% |
+
+Tried and dropped: one 15-symbol distribution for zero and magnitude together (fewer steps but
+much worse on small images), count-based update rates for the binary probabilities (no better
+than a fixed rate once priors exist), smaller joint edge contexts (0.1 points worse, no
+faster), coding the top mantissa bit with a probability (+0.15 points, but 7 to 10% slower
+decoding), four times larger stripes (+0.18 points, but four times the memory with eight
+threads), DC contexts from the neighbours' DC prediction errors (no gain), and other prior
+strengths (no gain).
+
 ## Reproducing the benchmark
 
 Lossless image compression (PNG/BMP):
@@ -389,13 +541,31 @@ python3 bench/run_jpeg_benchmark.py --set dev
 python3 bench/make_jpeg_report.py   # writes bench/results/JPEG_REPORT.md and the site's table
 ```
 
+Size, speed and memory of the fast mode and the other tools (one process at a time, all tools
+on a file before the next; about 50 minutes on 8 cores for the three sets without Komla's
+maximum mode), and paq8px separately (hours; several files at a time):
+
+```bash
+python3 bench/select_heldout.py pool    # lists the Commons pool -> bench/datasets/jpeg_heldout_pool.json
+python3 bench/select_heldout.py draw    # seeded random draw -> bench/datasets/jpeg_heldout.json
+python3 bench/select_heldout.py fetch   # downloads the held-out set, checks SHA-1
+python3 bench/run_jpeg_speed.py --set heldout --codecs jxl,brunsli,packjpg,lepton,lepton-rust,komla-fast
+python3 bench/run_jpeg_speed.py --set test ...   # and --set dev; --threads 1t,mt, --reps
+python3 bench/run_paq8px.py --set heldout --jobs 5
+python3 bench/make_jpeg_speed_report.py # writes bench/results/JPEG_SPEED_REPORT.md and the site's table
+```
+
+The fast model's learned starting distributions come from the development set:
+`komla jtrain -o codec/src/jpeg/fast_priors.bin bench/data/jpeg/dev/*/*.jpg` (then rebuild).
+
 `bench/select_jpegs.py` is the script that chose the Commons files (it queries Wikimedia
 Commons; its output is `bench/datasets/jpeg_commons.json`). paq8px is slow (about 0.01 MB/s
 per file on large photos); `PAQ8PX_JOBS` sets how many copies run at once (2.5 GB each).
 
-Tests: `cargo test --release` (round trips, corrupt input, JPEG fixtures, stored fallback,
-every single-byte corruption of a `.komla` JPEG file), `node tests/cross_target.mjs` (native and
-WebAssembly give identical files, for images and JPEGs), `python3 tests/make_edge_cases.py`
+Tests: `cargo test --release` (round trips, corrupt input, JPEG fixtures in both modes,
+stored fallback, every single-byte corruption of a `.komla` JPEG file, fast-mode output
+independent of the thread count), `node tests/cross_target.mjs` (native and WebAssembly give
+identical files, for images and JPEGs in both modes), `python3 tests/make_edge_cases.py`
 (1×1 images, 16-bit, palettes with transparency, interlaced PNG, BMP variants, JPEG variants
 including progressive with restart markers, EXIF/ICC/comments, trailing data and a truncated
 file), `node web/e2e/jpeg.mjs` (browser round trip of JPEG files).
@@ -417,7 +587,9 @@ headers (it does not use SharedArrayBuffer); parallelism comes from one Web Work
 
 ```
 codec/   the codec library (Rust): models, range coder, container, PNG/BMP I/O;
-         codec/src/jpeg: JPEG parsing and bit-exact re-encoding, coefficient model, container
+         codec/src/jpeg: JPEG parsing and bit-exact re-encoding (format.rs, and the fast
+         scan encoder huff.rs), coefficient models (model.rs; fast mode: fast.rs and its
+         learned starting distributions fast_priors.bin), container (mod.rs)
 cli/     the komla command-line tool
 wasm/    C-ABI WebAssembly bindings used by the web app
 web/     Vite + React + Tailwind + shadcn/ui app (workers in web/src/workers)

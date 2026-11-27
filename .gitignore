@@ -9,3 +9,4 @@ web/src/wasm/komla.wasm
 bench/data/
 bench/.select_cache.json
 bench/results/*.partial
+bench/__pycache__/
