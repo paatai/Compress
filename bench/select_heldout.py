@@ -6,6 +6,9 @@ downloads it to bench/data/jpeg/heldout/<group>/.
   python3 select_heldout.py draw      draws from the pool -> datasets/jpeg_heldout.json
   python3 select_heldout.py fetch     downloads the drawn files (checks SHA-1)
 
+  A further set from the same pool: draw/fetch --name heldout2 --seed 20261128
+  --exclude datasets/jpeg_heldout.json (writes datasets/jpeg_heldout2.json, data/jpeg/heldout2).
+
 Pool: for each group, the JPEG files among the first MAX_MEMBERS files (API order) of each of
 its categories, with a free licence (CC0, public domain, CC BY, CC BY-SA) and a size in the
 group's range, minus every file of the development and test sets (by SHA-1 and by title).
@@ -31,8 +34,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SEED = 20261127
 POOL = os.path.join(HERE, "datasets", "jpeg_heldout_pool.json.gz")
 FIELDS = ["sha1", "bytes", "title", "make", "model", "licence"]
-DRAW = os.path.join(HERE, "datasets", "jpeg_heldout.json")
-DATA = os.path.join(HERE, "data", "jpeg", "heldout")
 PHOTOS = ["Category:Quality images", "Category:Valued images", "Category:Featured pictures on Wikimedia Commons"]
 # (group, files, min bytes, max bytes, categories)
 GROUPS = [
@@ -104,12 +105,15 @@ def pool():
         fo.write(gzip.compress(json.dumps(out, separators=(",", ":")).encode(), 9, mtime=0))
 
 
-def draw():
+def draw(name, seed, exclude):
     p = json.loads(gzip.decompress(open(POOL, "rb").read()))
+    seed = seed or p["seed"]
     kept, seen = [], set()
+    for path in exclude:
+        seen |= {f["sha1"] for f in json.load(open(os.path.join(HERE, path)))["files"]}
     for group, g in p["groups"].items():
         order = [entry(r) for r in g["pool"]]
-        random.Random(f"{p['seed']}:{group}").shuffle(order)
+        random.Random(f"{seed}:{group}").shuffle(order)
         k = 0
         for f in order:
             if k >= g["files"]:
@@ -120,13 +124,16 @@ def draw():
             kept.append(dict(f, group=group))
             k += 1
         print(f"{group}: {k} drawn from {len(order)}", file=sys.stderr)
-    json.dump({"seed": p["seed"], "pool": os.path.basename(POOL), "files": kept}, open(DRAW, "w"), indent=1)
+    out = {"seed": seed, "pool": os.path.basename(POOL), "files": kept}
+    if exclude:
+        out["excluded"] = exclude
+    json.dump(out, open(os.path.join(HERE, "datasets", f"jpeg_{name}.json"), "w"), indent=1)
 
 
-def fetch():
+def fetch(name):
     from fetch_jpeg_datasets import fetch as get
-    for f in json.load(open(DRAW))["files"]:
-        path = os.path.join(DATA, f["group"], f"{f['group']}_{f['sha1'][:10]}.jpg")
+    for f in json.load(open(os.path.join(HERE, "datasets", f"jpeg_{name}.json")))["files"]:
+        path = os.path.join(HERE, "data", "jpeg", name, f["group"], f"{f['group']}_{f['sha1'][:10]}.jpg")
         if os.path.exists(path) and hashlib.sha1(open(path, "rb").read()).hexdigest() == f["sha1"]:
             continue
         data = get(f["url"])
@@ -135,8 +142,20 @@ def fetch():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         open(path, "wb").write(data)
         time.sleep(3)
-    print("held-out set ready in", DATA, file=sys.stderr)
+    print("held-out set ready in", os.path.join(HERE, "data", "jpeg", name), file=sys.stderr)
 
 
 if __name__ == "__main__":
-    {"pool": pool, "draw": draw, "fetch": fetch}[sys.argv[1]]()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("step", choices=["pool", "draw", "fetch"])
+    ap.add_argument("--name", default="heldout")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--exclude", action="append", default=[])
+    a = ap.parse_args()
+    if a.step == "pool":
+        pool()
+    elif a.step == "draw":
+        draw(a.name, a.seed, a.exclude)
+    else:
+        fetch(a.name)
