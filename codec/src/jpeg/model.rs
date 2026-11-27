@@ -43,7 +43,7 @@ const DYN_B: usize = 24;
 const DYN_C: usize = 8;
 
 /// Model parameters; KOMLA_JTUNE="i=v,..." overrides them for experiments (both sides must agree).
-const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 0, 0, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 16, 1, 16, 1, 2, 0];
+const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 1, 0, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 32, 1, 16, 1, 2, 0];
 
 fn tune() -> &'static [i32; 24] {
     static T: std::sync::OnceLock<[i32; 24]> = std::sync::OnceLock::new();
@@ -768,8 +768,9 @@ impl Model {
             let c9 = if u > 1 && v > 1 { cur[n - 9] as i32 } else { 0 };
             let px = if has_cc { pr8[n] } else { pc8[n] };
             let lsi = ucls * 49 + j;
-            let pls = if self.ls_on {
-                let mut x = [0f64; 40];
+            let use_ls = self.ls_on && (tune()[23] == 0 || (j as i32) < tune()[23]);
+            let pls = if use_ls {
+                let mut x = [0f64; 44];
                 for (i, &(src, idx)) in self.ls_feats[lsi].iter().enumerate() {
                     let idx = idx as usize;
                     x[i] = match src {
@@ -800,7 +801,11 @@ impl Model {
                     hash2(20 + k, (((clip(va, 4) + 4) as u32) << 8) | (((clip(vl, 4) + 4) as u32) << 4) | (cls << 1))
                 },
                 hash2(30 + k, (nz77.min(49) << 8) | ((nz77 - left).min(31) << 2) | cls),
-                hash2(40 + k, (mb(var.unsigned_abs()) << 12) | (mb(val.unsigned_abs()) << 8) | (mb(wavg) << 2) | cls),
+                if self.ls_on && tune()[7] == 1 {
+                    hash2(40 + k, (((clip(r8(pls), 15) + 16) as u32) << 10) | (nzb(left) << 5) | (lsconf << 1) | cls)
+                } else {
+                    hash2(40 + k, (mb(var.unsigned_abs()) << 12) | (mb(val.unsigned_abs()) << 8) | (mb(wavg) << 2) | cls)
+                },
                 hash2(50 + k, (mb(act) << 8) | (nzb(left) << 2) | cls),
                 hash2(60 + k, if luma { (mb(rem) << 8) | (run.min(15) << 2) } else { (pb(px) << 8) | (nzb(left) << 3) | 1 }),
                 hash2(70 + k, (run.min(15) << 8) | (nzb(left) << 3) | cls),
@@ -823,15 +828,15 @@ impl Model {
             self.sel = [ucls, k as usize * 2 + ucls, (nzb(left) as usize) * 4 + (mb(wavg) as usize).min(3)];
             self.actx = [k as usize * 2 + ucls, (mb(wavg) as usize) * 16 + nzb(left) as usize];
             self.pred8 = if luma { 2 * wavg as i32 } else { px };
-            self.pmu8 = if self.ls_on { pls } else if luma { 0 } else { px };
-            self.spred8 = if self.ls_on { pls } else { self.pred8 };
+            self.pmu8 = if use_ls { pls } else if luma { 0 } else { px };
+            self.spred8 = if use_ls { pls } else { self.pred8 };
             let ei = ((ucls * 64 + k as usize) * 12 + nzb(left) as usize) * 16 + mb(wavg) as usize;
             self.ps8 = match tune()[15] {
                 0 => 0,
                 f if f > 0 => (wavg as i32 * f / 16).max(2),
                 f => (self.emag[ei] * -f / 64 / 11).max(2),
             };
-            if self.ls_on && tune()[20] > 0 {
+            if use_ls && tune()[20] > 0 {
                 self.ps8 = (self.ls_err[lsi] * tune()[20] / 64).max(2);
             }
             self.dyn_base = PART_INTERIOR * SLOTS * DYN_B * DYN_C + (k as usize >> 3).min(7);
@@ -841,7 +846,7 @@ impl Model {
             cur[n] = val as i16;
             let em = &mut self.emag[ei];
             *em += (64 * val.unsigned_abs().min(1 << 16) as i32 - *em) >> 5;
-            if self.ls_on {
+            if use_ls {
                 self.ls[lsi].update((val * q[n]) as f64);
                 track(&mut self.ls_err[lsi], 8 * val - pls);
             }
@@ -1299,6 +1304,13 @@ fn ls_feats(class: usize, j: usize) -> Vec<(u8, u8)> {
         }
         if ZZ[v * 8 + g] < ZZ[n] {
             f.push((4, (v * 8 + g) as u8));
+        }
+    }
+    // diagonal neighbours in frequency already coded in this block
+    for (du, dv) in [(-1i32, -1i32), (1, -1), (-1, 1)] {
+        let (uu, vv) = (u as i32 + du, v as i32 + dv);
+        if (1..8).contains(&uu) && (1..8).contains(&vv) && ZZ[(vv * 8 + uu) as usize] < ZZ[n] {
+            f.push((4, (vv * 8 + uu) as u8));
         }
     }
     f.push((2, n as u8));
