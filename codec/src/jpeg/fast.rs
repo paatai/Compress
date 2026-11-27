@@ -685,7 +685,6 @@ const NZB: [u8; 64] = {
     t
 };
 const NNZB: usize = 16;
-const NNB: usize = 8;
 /// Bucket of the magnitude estimate of an interior coefficient (about 1.45 times wider each).
 const EQ: [u8; 256] = {
     let mut t = [0u8; 256];
@@ -713,33 +712,27 @@ const EQ: [u8; 256] = {
 };
 const NEQ: usize = 14;
 /// Zone of an interior position (index into INTERIOR) for magnitudes, times NEQ.
-const IZE: [u8; 49] = {
-    let mut t = [0u8; 49];
+const IZE: [u16; 49] = {
+    let mut t = [0u16; 49];
+    let mut z = [255u8; 39];
+    let mut n = 0;
     let mut i = 0;
     while i < 49 {
-        t[i] = (IZ8[i] / NNB as u8) * NEQ as u8;
+        let p = INTERIOR[i] as usize;
+        let (r, c) = (p / 8, p % 8);
+        let k = (r + c - 2) * 3 + if r < c { 0 } else if r == c { 1 } else { 2 };
+        if z[k] == 255 {
+            z[k] = n;
+            n += 1;
+        }
+        t[i] = z[k] as u16 * NEQ as u16;
         i += 1;
     }
     t
 };
 
-const NKZ: usize = 8;
+const NKZ: usize = 29;
 
-/// Coarse bucket of the number of nonzero coefficients still to code.
-const REMQ: [u8; 64] = {
-    let mut t = [0u8; 64];
-    let mut i = 0;
-    while i < 64 {
-        t[i] = match i {
-            0..=2 => 0,
-            3..=8 => 1,
-            _ => 2,
-        };
-        i += 1;
-    }
-    t
-};
-const NREMQ: usize = 3;
 
 /// Positions with both frequencies nonzero, in zigzag order.
 const INTERIOR: [u8; 49] = {
@@ -752,26 +745,6 @@ const INTERIOR: [u8; 49] = {
             n += 1;
         }
         k += 1;
-    }
-    t
-};
-/// Zone of an interior position (index into INTERIOR) for magnitudes, times NNB.
-const IZ8: [u8; 49] = {
-    let mut t = [0u8; 49];
-    let mut i = 0;
-    while i < 49 {
-        let z = match i {
-            0..=1 => 0,
-            2..=4 => 1,
-            5..=8 => 2,
-            9..=13 => 3,
-            14..=19 => 4,
-            20..=26 => 5,
-            27..=35 => 6,
-            _ => 7,
-        };
-        t[i] = z * NNB as u8;
-        i += 1;
     }
     t
 };
@@ -883,8 +856,9 @@ fn div_round(n: i64, r: i64) -> i32 {
 /// Bucket of a predicted magnitude.
 #[inline(always)]
 fn pbucket(p: i32) -> usize {
-    bitlen(p.unsigned_abs()).min(7) as usize
+    bitlen(p.unsigned_abs()).min(NPB as u32 - 1) as usize
 }
+const NPB: usize = 8;
 
 /// Initial distributions learned from the training set (see `komla jtrain`); empty: flat.
 static PRIORS: &[u8] = include_bytes!("fast_priors.bin");
@@ -929,11 +903,11 @@ impl Model {
             nz_hi: Table::new(2 * NNZB * NLUMA, 7, Cdf::new(7, &[8; 7])),
             nz_lo: Table::new(2 * NNZB * NLUMA * 7, 8, flat8),
             zero: Bits::new(2 * NREM * 49 * NEQ),
-            mag: Table::new(2 * NREMQ * NKZ * NEQ, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
+            mag: Table::new(2 * NREM * NKZ * NEQ, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
             nze: Table::new(2 * 2 * 8 * 8, 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
-            ezero: Bits::new(2 * 2 * 7 * 4 * 8 * NAQ * NBE),
-            emag: Table::new(2 * 2 * 4 * 8 * NAQ * NBE, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
-            esign: Bits::new(2 * 2 * 8 * 2),
+            ezero: Bits::new(2 * 2 * 7 * 4 * NPB * NAQ * NBE),
+            emag: Table::new(2 * 2 * 4 * NTOK * NAQ * NBE, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
+            esign: Bits::new(2 * 2 * NTOK * 7 * 2),
             esc: Table::new(4, 8, flat8),
             dc: Table::new(2 * 8 * 4, NTOK, Cdf::new(NTOK, &geo)),
         };
@@ -1016,10 +990,13 @@ impl Model {
             let adj = AQ[((blk[pos + across] as i32).unsigned_abs()).min(15) as usize] as usize;
             // the same coefficient in the blocks above and to the left
             let nm = BEQ[((near.0[pos] as i32).unsigned_abs() + (near.1[pos] as i32).unsigned_abs()).min(15) as usize] as usize;
-            let zctx = (((((cls * 2 + dir) * 7 + i - 1) * 4 + rem.min(4) - 1) * 8 + pb) * NAQ + adj) * NBE + nm;
+            let zctx = (((((cls * 2 + dir) * 7 + i - 1) * 4 + rem.min(4) - 1) * NPB + pb) * NAQ + adj) * NBE + nm;
             if self.ezero.bit(io, zctx, (v != 0) as u32) != 0 {
-                let t = 1 + self.emag.sym(io, ((((cls * 2 + dir) * 4 + EZ[i] as usize) * 8 + pb) * NAQ + adj) * NBE + nm, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
-                let sign = if p != 0 { Some((((cls * 2 + dir) * 8 + pb) * 2 + (p < 0) as usize, p < 0)) } else { None };
+                let tp = token(p.unsigned_abs());
+                let t = 1 + self.emag.sym(io, ((((cls * 2 + dir) * 4 + EZ[i] as usize) * NTOK + tp) * NAQ + adj) * NBE + nm, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
+                // the sign follows the prediction more reliably when the magnitudes agree
+                let dt = (t as i32 - tp as i32).clamp(-3, 3) + 3;
+                let sign = if p != 0 { Some(((((cls * 2 + dir) * NTOK + tp) * 7 + dt as usize) * 2 + (p < 0) as usize, p < 0)) } else { None };
                 let x = self.rest(io, t, v, cls * 2, sign);
                 if I::DEC {
                     blk[pos] = x as i16;
@@ -1062,7 +1039,7 @@ impl Model {
             info.nz77 = nz77 as u8;
             let mut rem = nz77;
             let zbase = |rem: usize| (cls * NREM + REMB[rem & 63] as usize) * 49 * NEQ;
-            let mbase = |rem: usize| (cls * NREMQ + REMQ[rem & 63] as usize) * NKZ * NEQ;
+            let mbase = |rem: usize| (cls * NREM + REMB[rem & 63] as usize) * NKZ * NEQ;
             let (mut zrow, mut mrow) = (zbase(rem), mbase(rem));
             let mut i = 0usize;
             while rem > 0 && i < 49 {
@@ -1072,7 +1049,9 @@ impl Model {
                 // first-row and first-column coefficients come later)
                 let inner = if pos & 7 > 1 { (blk[pos - 1] as i32).unsigned_abs() } else { 0 } + if pos > 15 { (blk[pos - 8] as i32).unsigned_abs() } else { 0 };
                 // a weighted sum of the magnitudes around the coefficient, inside and outside
-                let nb = EQ[(s + 2 * inner).min(255) as usize] as usize;
+                let diag = if pos & 7 > 1 && pos > 15 { (blk[pos - 9] as i32).unsigned_abs() } else { 0 };
+                let far = if pos & 7 > 2 { (blk[pos - 2] as i32).unsigned_abs() } else { 0 } + if pos > 23 { (blk[pos - 16] as i32).unsigned_abs() } else { 0 };
+                let nb = EQ[(s + 2 * inner + diag + far).min(255) as usize] as usize;
                 let v = blk[pos] as i32;
                 if self.zero.bit(io, zrow + i * NEQ + nb, (v != 0) as u32) != 0 {
                     let t = 1 + self.mag.sym(io, mrow + IZE[i] as usize + nb, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
