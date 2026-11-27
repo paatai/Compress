@@ -43,7 +43,7 @@ const DYN_B: usize = 24;
 const DYN_C: usize = 8;
 
 /// Model parameters; KOMLA_JTUNE="i=v,..." overrides them for experiments (both sides must agree).
-const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 1, 0, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 32, 1, 16, 1, 2, 0];
+const TUNE_DEFAULT: [i32; 24] = [255, 300, 200, 7, 255, 400, 0, 1, 2, 1, 8192, 800, 4000, 12, 12, -90, 4096, 64, 32, 1, 16, 1, 2, 0];
 
 fn tune() -> &'static [i32; 24] {
     static T: std::sync::OnceLock<[i32; 24]> = std::sync::OnceLock::new();
@@ -230,6 +230,7 @@ pub struct Model {
     mf: Mixer,
     apm1: Apm,
     apm2: Apm,
+    apm3: Apm,
     x: [i32; NIN],
     sel: [usize; 3],
     actx: [usize; 2],
@@ -266,7 +267,7 @@ pub struct Model {
     gcfl: [[i64; 4]; 4],
     planes: Vec<Plane>,
     /// cost accounting (KOMLA_STATS): bits per decision class, current class base
-    stats: Option<Box<[f64; 16]>>,
+    stats: Option<Box<[f64; 32]>>,
     part: usize,
     dbg: [[f64; 8]; 8],
 }
@@ -342,6 +343,7 @@ impl Model {
             mf: Mixer::new(5, SLOTS * 8, tu[2], 18000),
             apm1: Apm::new(SLOTS * 256, tu[3] as u32, t),
             apm2: Apm::new(SLOTS * 512, tu[3] as u32, t),
+            apm3: Apm::new(SLOTS * 3 * 32, tu[3] as u32, t),
             x: [0; NIN],
             sel: [0; 3],
             actx: [0; 2],
@@ -367,7 +369,7 @@ impl Model {
             dls: (0..2).map(|_| Ols::new(10, 1.0 - 1.0 / tu[16].max(16) as f64, tu[17] as f64, tu[18].max(1) as u32)).collect(),
             gcfl: [[0; 4]; 4],
             planes,
-            stats: if std::env::var_os("KOMLA_STATS").is_some() { Some(Box::new([0.0; 16])) } else { None },
+            stats: if std::env::var_os("KOMLA_STATS").is_some() { Some(Box::new([0.0; 32])) } else { None },
             part: 1,
             dbg: [[0.0; 8]; 8],
         }
@@ -375,10 +377,10 @@ impl Model {
 
     fn report(&self) {
         if let Some(s) = &self.stats {
-            let total: f64 = s.iter().sum();
+            let total: f64 = s[..16].iter().sum();
             let mut out = format!("coefficient model: {:.0} bytes\n", total / 8.0);
             for (i, name) in STAT_NAMES.iter().enumerate() {
-                out += &format!("  {name:<14} {:>10.0} B {:>6.2}%\n", s[i] / 8.0, 100.0 * s[i] / total.max(1.0));
+                out += &format!("  {name:<14} {:>10.0} B {:>6.2}%  {:>10.0} decisions {:.3} bits each\n", s[i] / 8.0, 100.0 * s[i] / total.max(1.0), s[16 + i], s[i] / s[16 + i].max(1.0));
             }
             eprint!("{out}");
             for (i, d) in self.dbg.iter().enumerate().skip(1) {
@@ -423,7 +425,9 @@ impl Model {
         let p0 = t.squash(df);
         let pa = self.apm1.pp(df, self.actx[0] * SLOTS + slot);
         let pc = self.apm2.pp(df, self.actx[1] * SLOTS + slot);
-        let p = clamp_p((2 * p0 + pa + pc) >> 2);
+        let part = self.dyn_base / (SLOTS * DYN_B * DYN_C);
+        let pd = self.apm3.pp(df, (part * 32 + ((self.pin + 2048) >> 7).clamp(0, 31) as usize) * SLOTS + slot);
+        let p = if tune()[8] == 1 { clamp_p((3 * p0 + 2 * pa + 2 * pc + pd) >> 3) } else if tune()[8] == 2 { clamp_p((p0 + pa + pc + pd) >> 2) } else { clamp_p((2 * p0 + pa + pc) >> 2) };
         let b = coder.code(bit, p);
         if let Some(s) = self.stats.as_mut() {
             let kind = match slot {
@@ -433,6 +437,7 @@ impl Model {
                 _ => 2,
             };
             s[self.part + kind] += cost(p, b);
+            s[16 + self.part + kind] += 1.0;
         }
         let r = &t.recip;
         for i in 0..NCTX {
@@ -446,6 +451,7 @@ impl Model {
         self.mf.update(&y, b);
         self.apm1.update(b);
         self.apm2.update(b);
+        self.apm3.update(b);
         b
     }
 
@@ -575,6 +581,7 @@ impl Model {
             let got = coder.code(bit, p);
             if let Some(s) = self.stats.as_mut() {
                 s[if max > 7 { 0 } else { 5 }] += cost(p, got);
+                s[if max > 7 { 16 } else { 21 }] += 1.0;
             }
             for i in 0..5 {
                 self.nzt[i].update(node, got, &t.recip);
@@ -768,7 +775,7 @@ impl Model {
             let c9 = if u > 1 && v > 1 { cur[n - 9] as i32 } else { 0 };
             let px = if has_cc { pr8[n] } else { pc8[n] };
             let lsi = ucls * 49 + j;
-            let use_ls = self.ls_on && (tune()[23] == 0 || (j as i32) < tune()[23]);
+            let use_ls = self.ls_on;
             let pls = if use_ls {
                 let mut x = [0f64; 44];
                 for (i, &(src, idx)) in self.ls_feats[lsi].iter().enumerate() {
