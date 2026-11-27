@@ -56,7 +56,7 @@ export function SizeTable({ rows, pixels, komlaBytes }: { rows: SizeRow[]; pixel
               {bytes !== undefined && (
                 <div>
                   <div className={cn(r.highlight && 'font-semibold')}>{formatBytes(bytes)}</div>
-                  <div className="text-xs text-muted-foreground">{formatBpp(bytes, pixels)}</div>
+                  {pixels > 0 && <div className="text-xs text-muted-foreground">{formatBpp(bytes, pixels)}</div>}
                 </div>
               )}
             </div>
