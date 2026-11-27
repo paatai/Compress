@@ -554,37 +554,6 @@ const REMB: [u8; 64] = {
 };
 const NREM: usize = 12;
 
-/// Zone of a zigzag position.
-const KZT: [u8; 64] = {
-    let mut t = [0u8; 64];
-    let mut i = 0;
-    while i < 64 {
-        t[i] = match i {
-            0 => 0,
-            1..=20 => i as u8 - 1,
-            21..=24 => 20,
-            25..=28 => 21,
-            29..=33 => 22,
-            34..=39 => 23,
-            40..=46 => 24,
-            47..=54 => 25,
-            _ => 26,
-        };
-        i += 1;
-    }
-    t
-};
-const NKZT: usize = 27;
-const KZT8: [u8; 64] = {
-    let mut t = [0u8; 64];
-    let mut i = 0;
-    while i < 64 {
-        t[i] = KZT[i] * NNB as u8;
-        i += 1;
-    }
-    t
-};
-
 /// Bucket of the neighbours' average nonzero count.
 const NZB: [u8; 64] = {
     let mut t = [0u8; 64];
@@ -611,26 +580,6 @@ const NZB: [u8; 64] = {
 const NNZB: usize = 16;
 const NNB: usize = 8;
 
-/// Zone of a zigzag position for magnitudes, times NNB.
-const KZ8: [u8; 64] = {
-    let mut t = [0u8; 64];
-    let mut i = 0;
-    while i < 64 {
-        let z = match i {
-            0..=2 => 0,
-            3..=5 => 1,
-            6..=9 => 2,
-            10..=14 => 3,
-            15..=20 => 4,
-            21..=27 => 5,
-            28..=35 => 6,
-            _ => 7,
-        };
-        t[i] = z * NNB as u8;
-        i += 1;
-    }
-    t
-};
 const NKZ: usize = 8;
 
 /// Coarse bucket of the number of nonzero coefficients still to code.

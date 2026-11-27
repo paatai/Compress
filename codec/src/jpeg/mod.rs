@@ -853,6 +853,9 @@ fn decompress_fast(c: FastContainer, threads: usize) -> Result<Vec<u8>, String> 
         return Err("corrupt stripe table".into());
     }
     let geom = StripeGeom::new(&l);
+    if !f.progressive && l.scans.len() == 1 && l.scans[0].comps.len() == f.comps.len() {
+        return decompress_stream(&c, &l, &geom, &rows, sides.pop().unwrap(), threads);
+    }
     let mut coefs: Vec<Vec<i16>> = f.comps.iter().map(|comp| vec![0i16; comp.pw * comp.ph * 64]).collect();
     {
         let parts = split_rows(f, &rows, &mut coefs);
@@ -875,6 +878,11 @@ fn decompress_fast(c: FastContainer, threads: usize) -> Result<Vec<u8>, String> 
     }
     out.extend_from_slice(&c.blob[bpos..]);
     drop(coefs);
+    finish_fast(&c, out, threads)
+}
+
+/// Appends the trailer and checks length and CRC.
+fn finish_fast(c: &FastContainer, mut out: Vec<u8>, threads: usize) -> Result<Vec<u8>, String> {
     let (kind, coded, n) = c.trailer;
     let t = match kind {
         TRAILER_CM => fast::decode_bytes(coded, n)?,
@@ -889,6 +897,126 @@ fn decompress_fast(c: FastContainer, threads: usize) -> Result<Vec<u8>, String> 
         return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
     }
     Ok(out)
+}
+
+/// Runs `produce` on 0..n with up to `threads` threads (at most `window` items ahead of the
+/// consumer) and feeds the results to `consume` in order.
+fn pipeline<B: Send>(n: usize, threads: usize, window: usize, produce: impl Fn(usize) -> Result<B, String> + Sync, mut consume: impl FnMut(usize, B) -> Result<(), String>) -> Result<(), String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if threads > 1 && n > 1 {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{mpsc, Condvar, Mutex};
+        let next = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let done = (Mutex::new(0usize), Condvar::new());
+        let (tx, rx) = mpsc::channel::<(usize, Result<B, String>)>();
+        return std::thread::scope(|sc| {
+            for _ in 0..threads.min(n) {
+                let tx = tx.clone();
+                let (next, stop, done, produce) = (&next, &stop, &done, &produce);
+                sc.spawn(move || loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    if k >= n {
+                        break;
+                    }
+                    let mut g = done.0.lock().unwrap();
+                    while k >= *g + window && !stop.load(Ordering::Relaxed) {
+                        g = done.1.wait(g).unwrap();
+                    }
+                    drop(g);
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if tx.send((k, produce(k))).is_err() {
+                        break;
+                    }
+                });
+            }
+            drop(tx);
+            let mut pending = std::collections::BTreeMap::new();
+            let mut expect = 0;
+            let mut res = Ok(());
+            while expect < n {
+                let Ok((k, r)) = rx.recv() else { break };
+                pending.insert(k, r);
+                while let Some(r) = pending.remove(&expect) {
+                    if res.is_ok() {
+                        res = r.and_then(|b| consume(expect, b));
+                    }
+                    expect += 1;
+                    *done.0.lock().unwrap() = expect;
+                    done.1.notify_all();
+                }
+                if res.is_err() {
+                    stop.store(true, Ordering::Relaxed);
+                    done.1.notify_all();
+                }
+            }
+            if res.is_ok() && expect < n {
+                res = Err("worker thread failed".into());
+            }
+            res
+        });
+    }
+    let _ = (threads, window);
+    for k in 0..n {
+        consume(k, produce(k)?)?;
+    }
+    Ok(())
+}
+
+/// Decompresses a file with one sequential scan stripe by stripe: each stripe is decoded into its
+/// own buffer and its scan data regenerated right away, so only a few stripes are in memory.
+fn decompress_stream(c: &FastContainer, l: &Layout, geom: &StripeGeom, rows: &[(usize, usize)], side: huff::Side, threads: usize) -> Result<Vec<u8>, String> {
+    let f = &l.frame;
+    let s = &l.scans[0];
+    let mut out = Vec::with_capacity(c.len + 64);
+    out.extend_from_slice(&c.blob[..s.blob_pos]);
+    let mut ch = huff::Choices::replay(side);
+    {
+        let mut enc = huff::SeqScan::new(s, f, &mut ch, &mut out)?;
+        let alloc = |k: usize| -> Vec<Vec<i16>> {
+            let (my0, my1) = rows[k];
+            f.comps.iter().map(|comp| vec![0i16; (my1 - my0) * comp.v * comp.pw * 64]).collect()
+        };
+        let decode = |k: usize, bufs: &mut Vec<Vec<i16>>| -> Result<(), String> {
+            let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
+            geom.decode(rows[k], c.stripes[k].0, c.stripes[k].1, &mut planes)
+        };
+        let mut emit = |k: usize, bufs: &Vec<Vec<i16>>| -> Result<(), String> {
+            let (my0, my1) = rows[k];
+            enc.rows(f, s, my0, my1, |ci, bx, by| {
+                let comp = &f.comps[ci];
+                bufs[ci][((by - my0 * comp.v) * comp.pw + bx) * 64..][..64].try_into().unwrap()
+            })
+        };
+        if threads > 1 && rows.len() > 1 {
+            pipeline(rows.len(), threads, threads + 2, |k| {
+                let mut b = alloc(k);
+                decode(k, &mut b)?;
+                Ok(b)
+            }, |k, b| emit(k, &b))?;
+        } else {
+            let mut b = alloc(0);
+            for k in 0..rows.len() {
+                if k > 0 {
+                    let (my0, my1) = rows[k];
+                    for (buf, comp) in b.iter_mut().zip(&f.comps) {
+                        buf.clear();
+                        buf.resize((my1 - my0) * comp.v * comp.pw * 64, 0);
+                    }
+                }
+                decode(k, &mut b)?;
+                emit(k, &b)?;
+            }
+        }
+        enc.finish();
+    }
+    if out.len() > c.len {
+        return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
+    }
+    out.extend_from_slice(&c.blob[s.blob_pos..]);
+    finish_fast(c, out, threads)
 }
 
 /// Decompresses any .komla JPEG container with up to `threads` threads.

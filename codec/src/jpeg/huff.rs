@@ -431,9 +431,97 @@ fn encode_ac_refine(w: &mut Bw, s: &Scan, ac: &Codes, blk: &[i16; 64], st: &mut 
     Ok(())
 }
 
+/// Incremental encoder of a sequential (baseline or extended) scan, fed MCU rows in order.
+pub struct SeqScan<'a, 'c> {
+    w: Bw<'a>,
+    dcs: Vec<Codes>,
+    acs: Vec<Codes>,
+    /// interleaved scan: (scan component, component, h, v) of every block of an MCU
+    units: Vec<(usize, usize, usize, usize)>,
+    pred: [i32; 4],
+    rst: usize,
+    /// MCUs encoded so far
+    m: usize,
+    ch: &'a mut Choices<'c>,
+}
+
+impl<'a, 'c> SeqScan<'a, 'c> {
+    pub fn new(s: &Scan, f: &Frame, ch: &'a mut Choices<'c>, out: &'a mut Vec<u8>) -> Result<Self, String> {
+        let codes = |v: &[Option<Huff>]| -> Result<Vec<Codes>, String> { v.iter().map(|h| h.as_ref().map(Codes::new).ok_or_else(|| "missing Huffman table".to_string())).collect() };
+        let mut units = Vec::new();
+        if s.comps.len() > 1 {
+            for (j, &ci) in s.comps.iter().enumerate() {
+                let c = &f.comps[ci];
+                for v in 0..c.v {
+                    for h in 0..c.h {
+                        units.push((j, ci, h, v));
+                    }
+                }
+            }
+        }
+        Ok(SeqScan { w: Bw::new(out), dcs: codes(&s.dc)?, acs: codes(&s.ac)?, units, pred: [0; 4], rst: 0, m: 0, ch })
+    }
+
+    #[inline(always)]
+    fn restart(&mut self, ri: usize) {
+        if ri > 0 && self.m > 0 && self.m % ri == 0 {
+            let n = self.w.pad_len();
+            let p = self.ch.pad(n);
+            self.w.flush(p);
+            self.w.out.push(0xFF);
+            self.w.out.push(0xD0 + (self.rst % 8) as u8);
+            self.rst += 1;
+            self.pred = [0; 4];
+        }
+    }
+
+    /// Encodes the MCUs of frame MCU rows `my0..my1`; `blk(c, bx, by)` returns a block of
+    /// component c (absolute block coordinates).
+    pub fn rows<'b>(&mut self, f: &Frame, s: &Scan, my0: usize, my1: usize, blk: impl Fn(usize, usize, usize) -> &'b [i16; 64]) -> Result<(), String> {
+        if !self.units.is_empty() {
+            for my in my0..my1 {
+                for mx in 0..f.mcux {
+                    self.restart(s.ri);
+                    for &(j, ci, h, v) in &self.units {
+                        let c = &f.comps[ci];
+                        encode_seq(&mut self.w, &self.dcs[j], &self.acs[j], blk(ci, mx * c.h + h, my * c.v + v), &mut self.pred[j])?;
+                    }
+                    self.m += 1;
+                }
+            }
+        } else {
+            let ci = s.comps[0];
+            let c = &f.comps[ci];
+            for by in (my0 * c.v).min(c.bh)..(my1 * c.v).min(c.bh) {
+                for bx in 0..c.bw {
+                    self.restart(s.ri);
+                    encode_seq(&mut self.w, &self.dcs[0], &self.acs[0], blk(ci, bx, by), &mut self.pred[0])?;
+                    self.m += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Final padding and the bytes after it.
+    pub fn finish(mut self) {
+        let n = self.w.pad_len();
+        let p = self.ch.pad(n);
+        self.w.flush(p);
+        self.w.out.extend_from_slice(&self.ch.side.garbage);
+    }
+}
+
 /// Regenerates the entropy-coded bytes of one scan and appends them to `out`. `coefs[c]`: the
 /// coefficients of component c (`pw * ph` blocks of 64, natural order).
 pub fn encode_scan(f: &Frame, s: &Scan, coefs: &[&[i16]], ch: &mut Choices, out: &mut Vec<u8>) -> Result<(), String> {
+    if !f.progressive {
+        let blk = |ci: usize, bx: usize, by: usize| -> &[i16; 64] { coefs[ci][(by * f.comps[ci].pw + bx) * 64..][..64].try_into().unwrap() };
+        let mut enc = SeqScan::new(s, f, ch, out)?;
+        enc.rows(f, s, 0, f.mcuy, blk)?;
+        enc.finish();
+        return Ok(());
+    }
     let mut w = Bw::new(out);
     let dcs: Vec<Option<Codes>> = s.dc.iter().map(|h| h.as_ref().map(Codes::new)).collect();
     let acs: Vec<Option<Codes>> = s.ac.iter().map(|h| h.as_ref().map(Codes::new)).collect();
