@@ -9,7 +9,10 @@ compared with the original file byte for byte (SHA-256). A codec that rejects a 
 restore it exactly is counted at the original size and reported as a failure. Files are run in
 order, all codecs on one file before the next, so that every codec sees the same conditions.
 
-usage: run_jpeg_speed.py --set dev|test [--codecs a,b] [--threads 1t,mt] [--reps N] [--force a,b]
+Every run's times are kept (enc_all, dec_all) to show the run-to-run variation; for Komla the
+container mode is recorded (3 fast mode, 2 maximum mode; 0 and 4 mean the file was stored).
+
+usage: run_jpeg_speed.py --set dev|test|heldout [--codecs a,b] [--threads 1t,mt] [--reps N] [--force a,b]
 """
 import argparse
 import hashlib
@@ -82,7 +85,8 @@ def timed(cmd, cwd, env):
     r = subprocess.run(["/usr/bin/time", "-f", "%M", "-o", tf] + cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=dict(os.environ, **env))
     dt = time.perf_counter() - t0
     if r.returncode != 0:
-        raise RuntimeError(f"{os.path.basename(cmd[0])} failed: {r.stderr.decode(errors='replace')[-300:]}")
+        how = f"crashed (signal {-r.returncode})" if r.returncode < 0 else f"failed (exit code {r.returncode})"
+        raise RuntimeError(f"{os.path.basename(cmd[0])} {how}: {r.stderr.decode(errors='replace')[-300:]}")
     rss = int(open(tf).read().split()[-1])
     return dt, rss
 
@@ -91,6 +95,8 @@ def run_one(codec, variant, img, reps):
     enc, outname, dec, env = CODECS[codec][variant]
     best_e = best_d = float("inf")
     rss_e = rss_d = 0
+    all_e, all_d = [], []
+    mode = None
     with tempfile.TemporaryDirectory(dir=SCRATCH) as td:
         shutil.copyfile(img, os.path.join(td, "in.jpg"))
         want = hashlib.sha256(open(img, "rb").read()).digest()
@@ -100,6 +106,9 @@ def run_one(codec, variant, img, reps):
                     os.remove(os.path.join(td, f))
             de, re_ = timed(enc, td, env)
             size = os.path.getsize(os.path.join(td, outname))
+            if codec.startswith("komla"):
+                with open(os.path.join(td, outname), "rb") as fh:
+                    mode = fh.read(7)[6]
             if codec == "packjpg":
                 os.makedirs(os.path.join(td, "d"), exist_ok=True)
                 shutil.move(os.path.join(td, outname), os.path.join(td, "d", "in.pjg"))
@@ -111,7 +120,12 @@ def run_one(codec, variant, img, reps):
                 raise RuntimeError("restored file differs from the original")
             best_e, best_d = min(best_e, de), min(best_d, dd)
             rss_e, rss_d = max(rss_e, re_), max(rss_d, rd)
-    return {"bytes": size, "enc_s": round(best_e, 4), "dec_s": round(best_d, 4), "enc_rss_kb": rss_e, "dec_rss_kb": rss_d, "ok": True}
+            all_e.append(round(de, 4))
+            all_d.append(round(dd, 4))
+    r = {"bytes": size, "enc_s": round(best_e, 4), "dec_s": round(best_d, 4), "enc_rss_kb": rss_e, "dec_rss_kb": rss_d, "ok": True, "enc_all": all_e, "dec_all": all_d}
+    if mode is not None:
+        r["mode"] = mode
+    return r
 
 
 def load(path):
