@@ -467,6 +467,17 @@ fn encode_ac_refine(w: &mut Bw, s: &Scan, ac: &Codes, blk: &[i16; 64], st: &mut 
     Ok(())
 }
 
+/// Where the encoder of a sequential scan stands between two MCU rows: the complete bytes
+/// written so far, the bits of the incomplete byte and the DC predictions. With it, the rows
+/// that follow can be encoded without the ones before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeqState {
+    pub bytes: u64,
+    pub nbits: u32,
+    pub bits: u32,
+    pub pred: [i32; 4],
+}
+
 /// Incremental encoder of a sequential (baseline or extended) scan, fed MCU rows in order.
 pub struct SeqScan<'a> {
     w: Bw<'a>,
@@ -563,6 +574,28 @@ impl<'a> SeqScan<'a> {
 
     pub fn choices(&mut self) -> &mut Choices {
         self.ch
+    }
+
+    /// The state after the rows fed so far; `moved` bytes were taken out of the output.
+    pub fn state(&self, moved: u64) -> SeqState {
+        SeqState { bytes: moved + self.w.out.len() as u64, nbits: self.w.n, bits: if self.w.n == 0 { 0 } else { (self.w.c >> (64 - self.w.n)) as u32 }, pred: self.pred }
+    }
+
+    /// Continues the scan from `st`, the state before frame MCU row `my0` (the rows above are
+    /// encoded elsewhere; the incomplete byte is written here).
+    pub fn resume(&mut self, f: &Frame, s: &Scan, my0: usize, st: &SeqState) {
+        self.w.n = st.nbits & 7;
+        self.w.c = if self.w.n == 0 { 0 } else { ((st.bits & ((1 << self.w.n) - 1)) as u64) << (64 - self.w.n) };
+        self.pred = st.pred;
+        self.m = if self.units.is_empty() {
+            let c = &f.comps[s.comps[0]];
+            (my0 * c.v).min(c.bh) * c.bw
+        } else {
+            my0 * f.mcux
+        };
+        let restarts = if s.ri > 0 && self.m > 0 { (self.m - 1) / s.ri } else { 0 };
+        self.rst = restarts;
+        self.ch.pad_i = restarts;
     }
 
     /// Final padding and the bytes after it.

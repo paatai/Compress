@@ -626,7 +626,17 @@ impl StripeGeom {
     }
 }
 
-fn put_side(out: &mut Vec<u8>, s: &huff::Side, scan_len: usize) {
+fn zigzag(v: i32) -> u64 {
+    ((v << 1) ^ (v >> 31)) as u32 as u64
+}
+
+fn unzigzag(v: u64) -> i32 {
+    ((v >> 1) as u32 as i32) ^ -((v & 1) as i32)
+}
+
+/// Writes a scan's side info: the length of its entropy-coded data, the choices `s` and, for a
+/// sequential scan, the encoder state at the start of every stripe after the first.
+fn put_side(out: &mut Vec<u8>, s: &huff::Side, scan_len: usize, cps: &[huff::SeqState], ncomp: usize) {
     put_varint(out, scan_len as u64);
     put_varint(out, s.pads.len() as u64);
     out.extend_from_slice(&s.pads);
@@ -638,10 +648,19 @@ fn put_side(out: &mut Vec<u8>, s: &huff::Side, scan_len: usize) {
         put_varint(out, (x - last) as u64);
         last = x;
     }
+    let mut at = 0u64;
+    for cp in cps {
+        put_varint(out, cp.bytes - at);
+        at = cp.bytes;
+        put_varint(out, ((cp.bits as u64) << 3) | cp.nbits as u64);
+        for &p in &cp.pred[..ncomp] {
+            put_varint(out, zigzag(p));
+        }
+    }
 }
 
-/// A scan's side info and the length of its entropy-coded data.
-fn get_side(b: &[u8], pos: &mut usize, limit: usize) -> Result<(huff::Side, u64), String> {
+/// A scan's side info written by `put_side`, with `ncps` encoder states of `ncomp` components.
+fn get_side(b: &[u8], pos: &mut usize, limit: usize, ncps: usize, ncomp: usize) -> Result<(huff::Side, u64, Vec<huff::SeqState>), String> {
     let mut s = huff::Side::default();
     let scan_len = get_varint(b, pos)?;
     if scan_len > limit as u64 {
@@ -663,7 +682,21 @@ fn get_side(b: &[u8], pos: &mut usize, limit: usize) -> Result<(huff::Side, u64)
         last += get_varint(b, pos)?;
         s.eob_flips.push(u32::try_from(last).map_err(|_| "corrupt .komla file")?);
     }
-    Ok((s, scan_len))
+    let mut cps = Vec::with_capacity(ncps);
+    let mut at = 0u64;
+    for _ in 0..ncps {
+        at += get_varint(b, pos)?;
+        if at > scan_len {
+            return Err("corrupt .komla file".into());
+        }
+        let nb = get_varint(b, pos)?;
+        let mut cp = huff::SeqState { bytes: at, nbits: (nb & 7) as u32, bits: ((nb >> 3) & 0x7F) as u32, pred: [0; 4] };
+        for p in cp.pred.iter_mut().take(ncomp) {
+            *p = unzigzag(get_varint(b, pos)?);
+        }
+        cps.push(cp);
+    }
+    Ok((s, scan_len, cps))
 }
 
 fn stored_fast(data: &[u8], note: String) -> (Vec<u8>, JpegInfo) {
@@ -706,6 +739,7 @@ fn verify_scans(l: &Layout, data: &[u8], rows: &[(usize, usize)], next: &mut dyn
     let mut chs: Vec<huff::Choices> = (0..n).map(|_| huff::Choices::record()).collect();
     let mut outs: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
     let mut done = vec![0usize; n];
+    let mut cps: Vec<Vec<huff::SeqState>> = (0..n).map(|_| Vec::new()).collect();
     let check = |i: usize, b: &[u8], done: &mut [usize]| -> Result<(), String> {
         let s = &l.scans[i];
         if data[s.seg.0..s.seg.1].get(done[i]..done[i] + b.len()) != Some(b) {
@@ -731,6 +765,11 @@ fn verify_scans(l: &Layout, data: &[u8], rows: &[(usize, usize)], next: &mut dyn
                 let b = e.bytes();
                 check(i, b, &mut done)?;
                 b.clear();
+                if let ScanEnc::Seq(e) = e {
+                    if st.k + 1 < rows.len() {
+                        cps[i].push(e.state(done[i] as u64));
+                    }
+                }
             }
             pass(st)?;
         }
@@ -750,7 +789,7 @@ fn verify_scans(l: &Layout, data: &[u8], rows: &[(usize, usize)], next: &mut dyn
         if done[i] != s.seg.1 - s.seg.0 {
             return Err(mismatch());
         }
-        put_side(&mut side, &ch.into_side(), s.seg.1 - s.seg.0);
+        put_side(&mut side, &ch.into_side(), s.seg.1 - s.seg.0, &cps[i], s.comps.len());
     }
     Ok(side)
 }
@@ -1301,17 +1340,20 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
     let c = parse_fast(inp, len, r.pos)?;
     let l = format::parse(&c.blob, false)?;
     let f = &l.frame;
-    let mut sides = Vec::with_capacity(l.scans.len());
-    let mut lens = Vec::with_capacity(l.scans.len());
-    let mut pos = 0;
-    for _ in &l.scans {
-        let (s, n) = get_side(&c.side, &mut pos, len as usize)?;
-        sides.push(s);
-        lens.push(n);
-    }
     let rows = fast_stripes(f);
     if rows.len() != c.stripes.len() {
         return Err("corrupt stripe table".into());
+    }
+    let ncps = if f.progressive { 0 } else { rows.len() - 1 };
+    let mut sides = Vec::with_capacity(l.scans.len());
+    let mut lens = Vec::with_capacity(l.scans.len());
+    let mut cps = Vec::with_capacity(l.scans.len());
+    let mut pos = 0;
+    for s in &l.scans {
+        let (side, n, cp) = get_side(&c.side, &mut pos, len as usize, ncps, s.comps.len())?;
+        sides.push(side);
+        lens.push(n);
+        cps.push(cp);
     }
     // the parts in file order: the header bytes before each scan, the scan, the rest of the
     // header bytes, the trailer
@@ -1337,7 +1379,65 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
         p.flush(sink)?;
     }
     let geom = StripeGeom::new(&l);
-    {
+    let read = |k: usize, v: &mut Vec<u8>| -> Result<usize, String> {
+        let (p, a, b) = c.stripes[k];
+        v.resize((a + b) as usize, 0);
+        inp.read_at(p, v)?;
+        Ok(a as usize)
+    };
+    if threads > 1 && rows.len() > 1 && !f.progressive {
+        // sequential scans can be regenerated stripe by stripe from the stored encoder states,
+        // so the threads that decode the stripes also turn them back into scan data
+        pipeline(
+            rows.len(),
+            threads,
+            threads + 2,
+            |k| -> Result<Vec<Vec<u8>>, String> {
+                let (my0, my1) = rows[k];
+                let mut bufs: Vec<Vec<i16>> = f.comps.iter().map(|comp| vec![0i16; (my1 - my0) * comp.v * comp.pw * 64]).collect();
+                {
+                    let mut data = Vec::new();
+                    let split = read(k, &mut data)?;
+                    let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
+                    geom.decode(rows[k], &data[..split], &data[split..], &mut planes)?;
+                }
+                let mut outs = Vec::with_capacity(l.scans.len());
+                for (i, s) in l.scans.iter().enumerate() {
+                    let start = if k > 0 { cps[i][k - 1].bytes } else { 0 };
+                    let end = if k + 1 < rows.len() { cps[i][k].bytes } else { lens[i] };
+                    let mut ch = huff::Choices::replay(sides[i].clone());
+                    let mut out = Vec::with_capacity(end.saturating_sub(start) as usize + 64);
+                    let mut e = huff::SeqScan::new(s, f, &mut ch, &mut out)?;
+                    if k > 0 {
+                        e.resume(f, s, my0, &cps[i][k - 1]);
+                    }
+                    e.rows(f, s, my0, my1, |ci, bx, by| {
+                        let comp = &f.comps[ci];
+                        bufs[ci][((by - my0 * comp.v) * comp.pw + bx) * 64..][..64].try_into().unwrap()
+                    })?;
+                    if k + 1 == rows.len() {
+                        e.finish();
+                    } else {
+                        drop(e);
+                    }
+                    if Some(out.len() as u64) != end.checked_sub(start) {
+                        return Err(damaged());
+                    }
+                    outs.push(out);
+                }
+                Ok(outs)
+            },
+            |_, outs| {
+                for (o, p) in outs.iter().zip(scans.iter_mut()) {
+                    p.write(sink, o)?;
+                }
+                Ok(())
+            },
+        )?;
+        for p in scans.iter_mut() {
+            p.flush(sink)?;
+        }
+    } else {
         let mut chs: Vec<huff::Choices> = sides.into_iter().map(huff::Choices::replay).collect();
         let mut outs: Vec<Vec<u8>> = l.scans.iter().map(|_| Vec::new()).collect();
         let mut encs: Vec<ScanEnc> = Vec::with_capacity(l.scans.len());
@@ -1358,12 +1458,6 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
                 b.clear();
             }
             Ok(())
-        };
-        let read = |k: usize, v: &mut Vec<u8>| -> Result<usize, String> {
-            let (p, a, b) = c.stripes[k];
-            v.resize((a + b) as usize, 0);
-            inp.read_at(p, v)?;
-            Ok(a as usize)
         };
         if threads > 1 && rows.len() > 1 {
             pipeline(
