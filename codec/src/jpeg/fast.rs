@@ -727,21 +727,24 @@ const EQ: [u8; 256] = {
     t
 };
 const NEQ: usize = 14;
-/// Zone of an interior position (index into INTERIOR) for magnitudes: its anti-diagonal, times
-/// NEQ.
-const IZE: [u16; 49] = {
-    let mut t = [0u16; 49];
+/// Zone of an interior position (index into INTERIOR) for magnitudes: its anti-diagonal, the last
+/// ones merged, times NEQ.
+const IZE: [u8; 49] = {
+    let mut t = [0u8; 49];
     let mut i = 0;
     while i < 49 {
         let p = INTERIOR[i] as usize;
-        t[i] = ((p / 8 + p % 8 - 2) * NEQ) as u16;
+        let d = p / 8 + p % 8 - 2;
+        let z = if d < 7 { d } else { 7 };
+        t[i] = (z * NEQ) as u8;
         i += 1;
     }
     t
 };
-
-const NKZ: usize = 13;
-
+const NKZ: usize = 8;
+/// Levels of the density of the nonzero coefficients still to code (per position left) in the
+/// magnitude contexts.
+const NREMQ: usize = 3;
 
 /// Positions with both frequencies nonzero, in zigzag order.
 const INTERIOR: [u8; 49] = {
@@ -754,6 +757,41 @@ const INTERIOR: [u8; 49] = {
             n += 1;
         }
         k += 1;
+    }
+    t
+};
+/// For each interior position (index into INTERIOR), the positions whose magnitude estimate it
+/// adds to once coded: the next ones to the right and below (weight 2), diagonally, two to the
+/// right and two below, and the next one on its anti-diagonal (weight 1). 0 where there is none
+/// (the DC slot of the estimate, which is never read).
+const FWD: [[u8; 6]; 49] = {
+    let mut t = [[0u8; 6]; 49];
+    let mut i = 0;
+    while i < 49 {
+        let p = INTERIOR[i] as usize;
+        let (r, c) = (p / 8, p % 8);
+        if c < 7 {
+            t[i][0] = (p + 1) as u8;
+        }
+        if r < 7 {
+            t[i][1] = (p + 8) as u8;
+        }
+        if r < 7 && c < 7 {
+            t[i][2] = (p + 9) as u8;
+        }
+        if c < 6 {
+            t[i][3] = (p + 2) as u8;
+        }
+        if r < 6 {
+            t[i][4] = (p + 16) as u8;
+        }
+        if i < 48 {
+            let q = INTERIOR[i + 1] as usize;
+            if q / 8 + q % 8 == r + c {
+                t[i][5] = q as u8;
+            }
+        }
+        i += 1;
     }
     t
 };
@@ -912,7 +950,7 @@ impl Model {
             nz_hi: Table::new(2 * NNZB * NLUMA, 7, Cdf::new(7, &[8; 7])),
             nz_lo: Table::new(2 * NNZB * NLUMA * 7, 8, flat8),
             zero: Bits::new(2 * NREM * 49 * NEQ),
-            mag: Table::new(2 * NREM * NKZ * NEQ, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
+            mag: Table::new(2 * NREMQ * NKZ * NEQ, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
             nze: Table::new(2 * 2 * 8 * 8, 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
             ezero: Bits::new(2 * 2 * 7 * 4 * NPB * NAQ * NBE),
             emag: Table::new(2 * 2 * 4 * NTOK * NAQ * NBE, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
@@ -995,8 +1033,10 @@ impl Model {
             };
             let pb = pbucket(p);
             let v = blk[pos] as i32;
-            // the interior coefficient next to it (same frequency along the edge)
-            let adj = AQ[((blk[pos + across] as i32).unsigned_abs()).min(15) as usize] as usize;
+            // the interior coefficient next to it (same frequency along the edge), the next one
+            // inwards and the previous edge coefficient (DC is coded later)
+            let av = 2 * (blk[pos + across] as i32).unsigned_abs() + (blk[pos + 2 * across] as i32).unsigned_abs() + if i > 1 { (blk[pos - step] as i32).unsigned_abs() } else { 0 };
+            let adj = AQ[(av / 2).min(15) as usize] as usize;
             // the same coefficient in the blocks above and to the left
             let nm = BEQ[((near.0[pos] as i32).unsigned_abs() + (near.1[pos] as i32).unsigned_abs()).min(15) as usize] as usize;
             let zctx = (((((cls * 2 + dir) * 7 + i - 1) * 4 + rem.min(4) - 1) * NPB + pb) * NAQ + adj) * NBE + nm;
@@ -1004,8 +1044,8 @@ impl Model {
                 let tp = token(p.unsigned_abs());
                 let t = 1 + self.emag.sym(io, ((((cls * 2 + dir) * 4 + EZ[i] as usize) * NTOK + tp) * NAQ + adj) * NBE + nm, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
                 // the sign follows the prediction more reliably when the magnitudes agree
-                let dt = (t as i32 - tp as i32).clamp(-3, 3) + 3;
-                let sign = if p != 0 { Some(((((cls * 2 + dir) * NTOK + tp) * 7 + dt as usize) * 2 + (p < 0) as usize, p < 0)) } else { None };
+                let dt = (t as i32 - tp as i32).clamp(-3, 3) as usize + 3;
+                let sign = if p != 0 { Some(((((cls * 2 + dir) * NTOK + tp) * 7 + dt) * 2 + (p < 0) as usize, p < 0)) } else { None };
                 let x = self.rest(io, t, v, cls * 2, sign);
                 if I::DEC {
                     blk[pos] = x as i16;
@@ -1048,29 +1088,39 @@ impl Model {
             info.nz77 = nz77 as u8;
             let mut rem = nz77;
             let zbase = |rem: usize| (cls * NREM + REMB[rem & 63] as usize) * 49 * NEQ;
-            let mbase = |rem: usize| (cls * NREM + REMB[rem & 63] as usize) * NKZ * NEQ;
-            let (mut zrow, mut mrow) = (zbase(rem), mbase(rem));
+            // remaining nonzero coefficients per remaining position
+            let mbase = |rem: usize, i: usize| (cls * NREMQ + (rem * 8 >= 2 * (49 - i)) as usize + (rem * 8 >= 5 * (49 - i)) as usize) * NKZ * NEQ;
+            let mut zrow = zbase(rem);
+            // magnitude estimate of each coefficient: a weighted sum of the same coefficient in the
+            // neighbouring blocks and of the interior coefficients of this block coded before it
+            // (added as they are coded; first-row and first-column coefficients come later).
+            // Magnitudes are capped so that the sum fits; any capped one saturates the bucket.
+            let mut est = [0u16; 64];
+            if rem > 0 {
+                let m = |b: &[i16; 64], k: usize| b[k].unsigned_abs().min(4095);
+                for (k, e) in est.iter_mut().enumerate() {
+                    *e = 2 * (m(na, k) + m(nl, k)) + m(nal, k) + m(nar, k);
+                }
+            }
             let mut i = 0usize;
             while rem > 0 && i < 49 {
                 let pos = INTERIOR[i] as usize & 63;
-                let s = 2 * ((na[pos] as i32).unsigned_abs() + (nl[pos] as i32).unsigned_abs()) + (nal[pos] as i32).unsigned_abs() + (nar[pos] as i32).unsigned_abs();
-                // the interior coefficients above and to the left in this block (coded before it;
-                // first-row and first-column coefficients come later)
-                let inner = if pos & 7 > 1 { (blk[pos - 1] as i32).unsigned_abs() } else { 0 } + if pos > 15 { (blk[pos - 8] as i32).unsigned_abs() } else { 0 };
-                // a weighted sum of the magnitudes around the coefficient, inside and outside
-                let diag = if pos & 7 > 1 && pos > 15 { (blk[pos - 9] as i32).unsigned_abs() } else { 0 };
-                let far = if pos & 7 > 2 { (blk[pos - 2] as i32).unsigned_abs() } else { 0 } + if pos > 23 { (blk[pos - 16] as i32).unsigned_abs() } else { 0 };
-                let nb = EQ[(s + 2 * inner + diag + far).min(255) as usize] as usize;
+                let nb = EQ[(est[pos] as u32 * 3 / 4).min(255) as usize] as usize;
                 let v = blk[pos] as i32;
                 if self.zero.bit(io, zrow + i * NEQ + nb, (v != 0) as u32) != 0 {
-                    let t = 1 + self.mag.sym(io, mrow + IZE[i] as usize + nb, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
+                    let t = 1 + self.mag.sym(io, mbase(rem, i) + IZE[i] as usize + nb, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
                     let x = self.rest(io, t, v, cls * 2, None);
                     if I::DEC {
                         blk[pos] = x as i16;
                     }
+                    let a = x.unsigned_abs().min(4095) as u16;
+                    let f = &FWD[i];
+                    for (j, &k) in f.iter().enumerate() {
+                        let e = &mut est[k as usize & 63];
+                        *e = e.wrapping_add(a << (j < 2) as u32);
+                    }
                     rem -= 1;
                     zrow = zbase(rem);
-                    mrow = mbase(rem);
                 }
                 i += 1;
             }
