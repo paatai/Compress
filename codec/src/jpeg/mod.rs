@@ -1045,6 +1045,34 @@ pub fn decompress_with(b: &[u8], threads: usize) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Training: the summed symbol statistics of the fast model over `files` (see
+/// `fast::build_priors`).
+pub fn fast_train(files: &[Vec<u8>]) -> Vec<(usize, Vec<u64>)> {
+    fast::TRAIN.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut totals: Vec<(usize, Vec<u64>)> = Vec::new();
+    for data in files {
+        let Ok(l) = format::parse(data, true) else { continue };
+        let Ok((mut coefs, _)) = format::decode_scans(&l, data) else { continue };
+        let rows = fast_stripes(&l.frame);
+        let geom = StripeGeom::new(&l);
+        for (k, mut p) in split_rows(&l.frame, &rows, &mut coefs).into_iter().enumerate() {
+            let mut e = fast::Enc::new();
+            let m = fast::code_stripe(&mut e, &mut p, &geom.width, &geom.v, &geom.extents(rows[k].0), &geom.q, rows[k].1 - rows[k].0);
+            let st = m.stats();
+            if totals.is_empty() {
+                totals = st.iter().map(|(n, c)| (*n, vec![0u64; c.len()])).collect();
+            }
+            for (t, (_, c)) in totals.iter_mut().zip(st) {
+                for (a, b) in t.1.iter_mut().zip(c) {
+                    *a += b as u64;
+                }
+            }
+        }
+    }
+    fast::TRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
+    totals
+}
+
 /// Experiment: codes all coefficients of a JPEG with the fast model in one stripe, decodes them
 /// again and checks they match. Returns (arithmetic bytes, raw bytes, seconds for Huffman
 /// decoding, model encoding, model decoding).

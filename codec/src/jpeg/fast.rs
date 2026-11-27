@@ -113,67 +113,93 @@ impl Cdf {
     }
 }
 
+/// Collect symbol statistics for training priors (`Model::stats`).
+pub static TRAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn training() -> bool {
+    TRAIN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Distributions with their update counts.
 pub struct Table {
     cdf: Vec<Cdf>,
     cnt: Vec<u8>,
+    n: usize,
+    /// symbol counts per distribution (training only)
+    stats: Vec<u32>,
 }
 
 impl Table {
-    fn new(len: usize, init: Cdf) -> Table {
-        Table { cdf: vec![init; len], cnt: vec![0; len] }
+    fn new(len: usize, n: usize, init: Cdf) -> Table {
+        Table { cdf: vec![init; len], cnt: vec![0; len], n, stats: if training() { vec![0; len * n] } else { Vec::new() } }
     }
     /// Codes symbol `s` of `n` with distribution `i` (an index bounded by construction).
     #[inline(always)]
     fn sym<I: Io>(&mut self, io: &mut I, i: usize, n: usize, s: usize) -> usize {
-        debug_assert!(i < self.cdf.len());
+        debug_assert!(i < self.cdf.len() && n == self.n);
+        if !I::DEC && !self.stats.is_empty() {
+            self.stats[i * n + s] += 1;
+        }
         // SAFETY: every index is computed from components that are each masked or clamped to
         // the table's dimensions (checked by the debug assertion); `cnt` has the same length.
         let (c, k) = unsafe { (self.cdf.get_unchecked_mut(i), self.cnt.get_unchecked_mut(i)) };
         io.sym(c, k, n, s)
     }
+    fn load(&mut self, p: &mut &[u8]) -> Option<()> {
+        for (c, k) in self.cdf.iter_mut().zip(self.cnt.iter_mut()) {
+            let (b, rest) = p.split_at_checked(2 * (self.n - 1) + 1)?;
+            for j in 1..self.n {
+                c.0[j] = u16::from_le_bytes([b[2 * j - 2], b[2 * j - 1]]);
+            }
+            *k = b[2 * (self.n - 1)].min(LIMIT);
+            *p = rest;
+        }
+        Some(())
+    }
 }
 
-/// Adaptive binary probability: P(0) out of 2^15 in the low 16 bits, number of updates (capped
-/// at `BIT_LIMIT`) above. P(0) stays within [1, 2^15 - 1] (see `adapt_bit`).
-pub type Bit = u32;
+/// Adaptive binary probability: P(0) out of 2^15, within [1, 2^15 - 1] (see `adapt_bit`).
+pub type Bit = u16;
 const BIT_INIT: Bit = 16384;
-const BIT_LIMIT: u32 = 30;
+const BIT_SHIFT: u32 = 6;
 
-/// Update weight after n updates: 1 / (n + 1.5), scaled to 16 bits.
-static BIT_RATE: [i32; 32] = {
-    let mut r = [0i32; 32];
-    let mut i = 0;
-    while i < 32 {
-        r[i] = 131072 / (2 * i as i32 + 3);
-        i += 1;
-    }
-    r
-};
-
+/// Moves P(0) towards the coded bit by 2^-BIT_SHIFT of the distance (never past the bounds).
 #[inline(always)]
 fn adapt_bit(p: Bit, b: u32) -> Bit {
-    let n = p >> 16;
-    let q = (p & 0xFFFF) as i32;
+    let q = p as i32;
     let t = if b != 0 { 1 } else { PROB_ONE as i32 - 1 };
-    let q = q + (((t - q) * BIT_RATE[(n & 31) as usize]) >> 16);
-    q as u32 | ((n + (n < BIT_LIMIT) as u32) << 16)
+    (q + ((t - q) >> BIT_SHIFT)) as Bit
 }
 
 /// Binary probabilities.
-pub struct Bits(Vec<Bit>);
+pub struct Bits {
+    p: Vec<Bit>,
+    /// counts of zeros and ones per probability (training only)
+    stats: Vec<u32>,
+}
 
 impl Bits {
     fn new(len: usize) -> Bits {
-        Bits(vec![BIT_INIT; len])
+        Bits { p: vec![BIT_INIT; len], stats: if training() { vec![0; len * 2] } else { Vec::new() } }
     }
     /// Codes bit `b` with probability `i` (an index bounded by construction).
     #[inline(always)]
     fn bit<I: Io>(&mut self, io: &mut I, i: usize, b: u32) -> u32 {
-        debug_assert!(i < self.0.len());
+        debug_assert!(i < self.p.len());
+        if !I::DEC && !self.stats.is_empty() {
+            self.stats[i * 2 + b as usize] += 1;
+        }
         // SAFETY: every index is computed from components that are each masked or clamped to
         // the table's dimensions (checked by the debug assertion).
-        io.bit(unsafe { self.0.get_unchecked_mut(i) }, b)
+        io.bit(unsafe { self.p.get_unchecked_mut(i) }, b)
+    }
+    fn load(&mut self, p: &mut &[u8]) -> Option<()> {
+        for x in self.p.iter_mut() {
+            let (b, rest) = p.split_at_checked(2)?;
+            *x = u16::from_le_bytes([b[0], b[1]]).clamp(1, PROB_ONE as u16 - 1);
+            *p = rest;
+        }
+        Some(())
     }
 }
 
@@ -376,7 +402,7 @@ impl Io for Enc {
     }
     #[inline(always)]
     fn bit(&mut self, p: &mut Bit, b: u32) -> u32 {
-        let q = *p & 0xFFFF;
+        let q = *p as u32;
         cost(if b != 0 { PROB_ONE - q } else { q });
         self.ops.push(if b != 0 { q | ((PROB_ONE - q - 1) << 16) } else { (q - 1) << 16 });
         *p = adapt_bit(*p, b);
@@ -452,7 +478,7 @@ impl Io for Dec<'_> {
     fn bit(&mut self, p: &mut Bit, _b: u32) -> u32 {
         let x = self.x0;
         let slot = x & (PROB_ONE - 1);
-        let q = *p & 0xFFFF;
+        let q = *p as u32;
         let b = (slot >= q) as u32;
         let (start, freq) = if b != 0 { (q, PROB_ONE - q) } else { (0, q) };
         let mut x = freq * (x >> PROB_BITS) + slot - start;
@@ -579,6 +605,42 @@ const NZB: [u8; 64] = {
 };
 const NNZB: usize = 16;
 const NNB: usize = 8;
+/// Bucket of the magnitude estimate of an interior coefficient (about 1.45 times wider each).
+const EQ: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = match i {
+            0 => 0,
+            1..=2 => 1,
+            3..=5 => 2,
+            6..=8 => 3,
+            9..=12 => 4,
+            13..=18 => 5,
+            19..=26 => 6,
+            27..=38 => 7,
+            39..=55 => 8,
+            56..=80 => 9,
+            81..=115 => 10,
+            116..=170 => 11,
+            171..=250 => 12,
+            _ => 13,
+        };
+        i += 1;
+    }
+    t
+};
+const NEQ: usize = 14;
+/// Zone of an interior position (index into INTERIOR) for magnitudes, times NEQ.
+const IZE: [u8; 49] = {
+    let mut t = [0u8; 49];
+    let mut i = 0;
+    while i < 49 {
+        t[i] = (IZ8[i] / NNB as u8) * NEQ as u8;
+        i += 1;
+    }
+    t
+};
 
 const NKZ: usize = 8;
 
@@ -678,6 +740,9 @@ fn pbucket(p: i32) -> usize {
     bitlen(p.unsigned_abs()).min(7) as usize
 }
 
+/// Initial distributions learned from the training set (see `komla jtrain`); empty: flat.
+static PRIORS: &[u8] = include_bytes!("fast_priors.bin");
+
 /// Adaptive distributions of one stripe.
 pub struct Model {
     nz_hi: Table,
@@ -704,18 +769,32 @@ impl Model {
     pub fn new() -> Model {
         let geo: Vec<u32> = (0..NTOK as u32).map(|t| 1 << (14 - t)).collect();
         let flat8 = Cdf::new(8, &[8; 8]);
-        Model {
-            nz_hi: Table::new(2 * NNZB, Cdf::new(7, &[8; 7])),
-            nz_lo: Table::new(2 * NNZB * 7, flat8),
-            zero: Bits::new(2 * NREM * 49 * NNB),
-            mag: Table::new(2 * NREMQ * NKZ * NNB, Cdf::new(NTOK - 1, &geo[1..])),
-            nze: Table::new(2 * 2 * 8 * 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
+        let mut m = Model {
+            nz_hi: Table::new(2 * NNZB, 7, Cdf::new(7, &[8; 7])),
+            nz_lo: Table::new(2 * NNZB * 7, 8, flat8),
+            zero: Bits::new(2 * NREM * 49 * NEQ),
+            mag: Table::new(2 * NREMQ * NKZ * NEQ, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
+            nze: Table::new(2 * 2 * 8 * 8, 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
             ezero: Bits::new(2 * 2 * 7 * 4 * 8),
-            emag: Table::new(2 * 2 * 4 * 8, Cdf::new(NTOK - 1, &geo[1..])),
+            emag: Table::new(2 * 2 * 4 * 8, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
             esign: Bits::new(2 * 2 * 8 * 2),
-            esc: Table::new(4, flat8),
-            dc: Table::new(2 * 8 * 4, Cdf::new(NTOK, &geo)),
+            esc: Table::new(4, 8, flat8),
+            dc: Table::new(2 * 8 * 4, NTOK, Cdf::new(NTOK, &geo)),
+        };
+        if !training() && !PRIORS.is_empty() {
+            let mut p = PRIORS;
+            let ok = m.nz_hi.load(&mut p).and_then(|_| m.nz_lo.load(&mut p)).and_then(|_| m.zero.load(&mut p)).and_then(|_| m.mag.load(&mut p)).and_then(|_| m.nze.load(&mut p)).and_then(|_| m.ezero.load(&mut p)).and_then(|_| m.emag.load(&mut p)).and_then(|_| m.esign.load(&mut p)).and_then(|_| m.esc.load(&mut p)).and_then(|_| m.dc.load(&mut p));
+            assert!(ok.is_some() && p.is_empty(), "priors do not match the model");
         }
+        m
+    }
+
+    /// Symbol statistics of every table, in the order of the priors file: for each table its
+    /// alphabet size (2 for binary probabilities) and the counts per context and symbol.
+    pub fn stats(&self) -> Vec<(usize, Vec<u32>)> {
+        let t = |x: &Table| (x.n, x.stats.clone());
+        let b = |x: &Bits| (2, x.stats.clone());
+        vec![t(&self.nz_hi), t(&self.nz_lo), b(&self.zero), t(&self.mag), t(&self.nze), b(&self.ezero), t(&self.emag), b(&self.esign), t(&self.esc), t(&self.dc)]
     }
 
     /// Codes a magnitude class and the raw bits of a value (`t` = its token, `v` the value);
@@ -796,13 +875,15 @@ impl Model {
     /// outside the stripe); `q`: the component's quantization table. Returns the block's `Info`.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    pub fn block<I: Io>(&mut self, io: &mut I, cls: usize, q: &[i64; 64], rq: &[i64; 64], blk: &mut [i16; 64], a: Option<(&[i16; 64], &Info)>, l: Option<(&[i16; 64], &Info)>, code_dc: bool, code_ac: bool) -> Info {
+    pub fn block<I: Io>(&mut self, io: &mut I, cls: usize, q: &[i64; 64], rq: &[i64; 64], blk: &mut [i16; 64], a: Option<(&[i16; 64], &Info)>, l: Option<(&[i16; 64], &Info)>, diag: (Option<&[i16; 64]>, Option<&[i16; 64]>), code_dc: bool, code_ac: bool) -> Info {
         let (na, nl) = match (a, l) {
             (Some(a), Some(l)) => (a.0, l.0),
             (Some(a), None) => (a.0, a.0),
             (None, Some(l)) => (l.0, l.0),
             (None, None) => (&ZERO_BLOCK, &ZERO_BLOCK),
         };
+        let nal = diag.0.unwrap_or(na);
+        let nar = diag.1.unwrap_or(na);
         let avg = |f: fn(&Info) -> u8| -> usize {
             match (a, l) {
                 (Some(a), Some(l)) => (f(a.1) as usize + f(l.1) as usize + 1) >> 1,
@@ -821,19 +902,23 @@ impl Model {
             let nz77 = hi * 8 + lo;
             info.nz77 = nz77 as u8;
             let mut rem = nz77;
-            let zbase = |rem: usize| (cls * NREM + REMB[rem & 63] as usize) * 49 * NNB;
-            let mbase = |rem: usize| (cls * NREMQ + REMQ[rem & 63] as usize) * NKZ * NNB;
+            let zbase = |rem: usize| (cls * NREM + REMB[rem & 63] as usize) * 49 * NEQ;
+            let mbase = |rem: usize| (cls * NREMQ + REMQ[rem & 63] as usize) * NKZ * NEQ;
             let (mut zrow, mut mrow) = (zbase(rem), mbase(rem));
             let mut i = 0usize;
             while rem > 0 && i < 49 {
                 let pos = INTERIOR[i] as usize & 63;
-                let s = (na[pos] as i32).unsigned_abs() + (nl[pos] as i32).unsigned_abs();
-                let nb = bitlen(s).min(NNB as u32 - 1) as usize;
+                let s = 2 * ((na[pos] as i32).unsigned_abs() + (nl[pos] as i32).unsigned_abs()) + (nal[pos] as i32).unsigned_abs() + (nar[pos] as i32).unsigned_abs();
+                // the interior coefficients above and to the left in this block (coded before it;
+                // first-row and first-column coefficients come later)
+                let inner = if pos & 7 > 1 { (blk[pos - 1] as i32).unsigned_abs() } else { 0 } + if pos > 15 { (blk[pos - 8] as i32).unsigned_abs() } else { 0 };
+                // a weighted sum of the magnitudes around the coefficient, inside and outside
+                let nb = EQ[(s + 2 * inner).min(255) as usize] as usize;
                 let v = blk[pos] as i32;
                 cat(1);
-                if self.zero.bit(io, zrow + i * NNB + nb, (v != 0) as u32) != 0 {
+                if self.zero.bit(io, zrow + i * NEQ + nb, (v != 0) as u32) != 0 {
                     cat(2);
-                    let t = 1 + self.mag.sym(io, mrow + IZ8[i] as usize + nb, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
+                    let t = 1 + self.mag.sym(io, mrow + IZE[i] as usize + nb, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
                     cat(3);
                     let x = self.rest(io, t, v, cls * 2, None);
                     if I::DEC {
@@ -902,7 +987,7 @@ pub struct Extent {
 /// component c (`width[c]` blocks of 64 coefficients per row); `v[c]`: block rows per MCU row;
 /// `q[c]`: quantization table (natural order).
 #[allow(clippy::too_many_arguments)]
-pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize], v: &[usize], ext: &[Extent], q: &[[u16; 64]], mcu_rows: usize) {
+pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize], v: &[usize], ext: &[Extent], q: &[[u16; 64]], mcu_rows: usize) -> Model {
     let mut m = Model::new();
     let qs: Vec<[i64; 64]> = q.iter().map(|t| t.map(|x| x as i64)).collect();
     let rqs: Vec<[i64; 64]> = q.iter().map(|t| t.map(|x| (1i64 << 32) / (COS0[0] * x.max(1) as i64))).collect();
@@ -934,12 +1019,59 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize]
                     let blk: &mut [i16; 64] = (&mut rest[..64]).try_into().unwrap();
                     let l = if bx > 0 { Some((<&[i16; 64]>::try_from(&left[(bx - 1) * 64..bx * 64]).unwrap(), &now[bx - 1])) } else { None };
                     let a = above.map(|ab| (<&[i16; 64]>::try_from(&ab[bx * 64..bx * 64 + 64]).unwrap(), &prev[bx]));
-                    let info = m.block(io, cls, &qs[c], &rqs[c], blk, a, l, cd, ca);
+                    let al = if bx > 0 { above.map(|ab| <&[i16; 64]>::try_from(&ab[(bx - 1) * 64..bx * 64]).unwrap()) } else { None };
+                    let ar = if bx + 1 < w.min(e.ac_w.max(e.dc_w)) { above.map(|ab| <&[i16; 64]>::try_from(&ab[(bx + 1) * 64..bx * 64 + 128]).unwrap()) } else { None };
+                    let info = m.block(io, cls, &qs[c], &rqs[c], blk, a, l, (al, ar), cd, ca);
                     now[bx] = info;
                 }
             }
         }
     }
+    m
+}
+
+/// Builds the priors file from summed `Model::stats` of a training set of `files` files:
+/// distributions with at least `min` observations start from the observed frequencies, with the
+/// update count of `count0` (binary: `bit_count0`) so that they adapt from there.
+pub fn build_priors(totals: &[(usize, Vec<u64>)], min: u64, count0: u8, bit_count0: u8) -> Vec<u8> {
+    let was = TRAIN.swap(true, std::sync::atomic::Ordering::Relaxed);
+    let fresh = Model::new();
+    TRAIN.store(was, std::sync::atomic::Ordering::Relaxed);
+    let defaults: Vec<Vec<[u16; 16]>> = [&fresh.nz_hi, &fresh.nz_lo]
+        .iter()
+        .map(|t| t.cdf.iter().map(|c| c.0).collect())
+        .chain(std::iter::once(Vec::new()))
+        .chain([&fresh.mag, &fresh.nze].iter().map(|t| t.cdf.iter().map(|c| c.0).collect()))
+        .chain(std::iter::once(Vec::new()))
+        .chain([&fresh.emag].iter().map(|t| t.cdf.iter().map(|c| c.0).collect()))
+        .chain(std::iter::once(Vec::new()))
+        .chain([&fresh.esc, &fresh.dc].iter().map(|t| t.cdf.iter().map(|c| c.0).collect()))
+        .collect();
+    let mut out = Vec::new();
+    for ((n, counts), def) in totals.iter().zip(&defaults) {
+        let n = *n;
+        for (ctx, c) in counts.chunks(n).enumerate() {
+            let total: u64 = c.iter().sum();
+            if n == 2 {
+                let q = if total >= min { (((c[0] as f64 + 0.4) / (total as f64 + 0.8)) * PROB_ONE as f64).round() as u32 } else { PROB_ONE / 2 };
+                out.extend_from_slice(&(q.clamp(1, PROB_ONE - 1) as u16).to_le_bytes());
+                let _ = bit_count0;
+            } else {
+                let cdf = if total >= min {
+                    let scale = (1u64 << 20) as f64 / total as f64;
+                    let w: Vec<u32> = c.iter().map(|&x| (x as f64 * scale).round() as u32).collect();
+                    Cdf::new(n, &w).0
+                } else {
+                    def[ctx]
+                };
+                for j in 1..n {
+                    out.extend_from_slice(&cdf[j].to_le_bytes());
+                }
+                out.push(if total >= min { count0 } else { 0 });
+            }
+        }
+    }
+    out
 }
 
 /// Codes bytes with an order-1 binary model (each byte as 8 decisions in the context of the

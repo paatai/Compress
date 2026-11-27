@@ -36,6 +36,7 @@ fn main() {
         "pixhash" => cmd_pixhash(&args[1..]),
         "jfast" => cmd_jfast(&args[1..]),
         "jblob" => cmd_jblob(&args[1..]),
+        "jtrain" => cmd_jtrain(&args[1..]),
         "--version" | "-V" => {
             println!("komla {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -211,6 +212,20 @@ fn cmd_decompress(args: &[String]) -> Result<(), String> {
         img.depth,
         dt
     );
+    Ok(())
+}
+
+/// Development aid: learns the fast model's initial distributions from JPEG files.
+fn cmd_jtrain(args: &[String]) -> Result<(), String> {
+    let (input, output) = split_out(args)?;
+    let _ = input;
+    let files: Vec<Vec<u8>> = args.iter().filter(|a| a.ends_with(".jpg") || a.ends_with(".jpeg")).map(|a| read(Path::new(a))).collect::<Result<_, _>>()?;
+    let totals = jpeg::fast_train(&files);
+    let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let priors = jpeg::fast::build_priors(&totals, env("PRIOR_MIN", 32), env("PRIOR_COUNT", 12) as u8, env("PRIOR_BITCOUNT", 12) as u8);
+    let output = output.ok_or("-o output file needed")?;
+    std::fs::write(&output, &priors).map_err(|e| e.to_string())?;
+    println!("{} files, {} bytes of priors -> {}", files.len(), priors.len(), output.display());
     Ok(())
 }
 
