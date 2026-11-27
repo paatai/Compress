@@ -96,8 +96,8 @@ impl Cdf {
     /// The symbol whose interval contains `slot` (< 2^15): one less than the number of
     /// cumulative frequencies at or below it, which form a prefix because they increase.
     #[inline(always)]
-    fn find(&self, slot: u32) -> usize {
-        simd::find(&self.0, slot as u16) - 1
+    fn find<L: Lanes>(&self, slot: u32) -> usize {
+        L::find(&self.0, slot as u16) - 1
     }
     #[inline(always)]
     fn interval(&self, s: usize) -> (u32, u32) {
@@ -107,8 +107,8 @@ impl Cdf {
     /// Moves every cumulative frequency towards its target by 2^-shift of the distance; `cnt`
     /// counts the updates.
     #[inline(always)]
-    fn update(&mut self, cnt: &mut u8, s: usize, n: usize) {
-        simd::update(&mut self.0, s + 1, &TARGETS.lo[n & 15], &TARGETS.hi[n & 15], SHIFT[(*cnt & 63) as usize]);
+    fn update<L: Lanes>(&mut self, cnt: &mut u8, s: usize, n: usize) {
+        L::update(&mut self.0, s + 1, &TARGETS.lo[n & 15], &TARGETS.hi[n & 15], SHIFT[(*cnt & 63) as usize]);
         *cnt += (*cnt < LIMIT) as u8;
     }
 }
@@ -202,6 +202,71 @@ impl Bits {
             *p = rest;
         }
         Some(())
+    }
+}
+
+/// The vector operations on a distribution: `find` counts the cumulative frequencies at or
+/// below a slot, `update` moves lanes from `j` on towards `hi` and the others towards `lo`.
+/// Every implementation computes the same integers.
+pub trait Lanes {
+    fn find(c: &[u16; 16], slot: u16) -> usize;
+    fn update(c: &mut [u16; 16], j: usize, lo: &[u16; 16], hi: &[u16; 16], shift: u32);
+}
+
+/// SSE2 on x86-64, SIMD128 on WebAssembly, scalar elsewhere.
+pub struct Base;
+
+impl Lanes for Base {
+    #[inline(always)]
+    fn find(c: &[u16; 16], slot: u16) -> usize {
+        simd::find(c, slot)
+    }
+    #[inline(always)]
+    fn update(c: &mut [u16; 16], j: usize, lo: &[u16; 16], hi: &[u16; 16], shift: u32) {
+        simd::update(c, j, lo, hi, shift)
+    }
+}
+
+/// AVX2 (only used where the CPU has it, see `encode_stripe` and `decode_stripe`).
+#[cfg(target_arch = "x86_64")]
+pub struct Avx2;
+
+#[cfg(target_arch = "x86_64")]
+impl Lanes for Avx2 {
+    #[inline(always)]
+    fn find(c: &[u16; 16], slot: u16) -> usize {
+        // SAFETY: only instantiated in code that runs after detecting AVX2.
+        unsafe { avx2::find(c, slot) }
+    }
+    #[inline(always)]
+    fn update(c: &mut [u16; 16], j: usize, lo: &[u16; 16], hi: &[u16; 16], shift: u32) {
+        // SAFETY: as above.
+        unsafe { avx2::update(c, j, lo, hi, shift) }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use core::arch::x86_64::*;
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn find(c: &[u16; 16], slot: u16) -> usize {
+        let v = _mm256_loadu_si256(c.as_ptr() as *const __m256i);
+        let le = _mm256_cmpeq_epi16(_mm256_subs_epu16(v, _mm256_set1_epi16(slot as i16)), _mm256_setzero_si256());
+        let bits = _mm256_movemask_epi8(le) as u32;
+        ((!bits).trailing_zeros() / 2) as usize
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn update(c: &mut [u16; 16], j: usize, lo: &[u16; 16], hi: &[u16; 16], shift: u32) {
+        let p = c.as_mut_ptr() as *mut __m256i;
+        let v = _mm256_loadu_si256(p);
+        let m = _mm256_loadu_si256(super::GE_MASK[j & 15].as_ptr() as *const __m256i);
+        let t = _mm256_blendv_epi8(_mm256_loadu_si256(lo.as_ptr() as *const __m256i), _mm256_loadu_si256(hi.as_ptr() as *const __m256i), m);
+        let d = _mm256_sra_epi16(_mm256_sub_epi16(t, v), _mm_cvtsi32_si128(shift as i32));
+        _mm256_storeu_si256(p, _mm256_add_epi16(v, d));
     }
 }
 
@@ -338,22 +403,23 @@ pub trait Io {
     fn raw(&mut self, v: u32, n: u32) -> u32;
 }
 
-pub struct Enc {
+pub struct Enc<L: Lanes = Base> {
+    lanes: std::marker::PhantomData<L>,
     ops: Vec<u32>,
     raw: Vec<u8>,
     racc: u64,
     rbits: u32,
 }
 
-impl Default for Enc {
+impl<L: Lanes> Default for Enc<L> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Enc {
+impl<L: Lanes> Enc<L> {
     pub fn new() -> Self {
-        Enc { ops: Vec::with_capacity(1 << 16), raw: Vec::with_capacity(1 << 16), racc: 0, rbits: 0 }
+        Enc { lanes: std::marker::PhantomData, ops: Vec::with_capacity(1 << 16), raw: Vec::with_capacity(1 << 16), racc: 0, rbits: 0 }
     }
     pub fn symbols(&self) -> usize {
         self.ops.len()
@@ -391,7 +457,7 @@ impl Enc {
     }
 }
 
-impl Io for Enc {
+impl<L: Lanes> Io for Enc<L> {
     const DEC: bool = false;
     #[inline(always)]
     fn sym(&mut self, c: &mut Cdf, cnt: &mut u8, n: usize, s: usize) -> usize {
@@ -399,7 +465,7 @@ impl Io for Enc {
         let (start, freq) = c.interval(s);
         cost(freq);
         self.ops.push(start | ((freq - 1) << 16));
-        c.update(cnt, s, n);
+        c.update::<L>(cnt, s, n);
         s
     }
     #[inline(always)]
@@ -426,7 +492,8 @@ impl Io for Enc {
     }
 }
 
-pub struct Dec<'a> {
+pub struct Dec<'a, L: Lanes = Base> {
+    lanes: std::marker::PhantomData<L>,
     x0: u32,
     x1: u32,
     data: &'a [u8],
@@ -437,9 +504,9 @@ pub struct Dec<'a> {
     rbits: u32,
 }
 
-impl<'a> Dec<'a> {
+impl<'a, L: Lanes> Dec<'a, L> {
     pub fn new(data: &'a [u8], raw: &'a [u8]) -> Self {
-        let mut d = Dec { x0: 0, x1: 0, data, pos: 0, rdata: raw, rpos: 0, racc: 0, rbits: 0 };
+        let mut d = Dec { lanes: std::marker::PhantomData, x0: 0, x1: 0, data, pos: 0, rdata: raw, rpos: 0, racc: 0, rbits: 0 };
         d.x0 = (d.word() << 16) | d.word();
         d.x1 = (d.word() << 16) | d.word();
         d
@@ -459,13 +526,13 @@ impl<'a> Dec<'a> {
     }
 }
 
-impl Io for Dec<'_> {
+impl<L: Lanes> Io for Dec<'_, L> {
     const DEC: bool = true;
     #[inline(always)]
     fn sym(&mut self, c: &mut Cdf, cnt: &mut u8, n: usize, _s: usize) -> usize {
         let x = self.x0;
         let slot = x & (PROB_ONE - 1);
-        let s = c.find(slot);
+        let s = c.find::<L>(slot);
         let (start, freq) = c.interval(s);
         let mut x = freq * (x >> PROB_BITS) + slot - start;
         if x < RANS_L {
@@ -473,7 +540,7 @@ impl Io for Dec<'_> {
         }
         self.x0 = self.x1;
         self.x1 = x;
-        c.update(cnt, s, n);
+        c.update::<L>(cnt, s, n);
         s
     }
     #[inline(always)]
@@ -999,6 +1066,7 @@ pub struct Extent {
 /// component c (`width[c]` blocks of 64 coefficients per row); `v[c]`: block rows per MCU row;
 /// `q[c]`: quantization table (natural order).
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize], v: &[usize], ext: &[Extent], q: &[[u16; 64]], mcu_rows: usize) -> Model {
     let mut m = Model::new();
     let qs: Vec<[i64; 64]> = q.iter().map(|t| t.map(|x| x as i64)).collect();
@@ -1040,6 +1108,64 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize]
         }
     }
     m
+}
+
+/// Geometry of a stripe for `encode_stripe` and `decode_stripe`.
+pub struct Geometry<'a> {
+    pub width: &'a [usize],
+    pub v: &'a [usize],
+    pub ext: &'a [Extent],
+    pub q: &'a [[u16; 64]],
+    pub mcu_rows: usize,
+}
+
+fn encode_with<L: Lanes>(planes: &mut [&mut [i16]], g: &Geometry) -> (Vec<u8>, Vec<u8>) {
+    let mut e = Enc::<L>::new();
+    code_stripe(&mut e, planes, g.width, g.v, g.ext, g.q, g.mcu_rows);
+    e.finish()
+}
+
+fn decode_with<L: Lanes>(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry) -> bool {
+    let mut d = Dec::<L>::new(rans, raw);
+    code_stripe(&mut d, planes, g.width, g.v, g.ext, g.q, g.mcu_rows);
+    !d.overrun()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn encode_avx2(planes: &mut [&mut [i16]], g: &Geometry) -> (Vec<u8>, Vec<u8>) {
+    encode_with::<Avx2>(planes, g)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+unsafe fn decode_avx2(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry) -> bool {
+    decode_with::<Avx2>(rans, raw, planes, g)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_avx2() -> bool {
+    std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi1") && std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("popcnt")
+}
+
+/// Codes the coefficients of one stripe; returns (rANS bytes, raw bits).
+pub fn encode_stripe(planes: &mut [&mut [i16]], g: &Geometry) -> (Vec<u8>, Vec<u8>) {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: the CPU has every feature the function is compiled for.
+        return unsafe { encode_avx2(planes, g) };
+    }
+    encode_with::<Base>(planes, g)
+}
+
+/// Decodes the coefficients of one stripe into zeroed planes; false if the data ran out.
+pub fn decode_stripe(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: the CPU has every feature the function is compiled for.
+        return unsafe { decode_avx2(rans, raw, planes, g) };
+    }
+    decode_with::<Base>(rans, raw, planes, g)
 }
 
 /// Builds the priors file from summed `Model::stats` of a training set of `files` files:
@@ -1092,7 +1218,7 @@ pub fn encode_bytes(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return vec![0];
     }
-    let mut e = Enc::new();
+    let mut e = Enc::<Base>::new();
     let mut t = Bits::new(256 * 256);
     let mut prev = 0usize;
     for &b in data {
@@ -1121,7 +1247,7 @@ pub fn decode_bytes(c: &[u8], n: usize) -> Result<Vec<u8>, String> {
     match c.first() {
         Some(0) if c.len() == n + 1 => Ok(c[1..].to_vec()),
         Some(1) => {
-            let mut d = Dec::new(&c[1..], &[]);
+            let mut d = Dec::<Base>::new(&c[1..], &[]);
             let mut t = Bits::new(256 * 256);
             let mut out = Vec::with_capacity(n);
             let mut prev = 0usize;

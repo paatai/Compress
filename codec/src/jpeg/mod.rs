@@ -647,14 +647,12 @@ impl StripeGeom {
             .collect()
     }
     fn encode(&self, rows: (usize, usize), planes: &mut [&mut [i16]]) -> (Vec<u8>, Vec<u8>) {
-        let mut e = fast::Enc::new();
-        fast::code_stripe(&mut e, planes, &self.width, &self.v, &self.extents(rows.0), &self.q, rows.1 - rows.0);
-        e.finish()
+        let ext = self.extents(rows.0);
+        fast::encode_stripe(planes, &fast::Geometry { width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 })
     }
     fn decode(&self, rows: (usize, usize), rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]]) -> Result<(), String> {
-        let mut d = fast::Dec::new(rans, raw);
-        fast::code_stripe(&mut d, planes, &self.width, &self.v, &self.extents(rows.0), &self.q, rows.1 - rows.0);
-        if d.overrun() {
+        let ext = self.extents(rows.0);
+        if !fast::decode_stripe(rans, raw, planes, &fast::Geometry { width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 }) {
             return Err("corrupt .komla file".into());
         }
         Ok(())
@@ -1131,7 +1129,7 @@ pub fn fast_train(files: &[Vec<u8>]) -> Vec<(usize, Vec<u64>)> {
         let rows = fast_stripes(&l.frame);
         let geom = StripeGeom::new(&l);
         for (k, mut p) in split_rows(&l.frame, &rows, &mut coefs).into_iter().enumerate() {
-            let mut e = fast::Enc::new();
+            let mut e = fast::Enc::<fast::Base>::new();
             let m = fast::code_stripe(&mut e, &mut p, &geom.width, &geom.v, &geom.extents(rows[k].0), &geom.q, rows[k].1 - rows[k].0);
             let st = m.stats();
             if totals.is_empty() {
@@ -1163,7 +1161,7 @@ pub fn fast_experiment(data: &[u8]) -> Result<(usize, usize, f64, f64, f64), Str
     let v: Vec<usize> = f.comps.iter().map(|c| c.v).collect();
     let q: Vec<[u16; 64]> = f.comps.iter().map(|c| c.q).collect();
     let t1 = std::time::Instant::now();
-    let mut e = fast::Enc::new();
+    let mut e = fast::Enc::<fast::Base>::new();
     {
         let mut planes: Vec<&mut [i16]> = coefs.iter_mut().map(|p| &mut p[..]).collect();
         fast::code_stripe(&mut e, &mut planes, &width, &v, &ext, &q, f.mcuy);
@@ -1179,7 +1177,7 @@ pub fn fast_experiment(data: &[u8]) -> Result<(usize, usize, f64, f64, f64), Str
     let t2 = std::time::Instant::now();
     let mut dec: Vec<Vec<i16>> = coefs.iter().map(|p| vec![0i16; p.len()]).collect();
     {
-        let mut d = fast::Dec::new(&arith, &raw);
+        let mut d = fast::Dec::<fast::Base>::new(&arith, &raw);
         let mut planes: Vec<&mut [i16]> = dec.iter_mut().map(|p| &mut p[..]).collect();
         fast::code_stripe(&mut d, &mut planes, &width, &v, &ext, &q, f.mcuy);
     }
