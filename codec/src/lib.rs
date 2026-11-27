@@ -62,18 +62,51 @@ pub struct Options {
     pub tuning: ct::Tuning,
 }
 
-pub fn crc32(data: &[u8]) -> u32 {
-    let mut table = [0u32; 256];
-    for (i, t) in table.iter_mut().enumerate() {
+/// CRC-32 tables for slicing by 8: `T[k][b]` is the CRC of byte b followed by k zero bytes.
+static CRC_TABLES: [[u32; 256]; 8] = {
+    let mut t = [[0u32; 256]; 8];
+    let mut i = 0;
+    while i < 256 {
         let mut c = i as u32;
-        for _ in 0..8 {
+        let mut j = 0;
+        while j < 8 {
             c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            j += 1;
         }
-        *t = c;
+        t[0][i] = c;
+        i += 1;
     }
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let c = t[k - 1][i];
+            t[k][i] = (c >> 8) ^ t[0][(c & 0xFF) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
+pub fn crc32(data: &[u8]) -> u32 {
+    let t = &CRC_TABLES;
     let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) ^ crc;
+        let hi = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+        crc = t[7][(lo & 0xFF) as usize]
+            ^ t[6][((lo >> 8) & 0xFF) as usize]
+            ^ t[5][((lo >> 16) & 0xFF) as usize]
+            ^ t[4][(lo >> 24) as usize]
+            ^ t[3][(hi & 0xFF) as usize]
+            ^ t[2][((hi >> 8) & 0xFF) as usize]
+            ^ t[1][((hi >> 16) & 0xFF) as usize]
+            ^ t[0][(hi >> 24) as usize];
+    }
+    for &b in chunks.remainder() {
+        crc = t[0][((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc ^ 0xFFFF_FFFF
 }
@@ -686,4 +719,31 @@ pub fn decompress(b: &[u8], opts: &Options, progress: &mut dyn FnMut(f32)) -> Re
     };
     let coded: Vec<u16> = decoded.into_iter().flatten().collect();
     Ok((finish(&info, coded)?, info.source))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn crc32_matches_the_bytewise_definition() {
+        assert_eq!(super::crc32(b"123456789"), 0xCBF4_3926);
+        let data: Vec<u8> = (0..100_003u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in &data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { 0xEDB8_8320 ^ (crc >> 1) } else { crc >> 1 };
+            }
+        }
+        for n in [0, 1, 7, 8, 9, 100_003] {
+            let mut c = 0xFFFF_FFFFu32;
+            for &b in &data[..n] {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            assert_eq!(super::crc32(&data[..n]), !c);
+        }
+        assert_eq!(super::crc32(&data), !crc);
+    }
 }

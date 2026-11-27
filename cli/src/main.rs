@@ -35,6 +35,7 @@ fn main() {
         "bench" => cmd_bench(&args[1..]),
         "pixhash" => cmd_pixhash(&args[1..]),
         "jfast" => cmd_jfast(&args[1..]),
+        "jblob" => cmd_jblob(&args[1..]),
         "--version" | "-V" => {
             println!("komla {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -98,7 +99,7 @@ fn read(p: &Path) -> Result<Vec<u8>, String> {
 
 fn jpeg_mode(info: &jpeg::JpegInfo) -> String {
     match info.mode {
-        jpeg::MODE_JPEG => format!(
+        jpeg::MODE_JPEG | jpeg::MODE_FAST => format!(
             "{} x {} {} {}JPEG, {} stripe(s)",
             info.width,
             info.height,
@@ -110,9 +111,9 @@ fn jpeg_mode(info: &jpeg::JpegInfo) -> String {
     }
 }
 
-fn compress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8]) -> Result<(), String> {
+fn compress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8], fast: bool) -> Result<(), String> {
     let t0 = Instant::now();
-    let (out, info) = jpeg::compress(bytes, &mut |_| {});
+    let (out, info) = if fast { jpeg::compress_fast(bytes, jpeg::threads()) } else { jpeg::compress(bytes, &mut |_| {}) };
     let dt = t0.elapsed().as_secs_f64();
     let output = output.unwrap_or_else(|| {
         let mut s = input.as_os_str().to_owned();
@@ -135,7 +136,7 @@ fn compress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8]) -> Result<
 
 fn decompress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8]) -> Result<(), String> {
     let t0 = Instant::now();
-    let out = jpeg::decompress(bytes, &mut |_| {})?;
+    let out = jpeg::decompress_with(bytes, jpeg::threads())?;
     let dt = t0.elapsed().as_secs_f64();
     let output = output.unwrap_or_else(|| {
         let stem = input.to_string_lossy();
@@ -147,10 +148,12 @@ fn decompress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8]) -> Resul
 }
 
 fn cmd_compress(args: &[String]) -> Result<(), String> {
-    let (input, output) = split_out(args)?;
+    let fast = args.iter().any(|a| a == "--fast");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--fast").cloned().collect();
+    let (input, output) = split_out(&args)?;
     let bytes = read(&input)?;
     if jpeg::is_jpeg(&bytes) {
-        return compress_jpeg(&input, output, &bytes);
+        return compress_jpeg(&input, output, &bytes, fast);
     }
     let (img, src) = io::read_image(&bytes)?;
     let t0 = Instant::now();
@@ -208,6 +211,28 @@ fn cmd_decompress(args: &[String]) -> Result<(), String> {
         img.depth,
         dt
     );
+    Ok(())
+}
+
+/// Development aid: header blob coding speed.
+fn cmd_jblob(args: &[String]) -> Result<(), String> {
+    let (mut tin, mut tout, mut te, mut td) = (0usize, 0usize, 0f64, 0f64);
+    for a in args {
+        let bytes = read(Path::new(a))?;
+        let Ok(l) = jpeg::format::parse(&bytes, true) else { continue };
+        let t0 = Instant::now();
+        let c = jpeg::bytecm::encode(&l.blob);
+        let e = t0.elapsed().as_secs_f64();
+        let t1 = Instant::now();
+        let d = jpeg::bytecm::decode(&c, l.blob.len())?;
+        let dd = t1.elapsed().as_secs_f64();
+        assert_eq!(d, l.blob);
+        tin += l.blob.len();
+        tout += c.len();
+        te += e;
+        td += dd;
+    }
+    println!("blob {tin} -> {tout} ({:.1}%), enc {:.2} MB/s, dec {:.2} MB/s", 100.0 * tout as f64 / tin as f64, tin as f64 / te / 1e6, tin as f64 / td / 1e6);
     Ok(())
 }
 

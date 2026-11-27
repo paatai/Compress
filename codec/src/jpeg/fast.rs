@@ -28,9 +28,8 @@ const RANS_L: u32 = 1 << 16;
 pub struct Cdf([u16; 16]);
 
 const LIMIT: u8 = 63;
-const MAX_SHIFT: u32 = 6;
 
-/// Update shift after n updates: about log2(n + 2), so that early updates average like counts.
+/// Update shift after n updates: log2(n + 2) + 1, between 3 and 7.
 static SHIFT: [u32; 64] = {
     let mut r = [0u32; 64];
     let mut i = 0;
@@ -39,23 +38,18 @@ static SHIFT: [u32; 64] = {
         while (1usize << (s + 1)) <= i + 2 {
             s += 1;
         }
-        r[i] = if s > MAX_SHIFT { MAX_SHIFT } else { s };
+        s += 1;
+        r[i] = if s < 3 {
+            3
+        } else if s > 7 {
+            7
+        } else {
+            s
+        };
         i += 1;
     }
     r
 };
-
-pub static mut XSHIFT: [u32; 64] = SHIFT;
-/// Experiment: shift = clamp(floor(log2(cnt + 2)) + a, lo, hi).
-pub fn set_shift(a: i32, lo: u32, hi: u32) {
-    for i in 0..64 {
-        let mut s = 0i32;
-        while (1usize << (s + 1)) <= i + 2 {
-            s += 1;
-        }
-        unsafe { XSHIFT[i] = ((s + a).max(lo as i32) as u32).min(hi) };
-    }
-}
 
 /// Targets of the update for an alphabet of n symbols: the starts of symbols up to the coded one
 /// move towards LO, the others towards HI, which keeps one unit of frequency for every symbol.
@@ -114,7 +108,7 @@ impl Cdf {
     /// counts the updates.
     #[inline(always)]
     fn update(&mut self, cnt: &mut u8, s: usize, n: usize) {
-        simd::update(&mut self.0, s + 1, &TARGETS.lo[n & 15], &TARGETS.hi[n & 15], unsafe { XSHIFT[(*cnt & 63) as usize] });
+        simd::update(&mut self.0, s + 1, &TARGETS.lo[n & 15], &TARGETS.hi[n & 15], SHIFT[(*cnt & 63) as usize]);
         *cnt += (*cnt < LIMIT) as u8;
     }
 }
@@ -144,13 +138,13 @@ impl Table {
 /// at `BIT_LIMIT`) above. P(0) stays within [1, 2^15 - 1] (see `adapt_bit`).
 pub type Bit = u32;
 const BIT_INIT: Bit = 16384;
-pub static mut BIT_LIMIT: u32 = 30;
+const BIT_LIMIT: u32 = 30;
 
 /// Update weight after n updates: 1 / (n + 1.5), scaled to 16 bits.
-static BIT_RATE: [i32; 256] = {
-    let mut r = [0i32; 256];
+static BIT_RATE: [i32; 32] = {
+    let mut r = [0i32; 32];
     let mut i = 0;
-    while i < 256 {
+    while i < 32 {
         r[i] = 131072 / (2 * i as i32 + 3);
         i += 1;
     }
@@ -162,8 +156,8 @@ fn adapt_bit(p: Bit, b: u32) -> Bit {
     let n = p >> 16;
     let q = (p & 0xFFFF) as i32;
     let t = if b != 0 { 1 } else { PROB_ONE as i32 - 1 };
-    let q = q + (((t - q) * BIT_RATE[(n & 255) as usize]) >> 16);
-    q as u32 | ((n + (n < unsafe { BIT_LIMIT }) as u32) << 16)
+    let q = q + (((t - q) * BIT_RATE[(n & 31) as usize]) >> 16);
+    q as u32 | ((n + (n < BIT_LIMIT) as u32) << 16)
 }
 
 /// Binary probabilities.
@@ -996,5 +990,65 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize]
                 }
             }
         }
+    }
+}
+
+/// Codes bytes with an order-1 binary model (each byte as 8 decisions in the context of the
+/// previous byte); a leading 0 marks bytes stored as they are when that is not larger.
+pub fn encode_bytes(data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return vec![0];
+    }
+    let mut e = Enc::new();
+    let mut t = Bits::new(256 * 256);
+    let mut prev = 0usize;
+    for &b in data {
+        let mut node = 1usize;
+        for i in (0..8).rev() {
+            let bit = ((b >> i) & 1) as u32;
+            t.bit(&mut e, prev * 256 + node, bit);
+            node = node * 2 + bit as usize;
+        }
+        prev = b as usize;
+    }
+    let (r, _) = e.finish();
+    let mut out = Vec::with_capacity(r.len().min(data.len()) + 1);
+    if r.len() < data.len() {
+        out.push(1);
+        out.extend_from_slice(&r);
+    } else {
+        out.push(0);
+        out.extend_from_slice(data);
+    }
+    out
+}
+
+/// Inverse of `encode_bytes` for `n` bytes.
+pub fn decode_bytes(c: &[u8], n: usize) -> Result<Vec<u8>, String> {
+    match c.first() {
+        Some(0) if c.len() == n + 1 => Ok(c[1..].to_vec()),
+        Some(1) => {
+            let mut d = Dec::new(&c[1..], &[]);
+            let mut t = Bits::new(256 * 256);
+            let mut out = Vec::with_capacity(n);
+            let mut prev = 0usize;
+            for i in 0..n {
+                let mut node = 1usize;
+                for _ in 0..8 {
+                    node = node * 2 + t.bit(&mut d, prev * 256 + node, 0) as usize;
+                }
+                let b = (node - 256) as u8;
+                out.push(b);
+                prev = b as usize;
+                if i % 4096 == 0 && d.overrun() {
+                    return Err("corrupt .komla file".into());
+                }
+            }
+            if d.overrun() {
+                return Err("corrupt .komla file".into());
+            }
+            Ok(out)
+        }
+        _ => Err("corrupt .komla file".into()),
     }
 }

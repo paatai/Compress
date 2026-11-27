@@ -24,6 +24,7 @@
 pub mod bytecm;
 pub mod fast;
 pub mod format;
+pub mod huff;
 pub mod model;
 
 use crate::coder::{Decoder, Encoder};
@@ -534,14 +535,392 @@ pub fn decompress(b: &[u8], progress: &mut dyn FnMut(f32)) -> Result<Vec<u8>, St
     finish(&c, stripes)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Fast mode
+//
+//   "KMLA" | 'J' | version | MODE_FAST | varint original length | CRC-32 of the original file
+//   varint header-blob length | varint coded length | header blob (`fast::encode_bytes`)
+//   varint trailer length | trailer kind | varint coded length | coded trailer
+//   varint side-info length | side info (per scan: padding, garbage, end-of-band choices)
+//   varint stripe count | per stripe: varint rANS length, varint raw length | stripe data
+//
+// The side info can be decoded before any scan, so scans and stripes are independent: stripes
+// are coded and decoded in parallel, straight from and into the coefficient planes.
+
+/// Stripes of the fast mode hold about this many blocks (all components).
+pub const FAST_STRIPE_BLOCKS: usize = 1 << 15;
+pub const MODE_FAST: u8 = 3;
+/// Stored with the fast byte model.
+pub const MODE_BYTES: u8 = 4;
+const TRAILER_FAST: u8 = 2;
+
+/// Worker threads: KOMLA_THREADS if set, else the machine's parallelism (1 on WebAssembly).
+pub fn threads() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if let Some(n) = std::env::var("KOMLA_THREADS").ok().and_then(|s| s.parse::<usize>().ok()) {
+            return n.max(1);
+        }
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    }
+}
+
+/// Runs `f` on every item with up to `threads` threads; results in item order.
+fn par_map<T: Send, R: Send>(items: Vec<T>, threads: usize, f: impl Fn(usize, T) -> R + Sync) -> Vec<R> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let n = items.len();
+        if threads > 1 && n > 1 {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Mutex;
+            let slots: Vec<Mutex<Option<T>>> = items.into_iter().map(|t| Mutex::new(Some(t))).collect();
+            let out: Vec<Mutex<Option<R>>> = (0..n).map(|_| Mutex::new(None)).collect();
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(n) {
+                    s.spawn(|| loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        let t = slots[i].lock().unwrap().take().unwrap();
+                        let r = f(i, t);
+                        *out[i].lock().unwrap() = Some(r);
+                    });
+                }
+            });
+            return out.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
+        }
+    }
+    let _ = threads;
+    items.into_iter().enumerate().map(|(i, t)| f(i, t)).collect()
+}
+
+/// MCU rows of each fast-mode stripe.
+pub fn fast_stripes(f: &Frame) -> Vec<(usize, usize)> {
+    let per_row: usize = f.comps.iter().map(|c| c.pw * c.v).sum();
+    let target = std::env::var("KOMLA_STRIPE").ok().and_then(|s| s.parse().ok()).unwrap_or(FAST_STRIPE_BLOCKS);
+    let n = (per_row * f.mcuy).div_ceil(target).clamp(1, f.mcuy.clamp(1, 256));
+    let rows = f.mcuy.div_ceil(n);
+    (0..n).map(|k| (k * rows, ((k + 1) * rows).min(f.mcuy))).filter(|r| r.0 < r.1).collect()
+}
+
+/// Splits each component's plane into the block rows of every stripe.
+fn split_rows<'a>(f: &Frame, rows: &[(usize, usize)], planes: &'a mut [Vec<i16>]) -> Vec<Vec<&'a mut [i16]>> {
+    let mut out: Vec<Vec<&'a mut [i16]>> = (0..rows.len()).map(|_| Vec::with_capacity(f.comps.len())).collect();
+    for (c, plane) in f.comps.iter().zip(planes.iter_mut()) {
+        let mut rest: &'a mut [i16] = &mut plane[..];
+        for (k, &(my0, my1)) in rows.iter().enumerate() {
+            let n = (my1 - my0) * c.v * c.pw * 64;
+            let (a, b) = std::mem::take(&mut rest).split_at_mut(n);
+            out[k].push(a);
+            rest = b;
+        }
+    }
+    out
+}
+
+struct StripeGeom {
+    width: Vec<usize>,
+    v: Vec<usize>,
+    q: Vec<[u16; 64]>,
+    cov: Vec<(bool, bool, (usize, usize), (usize, usize))>,
+}
+
+impl StripeGeom {
+    fn new(l: &Layout) -> StripeGeom {
+        let f = &l.frame;
+        StripeGeom { width: f.comps.iter().map(|c| c.pw).collect(), v: f.comps.iter().map(|c| c.v).collect(), q: f.comps.iter().map(|c| c.q).collect(), cov: coverage(l) }
+    }
+    fn extents(&self, my0: usize) -> Vec<fast::Extent> {
+        self.cov
+            .iter()
+            .zip(&self.v)
+            .map(|(c, &v)| {
+                let r0 = my0 * v;
+                fast::Extent { dc: c.0, ac: c.1, dc_w: c.2 .0, dc_h: c.2 .1.saturating_sub(r0), ac_w: c.3 .0, ac_h: c.3 .1.saturating_sub(r0) }
+            })
+            .collect()
+    }
+    fn encode(&self, rows: (usize, usize), planes: &mut [&mut [i16]]) -> (Vec<u8>, Vec<u8>) {
+        let mut e = fast::Enc::new();
+        fast::code_stripe(&mut e, planes, &self.width, &self.v, &self.extents(rows.0), &self.q, rows.1 - rows.0);
+        e.finish()
+    }
+    fn decode(&self, rows: (usize, usize), rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]]) -> Result<(), String> {
+        let mut d = fast::Dec::new(rans, raw);
+        fast::code_stripe(&mut d, planes, &self.width, &self.v, &self.extents(rows.0), &self.q, rows.1 - rows.0);
+        if d.overrun() {
+            return Err("corrupt .komla file".into());
+        }
+        Ok(())
+    }
+}
+
+fn put_side(out: &mut Vec<u8>, s: &huff::Side) {
+    put_varint(out, s.pads.len() as u64);
+    out.extend_from_slice(&s.pads);
+    put_varint(out, s.garbage.len() as u64);
+    out.extend_from_slice(&s.garbage);
+    put_varint(out, s.eob_flips.len() as u64);
+    let mut last = 0u32;
+    for &x in &s.eob_flips {
+        put_varint(out, (x - last) as u64);
+        last = x;
+    }
+}
+
+fn get_side(b: &[u8], pos: &mut usize, limit: usize) -> Result<huff::Side, String> {
+    let mut s = huff::Side::default();
+    let n = get_varint(b, pos)?;
+    s.pads = take(b, pos, n)?.to_vec();
+    let n = get_varint(b, pos)?;
+    if n > limit as u64 {
+        return Err("corrupt .komla file".into());
+    }
+    s.garbage = take(b, pos, n)?.to_vec();
+    let n = get_varint(b, pos)?;
+    if n > limit as u64 {
+        return Err("corrupt .komla file".into());
+    }
+    let mut last = 0u64;
+    for _ in 0..n {
+        last += get_varint(b, pos)?;
+        s.eob_flips.push(u32::try_from(last).map_err(|_| "corrupt .komla file")?);
+    }
+    Ok(s)
+}
+
+fn stored_fast(data: &[u8], note: String) -> (Vec<u8>, JpegInfo) {
+    let mut h = Vec::with_capacity(data.len() + 16);
+    h.extend_from_slice(crate::MAGIC);
+    h.push(KIND);
+    h.push(VERSION);
+    let c = fast::encode_bytes(data);
+    let mode = if c[0] == 1 { MODE_BYTES } else { MODE_RAW };
+    h.push(mode);
+    put_varint(&mut h, data.len() as u64);
+    h.extend_from_slice(&crate::crc32(data).to_le_bytes());
+    h.extend_from_slice(if mode == MODE_BYTES { &c } else { data });
+    (h, JpegInfo { mode, note, ..Default::default() })
+}
+
+/// Compresses a JPEG file in the fast mode with up to `threads` threads. Never fails: input
+/// that cannot be recompressed exactly is stored.
+pub fn compress_fast(data: &[u8], threads: usize) -> (Vec<u8>, JpegInfo) {
+    match analyze_fast(data, threads) {
+        Ok(r) => r,
+        Err(e) => stored_fast(data, e),
+    }
+}
+
+fn analyze_fast(data: &[u8], threads: usize) -> Result<(Vec<u8>, JpegInfo), String> {
+    if data.len() > u32::MAX as usize {
+        return Err("file too large".into());
+    }
+    let l = format::parse(data, true)?;
+    let (mut coefs, sides) = format::decode_scans(&l, data)?;
+    let f = &l.frame;
+    // regenerate every scan from the coefficients, recording the side info that reproduces it
+    let side = {
+        let planes: Vec<&[i16]> = coefs.iter().map(|p| &p[..]).collect();
+        let jobs: Vec<usize> = (0..l.scans.len()).collect();
+        let res = par_map(jobs, threads, |_, i| -> Result<huff::Side, String> {
+            let s = &l.scans[i];
+            let mut ch = huff::Choices::record(&sides[i]);
+            let mut out = Vec::with_capacity(s.seg.1 - s.seg.0 + 64);
+            huff::encode_scan(f, s, &planes, &mut ch, &mut out)?;
+            if out[..] != data[s.seg.0..s.seg.1] {
+                return Err("scan data cannot be reproduced exactly from its coefficients".into());
+            }
+            Ok(ch.side)
+        });
+        let mut side = Vec::new();
+        for r in res {
+            put_side(&mut side, &r?);
+        }
+        side
+    };
+    let rows = fast_stripes(f);
+    let geom = StripeGeom::new(&l);
+    let streams = {
+        let parts = split_rows(f, &rows, &mut coefs);
+        par_map(parts, threads, |k, mut p| geom.encode(rows[k], &mut p))
+    };
+    drop(coefs);
+    let trailer = &data[l.end..];
+    let mut h = Vec::with_capacity(4096 + streams.iter().map(|s| s.0.len() + s.1.len()).sum::<usize>());
+    h.extend_from_slice(crate::MAGIC);
+    h.push(KIND);
+    h.push(VERSION);
+    h.push(MODE_FAST);
+    put_varint(&mut h, data.len() as u64);
+    h.extend_from_slice(&crate::crc32(data).to_le_bytes());
+    let c = fast::encode_bytes(&l.blob);
+    put_varint(&mut h, l.blob.len() as u64);
+    put_varint(&mut h, c.len() as u64);
+    h.extend_from_slice(&c);
+    put_varint(&mut h, trailer.len() as u64);
+    let (kind, c) = match is_jpeg(trailer).then(|| compress_fast(trailer, threads)) {
+        Some((nested, info)) if info.mode == MODE_FAST && nested.len() < trailer.len() => (TRAILER_FAST, nested),
+        _ => (TRAILER_CM, fast::encode_bytes(trailer)),
+    };
+    h.push(kind);
+    put_varint(&mut h, c.len() as u64);
+    h.extend_from_slice(&c);
+    put_varint(&mut h, side.len() as u64);
+    h.extend_from_slice(&side);
+    put_varint(&mut h, streams.len() as u64);
+    for (r, w) in &streams {
+        put_varint(&mut h, r.len() as u64);
+        put_varint(&mut h, w.len() as u64);
+    }
+    for (r, w) in &streams {
+        h.extend_from_slice(r);
+        h.extend_from_slice(w);
+    }
+    let info = JpegInfo {
+        width: f.width as u32,
+        height: f.height as u32,
+        components: f.comps.len() as u8,
+        progressive: f.progressive,
+        sampling: sampling(f),
+        stripes: rows.len() as u32,
+        mode: MODE_FAST,
+        note: String::new(),
+    };
+    Ok((h, info))
+}
+
+/// The parts of a fast-mode container.
+struct FastContainer<'a> {
+    len: usize,
+    crc: u32,
+    blob: Vec<u8>,
+    trailer: (u8, &'a [u8], usize),
+    side: &'a [u8],
+    stripes: Vec<(&'a [u8], &'a [u8])>,
+}
+
+fn parse_fast(b: &[u8], len: usize, crc: u32, mut pos: usize) -> Result<FastContainer<'_>, String> {
+    let n = get_varint(b, &mut pos)?;
+    let cl = get_varint(b, &mut pos)?;
+    if n > len as u64 {
+        return Err("corrupt .komla file".into());
+    }
+    let blob = fast::decode_bytes(take(b, &mut pos, cl)?, n as usize)?;
+    let tl = get_varint(b, &mut pos)?;
+    if tl > len as u64 {
+        return Err("corrupt .komla file".into());
+    }
+    let kind = *b.get(pos).ok_or("truncated .komla file")?;
+    pos += 1;
+    let cl = get_varint(b, &mut pos)?;
+    let trailer = (kind, take(b, &mut pos, cl)?, tl as usize);
+    let sl = get_varint(b, &mut pos)?;
+    let side = take(b, &mut pos, sl)?;
+    let n = get_varint(b, &mut pos)? as usize;
+    if n == 0 || n > 256 {
+        return Err("corrupt stripe table".into());
+    }
+    let mut lens = Vec::with_capacity(n);
+    for _ in 0..n {
+        lens.push((get_varint(b, &mut pos)?, get_varint(b, &mut pos)?));
+    }
+    let mut stripes = Vec::with_capacity(n);
+    for (r, w) in lens {
+        let r = take(b, &mut pos, r)?;
+        let w = take(b, &mut pos, w)?;
+        stripes.push((r, w));
+    }
+    Ok(FastContainer { len, crc, blob, trailer, side, stripes })
+}
+
+fn decompress_fast(c: FastContainer, threads: usize) -> Result<Vec<u8>, String> {
+    let l = format::parse(&c.blob, false)?;
+    let f = &l.frame;
+    let mut pos = 0;
+    let mut sides = Vec::with_capacity(l.scans.len());
+    for _ in &l.scans {
+        sides.push(get_side(c.side, &mut pos, c.len)?);
+    }
+    let rows = fast_stripes(f);
+    if rows.len() != c.stripes.len() {
+        return Err("corrupt stripe table".into());
+    }
+    let geom = StripeGeom::new(&l);
+    let mut coefs: Vec<Vec<i16>> = f.comps.iter().map(|comp| vec![0i16; comp.pw * comp.ph * 64]).collect();
+    {
+        let parts = split_rows(f, &rows, &mut coefs);
+        let res = par_map(parts, threads, |k, mut p| geom.decode(rows[k], c.stripes[k].0, c.stripes[k].1, &mut p));
+        for r in res {
+            r?;
+        }
+    }
+    let planes: Vec<&[i16]> = coefs.iter().map(|p| &p[..]).collect();
+    let mut out = Vec::with_capacity(c.len + 64);
+    let mut bpos = 0;
+    for (s, side) in l.scans.iter().zip(sides) {
+        out.extend_from_slice(&c.blob[bpos..s.blob_pos]);
+        bpos = s.blob_pos;
+        let mut ch = huff::Choices::replay(side);
+        huff::encode_scan(f, s, &planes, &mut ch, &mut out)?;
+        if out.len() > c.len {
+            return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
+        }
+    }
+    out.extend_from_slice(&c.blob[bpos..]);
+    drop(coefs);
+    let (kind, coded, n) = c.trailer;
+    let t = match kind {
+        TRAILER_CM => fast::decode_bytes(coded, n)?,
+        TRAILER_FAST => decompress_with(coded, threads)?,
+        _ => return Err("corrupt .komla file".into()),
+    };
+    if t.len() != n {
+        return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
+    }
+    out.extend_from_slice(&t);
+    if out.len() != c.len || crate::crc32(&out) != c.crc {
+        return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
+    }
+    Ok(out)
+}
+
+/// Decompresses any .komla JPEG container with up to `threads` threads.
+pub fn decompress_with(b: &[u8], threads: usize) -> Result<Vec<u8>, String> {
+    if !is_container(b) {
+        return Err("not a Komla JPEG file".into());
+    }
+    if b[5] != VERSION {
+        return Err(format!("unsupported Komla JPEG version {}", b[5]));
+    }
+    match b.get(6) {
+        Some(&MODE_FAST) | Some(&MODE_BYTES) => {
+            let mut pos = 7;
+            let len = usize::try_from(get_varint(b, &mut pos)?).map_err(|_| "corrupt .komla file")?;
+            let crc = u32::from_le_bytes(take(b, &mut pos, 4)?.try_into().unwrap());
+            if b[6] == MODE_BYTES {
+                let out = fast::decode_bytes(&b[pos..], len)?;
+                if out.len() != len || crate::crc32(&out) != crc {
+                    return Err("checksum mismatch: the .komla file is damaged or incomplete".into());
+                }
+                return Ok(out);
+            }
+            decompress_fast(parse_fast(b, len, crc, pos)?, threads)
+        }
+        _ => decompress(b, &mut |_| {}),
+    }
+}
+
 /// Experiment: codes all coefficients of a JPEG with the fast model in one stripe, decodes them
 /// again and checks they match. Returns (arithmetic bytes, raw bytes, seconds for Huffman
 /// decoding, model encoding, model decoding).
 pub fn fast_experiment(data: &[u8]) -> Result<(usize, usize, f64, f64, f64), String> {
-    if let Ok(v) = std::env::var("KOMLA_SH") {
-        let p: Vec<i32> = v.split(',').map(|x| x.parse().unwrap()).collect();
-        fast::set_shift(p[0], p[1] as u32, p[2] as u32);
-    }
     let t0 = std::time::Instant::now();
     let l = format::parse(data, true)?;
     let (mut coefs, _) = format::decode_scans(&l, data)?;

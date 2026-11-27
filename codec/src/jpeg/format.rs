@@ -419,6 +419,8 @@ pub struct ScanSide {
     pub garbage: Vec<u8>,
     /// for every end-of-band event of a progressive AC scan: did the run end there?
     pub eob_end: Vec<bool>,
+    /// some padding bits were not all ones
+    pub pads_not_ones: bool,
 }
 
 struct BitReader<'a> {
@@ -498,9 +500,10 @@ impl<'a> BitReader<'a> {
     }
     /// Reads the padding bits of the current byte and moves to the next whole byte.
     /// Fails if the data consumed so far ran past the end of the segment.
-    fn align(&mut self) -> Result<u8, String> {
+    fn align(&mut self) -> Result<(u8, bool), String> {
         let n = self.nbits % 8;
         let pad = self.bits(n) as u8;
+        let ones = pad as u32 == (1 << n) - 1;
         let unread = (self.nbits / 8) as usize;
         let mut fake_unread = 0;
         for i in 0..unread {
@@ -517,7 +520,7 @@ impl<'a> BitReader<'a> {
         self.acc = 0;
         self.nbits = 0;
         self.hn = 0;
-        Ok(pad)
+        Ok((pad, ones))
     }
 }
 
@@ -564,7 +567,9 @@ fn decode_scan(f: &Frame, s: &Scan, seg: &[u8], coefs: &mut [Vec<i16>]) -> Resul
             if eobrun > 0 {
                 return Err("end-of-band run crosses a restart marker".into());
             }
-            side.pads.push(r.align()?);
+            let (pad, ones) = r.align()?;
+            side.pads.push(pad);
+            side.pads_not_ones |= !ones;
             if r.seg.get(r.pos) != Some(&0xFF) || r.seg.get(r.pos + 1) != Some(&(0xD0 + (rst % 8) as u8)) {
                 return Err("missing or unexpected restart marker".into());
             }
@@ -602,7 +607,9 @@ fn decode_scan(f: &Frame, s: &Scan, seg: &[u8], coefs: &mut [Vec<i16>]) -> Resul
     if eobrun > 0 {
         return Err("end-of-band run past the end of the scan".into());
     }
-    side.pads.push(r.align()?);
+    let (pad, ones) = r.align()?;
+    side.pads.push(pad);
+    side.pads_not_ones |= !ones;
     side.garbage = seg[r.pos..].to_vec();
     Ok(side)
 }

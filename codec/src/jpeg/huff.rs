@@ -1,0 +1,543 @@
+//! Fast regeneration of JPEG scan data from coefficients.
+//!
+//! Produces exactly the bytes of `format::encode_scan` (libjpeg's encoder rules), but walks the
+//! nonzero coefficients of each block through a bit mask in zigzag order instead of testing all
+//! 64, writes each code together with its value bits, and moves whole 32-bit words to the
+//! output when they contain no 0xFF byte. The choices the coefficients do not determine come
+//! from a `Side`, which can be decoded before any scan (unlike the adaptive side coder of the
+//! default mode), so scans and stripes can be regenerated independently.
+
+use super::format::{Frame, Huff, Scan, ScanSide, NATURAL};
+
+/// What a scan's coefficients do not determine, as the fast container stores it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Side {
+    /// padding bits of every flush; empty if they were all ones (what libjpeg writes)
+    pub pads: Vec<u8>,
+    /// bytes after the final flush, before the next marker
+    pub garbage: Vec<u8>,
+    /// end-of-band events of a progressive AC scan (numbered over the scan) at which the
+    /// encoder had a choice and decided against libjpeg's rule
+    pub eob_flips: Vec<u32>,
+}
+
+/// Zigzag index of each natural (row-major) position.
+pub const ZIGZAG: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut k = 0;
+    while k < 64 {
+        t[NATURAL[k]] = k as u8;
+        k += 1;
+    }
+    t
+};
+
+/// `ZZ[b][m]`: the zigzag-order bits of natural positions 8b..8b+8 whose bits are set in m.
+static ZZ: [[u64; 256]; 8] = {
+    let mut t = [[0u64; 256]; 8];
+    let mut b = 0;
+    while b < 8 {
+        let mut m = 0;
+        while m < 256 {
+            let mut v = 0u64;
+            let mut j = 0;
+            while j < 8 {
+                if m & (1 << j) != 0 {
+                    v |= 1u64 << ZIGZAG[b * 8 + j];
+                }
+                j += 1;
+            }
+            t[b][m] = v;
+            m += 1;
+        }
+        b += 1;
+    }
+    t
+};
+
+/// Bit k (zigzag order) set where |coefficient| >= `thr` (1 <= thr <= 2^14).
+#[inline(always)]
+pub fn zz_mask(blk: &[i16; 64], thr: i16) -> u64 {
+    let m = nat_mask(blk, thr);
+    let mut z = 0u64;
+    for b in 0..8 {
+        z |= ZZ[b][((m >> (8 * b)) & 0xFF) as usize];
+    }
+    z
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn nat_mask(blk: &[i16; 64], thr: i16) -> u64 {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of x86-64; `blk` is 64 i16 (eight unaligned 128-bit loads).
+    unsafe {
+        let p = blk.as_ptr() as *const __m128i;
+        let hi = _mm_set1_epi16(thr - 1);
+        let lo = _mm_set1_epi16(1 - thr);
+        let mut m = 0u64;
+        for j in 0..4 {
+            let a = _mm_loadu_si128(p.add(2 * j));
+            let b = _mm_loadu_si128(p.add(2 * j + 1));
+            let ma = _mm_or_si128(_mm_cmpgt_epi16(a, hi), _mm_cmplt_epi16(a, lo));
+            let mb = _mm_or_si128(_mm_cmpgt_epi16(b, hi), _mm_cmplt_epi16(b, lo));
+            m |= (_mm_movemask_epi8(_mm_packs_epi16(ma, mb)) as u32 as u64) << (16 * j);
+        }
+        m
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+fn nat_mask(blk: &[i16; 64], thr: i16) -> u64 {
+    use core::arch::wasm32::*;
+    // SAFETY: `blk` is 64 i16 (eight unaligned 128-bit loads).
+    unsafe {
+        let p = blk.as_ptr() as *const v128;
+        let hi = i16x8_splat(thr - 1);
+        let lo = i16x8_splat(1 - thr);
+        let mut m = 0u64;
+        for j in 0..8 {
+            let a = v128_load(p.add(j));
+            let ma = v128_or(i16x8_gt(a, hi), i16x8_lt(a, lo));
+            m |= (i16x8_bitmask(ma) as u64) << (8 * j);
+        }
+        m
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "wasm32", target_feature = "simd128"))))]
+#[inline(always)]
+fn nat_mask(blk: &[i16; 64], thr: i16) -> u64 {
+    let mut m = 0u64;
+    for (i, &v) in blk.iter().enumerate() {
+        m |= (((v as i32).unsigned_abs() >= thr as u32) as u64) << i;
+    }
+    m
+}
+
+#[inline(always)]
+fn bitlen(v: u32) -> u32 {
+    32 - v.leading_zeros()
+}
+
+/// Huffman codes for encoding: code << 8 | length (0 if the symbol has no code).
+pub struct Codes([u32; 256]);
+
+impl Codes {
+    pub fn new(h: &Huff) -> Codes {
+        let mut t = [0u32; 256];
+        for (s, e) in t.iter_mut().enumerate() {
+            *e = ((h.code[s] as u32) << 8) | h.len[s] as u32;
+        }
+        Codes(t)
+    }
+}
+
+/// The value bits of a coefficient of bit length n (JPEG: negative values as v - 1).
+#[inline(always)]
+fn vbits(v: i32, n: u32) -> u32 {
+    (v + (v >> 31)) as u32 & ((1u32 << n) - 1)
+}
+
+/// Bit writer with JPEG byte stuffing. Pending bits sit at the top of `c` (fewer than 8 between
+/// calls); every `put` stores all 8 bytes of `c` at the end of the output and keeps the
+/// complete ones, so no branch depends on how many bits have accumulated.
+struct Bw<'a> {
+    out: &'a mut Vec<u8>,
+    c: u64,
+    n: u32,
+}
+
+/// Bytes `put` may write past the end of the output (8 stored, up to 4 kept, and stuffing).
+const SLACK: usize = 16;
+/// The top n bytes of a u64.
+const TOP: [u64; 9] = [0, 0xFF << 56, 0xFFFF << 48, 0xFF_FFFF << 40, 0xFFFF_FFFF << 32, 0xFF_FFFF_FFFF << 24, 0xFFFF_FFFF_FFFF << 16, 0xFF_FFFF_FFFF_FFFF << 8, u64::MAX];
+
+impl Bw<'_> {
+    fn new(out: &mut Vec<u8>) -> Bw<'_> {
+        out.reserve(4096);
+        Bw { out, c: 0, n: 0 }
+    }
+    /// Makes room for at least `bytes` more output.
+    #[inline(always)]
+    fn room(&mut self, bytes: usize) {
+        if self.out.capacity() - self.out.len() < bytes + SLACK {
+            self.out.reserve(bytes + SLACK + self.out.len() / 2);
+        }
+    }
+    /// Appends `len` (1 to 32) bits `v` (< 2^len); needs `room` for 8 bytes.
+    #[inline(always)]
+    fn put(&mut self, v: u32, len: u32) {
+        debug_assert!((1..=32).contains(&len) && self.n < 8 && (v as u64) >> len == 0);
+        self.n += len;
+        self.c |= (v as u64) << (64 - self.n);
+        let nb = (self.n >> 3) as usize;
+        let len0 = self.out.len();
+        debug_assert!(self.out.capacity() - len0 >= 8);
+        // SAFETY: `room` keeps at least SLACK (> 8) bytes of spare capacity, and only the first
+        // `nb` stored bytes become part of the vector.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.c.to_be_bytes().as_ptr(), self.out.as_mut_ptr().add(len0), 8);
+        }
+        // flags bytes that are 0xFF (and possibly bytes above one), only in the kept bytes
+        let x = !self.c;
+        let ff = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080 & TOP[nb];
+        if ff == 0 {
+            // SAFETY: the `nb` bytes were written above, within capacity.
+            unsafe { self.out.set_len(len0 + nb) };
+        } else {
+            for &b in &self.c.to_be_bytes()[..nb] {
+                self.out.push(b);
+                if b == 0xFF {
+                    self.out.push(0);
+                }
+            }
+        }
+        self.c <<= 8 * nb;
+        self.n &= 7;
+    }
+    #[inline(always)]
+    fn sym(&mut self, t: &Codes, s: usize) -> Result<(), String> {
+        let e = t.0[s & 255];
+        if e & 0xFF == 0 {
+            return Err("symbol missing from Huffman table".into());
+        }
+        self.put(e >> 8, e & 0xFF);
+        Ok(())
+    }
+    /// A symbol followed by `n` value bits (`v` < 2^n).
+    #[inline(always)]
+    fn sym_bits(&mut self, t: &Codes, s: usize, v: u32, n: u32) -> Result<(), String> {
+        let e = t.0[s & 255];
+        if e & 0xFF == 0 {
+            return Err("symbol missing from Huffman table".into());
+        }
+        self.put(((e >> 8) << n) | v, (e & 0xFF) + n);
+        Ok(())
+    }
+    fn pad_len(&self) -> u32 {
+        (8 - self.n) % 8
+    }
+    /// Pads to a byte boundary with `pad` (`pad_len` bits).
+    fn flush(&mut self, pad: u32) {
+        let n = self.pad_len();
+        if n > 0 {
+            self.room(8);
+            self.put(pad, n);
+        }
+    }
+}
+
+/// Source of the encoder's free choices: while compressing it replays the recorded `ScanSide`
+/// and writes down the `Side` that reproduces it; while decompressing it reads the `Side`.
+pub struct Choices<'a> {
+    rec: Option<&'a ScanSide>,
+    pub side: Side,
+    pad_i: usize,
+    eob_i: u32,
+    flip_i: usize,
+}
+
+impl<'a> Choices<'a> {
+    pub fn record(rec: &'a ScanSide) -> Self {
+        let side = Side { pads: if rec.pads_not_ones { rec.pads.clone() } else { Vec::new() }, garbage: rec.garbage.clone(), eob_flips: Vec::new() };
+        Choices { rec: Some(rec), side, pad_i: 0, eob_i: 0, flip_i: 0 }
+    }
+    pub fn replay(side: Side) -> Self {
+        Choices { rec: None, side, pad_i: 0, eob_i: 0, flip_i: 0 }
+    }
+    fn pad(&mut self, n: u32) -> u32 {
+        let ones = (1u32 << n) - 1;
+        let v = if self.side.pads.is_empty() { ones } else { self.side.pads.get(self.pad_i).copied().unwrap_or(0xFF) as u32 & ones };
+        self.pad_i += 1;
+        v
+    }
+    /// At an end-of-band event where the run may continue: does it end here?
+    fn eob_end(&mut self, libjpeg: bool) -> bool {
+        let i = self.eob_i;
+        match self.rec {
+            Some(r) => {
+                let v = r.eob_end.get(i as usize).copied().unwrap_or(true);
+                if v != libjpeg {
+                    self.side.eob_flips.push(i);
+                }
+                v
+            }
+            None => {
+                let flip = self.side.eob_flips.get(self.flip_i) == Some(&i);
+                self.flip_i += flip as usize;
+                libjpeg ^ flip
+            }
+        }
+    }
+}
+
+struct Prog {
+    eobrun: u32,
+    be: Vec<u8>,
+}
+
+fn emit_eobrun(w: &mut Bw, ac: &Codes, st: &mut Prog) -> Result<(), String> {
+    if st.eobrun > 0 {
+        let n = bitlen(st.eobrun) - 1;
+        if n > 14 {
+            return Err("end-of-band run too long".into());
+        }
+        w.sym_bits(ac, (n << 4) as usize, st.eobrun & ((1 << n) - 1), n)?;
+        st.eobrun = 0;
+        for &b in &st.be {
+            w.put(b as u32, 1);
+        }
+        st.be.clear();
+    }
+    Ok(())
+}
+
+fn end_of_band(w: &mut Bw, ac: &Codes, st: &mut Prog, free: bool, libjpeg: bool, ch: &mut Choices) -> Result<(), String> {
+    let forced = st.eobrun == 0x7FFF;
+    let flush = if forced || !free { forced } else { ch.eob_end(libjpeg) };
+    ch.eob_i += 1;
+    if flush {
+        emit_eobrun(w, ac, st)?;
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn encode_dc(w: &mut Bw, h: &Codes, v: i32, pred: &mut i32) -> Result<(), String> {
+    let d = v - *pred;
+    *pred = v;
+    let n = bitlen(d.unsigned_abs());
+    if n > 15 {
+        return Err("DC difference out of range".into());
+    }
+    w.sym_bits(h, n as usize, vbits(d, n), n)
+}
+
+#[inline(always)]
+fn encode_seq(w: &mut Bw, dc: &Codes, ac: &Codes, blk: &[i16; 64], pred: &mut i32) -> Result<(), String> {
+    w.room(512);
+    encode_dc(w, dc, blk[0] as i32, pred)?;
+    let mut mask = zz_mask(blk, 1) & !1;
+    let mut k = 0u32;
+    while mask != 0 {
+        let z = mask.trailing_zeros();
+        let mut r = z - k - 1;
+        while r > 15 {
+            w.sym(ac, 0xF0)?;
+            r -= 16;
+        }
+        let v = blk[NATURAL[z as usize]] as i32;
+        let n = bitlen(v.unsigned_abs());
+        w.sym_bits(ac, ((r << 4) + n) as usize, vbits(v, n), n)?;
+        k = z;
+        mask &= mask - 1;
+    }
+    if k < 63 {
+        w.sym(ac, 0)?;
+    }
+    Ok(())
+}
+
+/// Bits ss..=se.
+#[inline(always)]
+fn band(ss: usize, se: usize) -> u64 {
+    (u64::MAX >> (63 - se)) & (u64::MAX << ss)
+}
+
+/// Does a block emit no symbol in a progressive AC scan (so it can only extend a run)?
+#[inline(always)]
+fn pure(blk: &[i16; 64], s: &Scan) -> bool {
+    let b = band(s.ss, s.se);
+    if s.ah == 0 {
+        zz_mask(blk, 1 << s.al) & b == 0
+    } else {
+        zz_mask(blk, 1 << s.al) & !zz_mask(blk, 2 << s.al) & b == 0
+    }
+}
+
+fn encode_ac_first(w: &mut Bw, s: &Scan, ac: &Codes, blk: &[i16; 64], st: &mut Prog, free: bool, ch: &mut Choices) -> Result<(), String> {
+    w.room(512 + st.be.len() / 2);
+    let mut mask = zz_mask(blk, 1 << s.al) & band(s.ss, s.se);
+    let mut k = s.ss as u32;
+    while mask != 0 {
+        let z = mask.trailing_zeros();
+        emit_eobrun(w, ac, st)?;
+        let mut r = z - k;
+        while r > 15 {
+            w.sym(ac, 0xF0)?;
+            r -= 16;
+        }
+        let v = blk[NATURAL[z as usize]] as i32;
+        let a = v.unsigned_abs() >> s.al;
+        let n = bitlen(a);
+        w.sym_bits(ac, ((r << 4) + n) as usize, (if v < 0 { !a } else { a }) & ((1 << n) - 1), n)?;
+        k = z + 1;
+        mask &= mask - 1;
+    }
+    if k <= s.se as u32 {
+        st.eobrun += 1;
+        end_of_band(w, ac, st, free, false, ch)?;
+    }
+    Ok(())
+}
+
+fn encode_ac_refine(w: &mut Bw, s: &Scan, ac: &Codes, blk: &[i16; 64], st: &mut Prog, free: bool, ch: &mut Choices, br: &mut Vec<u8>) -> Result<(), String> {
+    w.room(512 + st.be.len() / 2);
+    let b = band(s.ss, s.se);
+    let m1 = zz_mask(blk, 1 << s.al) & b;
+    let m2 = zz_mask(blk, 2 << s.al) & b;
+    let newly = m1 & !m2;
+    let eob = if newly != 0 { 63 - newly.leading_zeros() } else { 0 };
+    let mut mask = m1;
+    let mut r = 0u32;
+    let mut next = s.ss as u32;
+    br.clear();
+    while mask != 0 {
+        let z = mask.trailing_zeros();
+        r += z - next;
+        next = z + 1;
+        while r > 15 && z <= eob {
+            emit_eobrun(w, ac, st)?;
+            w.sym(ac, 0xF0)?;
+            r -= 16;
+            for &x in br.iter() {
+                w.put(x as u32, 1);
+            }
+            br.clear();
+        }
+        let v = blk[NATURAL[z as usize]] as i32;
+        if m2 >> z & 1 != 0 {
+            br.push(((v.unsigned_abs() >> s.al) & 1) as u8);
+        } else {
+            emit_eobrun(w, ac, st)?;
+            w.sym_bits(ac, ((r << 4) + 1) as usize, (v >= 0) as u32, 1)?;
+            for &x in br.iter() {
+                w.put(x as u32, 1);
+            }
+            br.clear();
+            r = 0;
+        }
+        mask &= mask - 1;
+    }
+    r += s.se as u32 + 1 - next;
+    if r > 0 || !br.is_empty() {
+        st.eobrun += 1;
+        st.be.extend_from_slice(br);
+        let libjpeg = st.be.len() > 937;
+        end_of_band(w, ac, st, free, libjpeg, ch)?;
+    }
+    Ok(())
+}
+
+/// Regenerates the entropy-coded bytes of one scan and appends them to `out`. `coefs[c]`: the
+/// coefficients of component c (`pw * ph` blocks of 64, natural order).
+pub fn encode_scan(f: &Frame, s: &Scan, coefs: &[&[i16]], ch: &mut Choices, out: &mut Vec<u8>) -> Result<(), String> {
+    let mut w = Bw::new(out);
+    let dcs: Vec<Option<Codes>> = s.dc.iter().map(|h| h.as_ref().map(Codes::new)).collect();
+    let acs: Vec<Option<Codes>> = s.ac.iter().map(|h| h.as_ref().map(Codes::new)).collect();
+    let mut pred = [0i32; 4];
+    let mut st = Prog { eobrun: 0, be: Vec::new() };
+    let mut br = Vec::new();
+    let blk_at = |ci: usize, bx: usize, by: usize| -> &[i16; 64] {
+        let pw = f.comps[ci].pw;
+        coefs[ci][(by * pw + bx) * 64..][..64].try_into().unwrap()
+    };
+    if s.comps.len() > 1 {
+        let mut units: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for (j, &ci) in s.comps.iter().enumerate() {
+            let c = &f.comps[ci];
+            for v in 0..c.v {
+                for h in 0..c.h {
+                    units.push((j, ci, h, v));
+                }
+            }
+        }
+        let count = f.mcux * f.mcuy;
+        let mut rst = 0usize;
+        for m in 0..count {
+            if s.ri > 0 && m > 0 && m % s.ri == 0 {
+                let n = w.pad_len();
+                let p = ch.pad(n);
+                w.flush(p);
+                w.out.push(0xFF);
+                w.out.push(0xD0 + (rst % 8) as u8);
+                rst += 1;
+                pred = [0; 4];
+            }
+            let (mx, my) = (m % f.mcux, m / f.mcux);
+            for &(j, ci, h, v) in &units {
+                let c = &f.comps[ci];
+                let blk = blk_at(ci, mx * c.h + h, my * c.v + v);
+                if !f.progressive {
+                    encode_seq(&mut w, dcs[j].as_ref().unwrap(), acs[j].as_ref().unwrap(), blk, &mut pred[j])?;
+                } else if s.ah == 0 {
+                    w.room(64);
+                    encode_dc(&mut w, dcs[j].as_ref().unwrap(), (blk[0] as i32) >> s.al, &mut pred[j])?;
+                } else {
+                    w.room(64);
+                    w.put(((blk[0] as i32) >> s.al) as u32 & 1, 1);
+                }
+            }
+        }
+    } else {
+        let ci = s.comps[0];
+        let c = &f.comps[ci];
+        let (bw, bh) = (c.bw, c.bh);
+        let count = bw * bh;
+        let ac_scan = f.progressive && s.ss > 0;
+        let mut rst = 0usize;
+        let mut next_pure = ac_scan && count > 0 && pure(blk_at(ci, 0, 0), s);
+        for m in 0..count {
+            if s.ri > 0 && m > 0 && m % s.ri == 0 {
+                if ac_scan {
+                    w.room(512 + st.be.len() / 2);
+                    emit_eobrun(&mut w, acs[0].as_ref().unwrap(), &mut st)?;
+                }
+                let n = w.pad_len();
+                let p = ch.pad(n);
+                w.flush(p);
+                w.out.push(0xFF);
+                w.out.push(0xD0 + (rst % 8) as u8);
+                rst += 1;
+                pred = [0; 4];
+            }
+            let blk = blk_at(ci, m % bw, m / bw);
+            if !f.progressive {
+                encode_seq(&mut w, dcs[0].as_ref().unwrap(), acs[0].as_ref().unwrap(), blk, &mut pred[0])?;
+            } else if !ac_scan {
+                w.room(64);
+                if s.ah == 0 {
+                    encode_dc(&mut w, dcs[0].as_ref().unwrap(), (blk[0] as i32) >> s.al, &mut pred[0])?;
+                } else {
+                    w.put(((blk[0] as i32) >> s.al) as u32 & 1, 1);
+                }
+            } else {
+                let interval_end = if s.ri > 0 { (m / s.ri + 1) * s.ri } else { count }.min(count);
+                let free = if m + 1 < count {
+                    next_pure = pure(blk_at(ci, (m + 1) % bw, (m + 1) / bw), s);
+                    m + 1 < interval_end && next_pure
+                } else {
+                    false
+                };
+                let _ = next_pure;
+                let ac = acs[0].as_ref().unwrap();
+                if s.ah == 0 {
+                    encode_ac_first(&mut w, s, ac, blk, &mut st, free, ch)?;
+                } else {
+                    encode_ac_refine(&mut w, s, ac, blk, &mut st, free, ch, &mut br)?;
+                }
+            }
+        }
+        if ac_scan {
+            w.room(512 + st.be.len() / 2);
+            emit_eobrun(&mut w, acs[0].as_ref().unwrap(), &mut st)?;
+        }
+    }
+    let n = w.pad_len();
+    let p = ch.pad(n);
+    w.flush(p);
+    w.out.extend_from_slice(&ch.side.garbage);
+    Ok(())
+}
