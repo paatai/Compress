@@ -1,4 +1,5 @@
 import data from '@/data/jpeg-benchmark.json'
+import speedData from '@/data/jpeg-speed.json'
 import { cn } from '@/lib/utils'
 
 interface Group {
@@ -20,6 +21,75 @@ interface JpegBenchData {
 }
 
 const bench = data as JpegBenchData
+
+interface SpeedRow {
+  id: string
+  label: string
+  threads: '1t' | 'mt'
+  saved: number
+  enc: number
+  dec: number
+  enc_mib: number
+  dec_mib: number
+  fails: number
+}
+const speed = speedData as { files: number; bytes: number; rows: SpeedRow[] }
+
+/** Size, speed and peak memory of every tool, one thread and all cores. */
+function SpeedTable() {
+  if (!speed.rows.length) return null
+  const groups: [SpeedRow['threads'], string][] = [
+    ['1t', 'One thread'],
+    ['mt', 'All cores (8)'],
+  ]
+  return (
+    <div className="space-y-3">
+      <h3 className="text-lg font-semibold tracking-tight">Size, speed and memory</h3>
+      <p className="max-w-3xl text-sm text-muted-foreground">
+        The same {speed.files} files, every tool run one process at a time on the same machine. Speed is megabytes of JPEG per second for the whole process; memory is
+        the largest peak of any file. Komla's fast mode beats JPEG XL's lossless JPEG transcoding (default settings) on all four at once.
+      </p>
+      <div className="overflow-x-auto rounded-xl border">
+        <table className="w-full min-w-[44rem] text-sm">
+          <thead className="bg-muted/50 text-left">
+            <tr>
+              <th className="px-3 py-3 font-medium">Tool</th>
+              <th className="px-3 py-3 text-right font-medium">Smaller</th>
+              <th className="px-3 py-3 text-right font-medium">Compress</th>
+              <th className="px-3 py-3 text-right font-medium">Decompress</th>
+              <th className="px-3 py-3 text-right font-medium">Memory, compress</th>
+              <th className="px-3 py-3 text-right font-medium">Memory, decompress</th>
+            </tr>
+          </thead>
+          {groups.map(([th, title]) => (
+            <tbody key={th}>
+              <tr className="border-t bg-muted/30">
+                <td colSpan={6} className="px-3 py-2 text-xs font-medium text-muted-foreground">
+                  {title}
+                </td>
+              </tr>
+              {speed.rows
+                .filter((r) => r.threads === th)
+                .map((r) => (
+                  <tr key={r.id + th} className={cn('border-t', r.id === 'komla-fast' && 'bg-emerald-500/5 font-semibold')}>
+                    <td className="px-3 py-2.5 whitespace-nowrap">{r.label}</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums">{r.saved.toFixed(1)}%</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums">{r.enc.toFixed(r.enc < 1 ? 2 : 1)} MB/s</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums">{r.dec.toFixed(r.dec < 1 ? 2 : 1)} MB/s</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums">{Math.round(r.enc_mib)} MiB</td>
+                    <td className="px-3 py-2.5 text-right tabular-nums">{Math.round(r.dec_mib)} MiB</td>
+                  </tr>
+                ))}
+            </tbody>
+          ))}
+        </table>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        JPEG XL: cjxl --lossless_jpeg=1 at its default effort, djxl; brunsli and packJPG have no threads. Commands and per-group sizes: bench/results/JPEG_SPEED_REPORT.md.
+      </p>
+    </div>
+  )
+}
 
 export function JpegBenchmark() {
   if (!bench.codecs.length) return null
@@ -86,9 +156,11 @@ export function JpegBenchmark() {
         </table>
       </div>
       <p className="text-xs text-muted-foreground">
-        Points of savings; the last row is the difference to the best other tool in each column. Tools: libjxl 0.13 (cjxl --lossless_jpeg=1 -e 9), brunsli, Dropbox
-        Lepton and its Rust port, packJPG 2.5n, paq8px v217 (-8). Full tables, speeds and commands: bench/results/JPEG_REPORT.md.
+        Points of savings, Komla's maximum compression mode; the last row is the difference to the best other tool in each column. Tools: libjxl 0.13 (cjxl
+        --lossless_jpeg=1 -e 9), brunsli, Dropbox Lepton and its Rust port, packJPG 2.5n, paq8px v217 (-8). Full tables, speeds and commands:
+        bench/results/JPEG_REPORT.md.
       </p>
+      <SpeedTable />
     </section>
   )
 }

@@ -1,0 +1,160 @@
+{
+ "files": 80,
+ "bytes": 89262753,
+ "rows": [
+  {
+   "id": "komla-fast",
+   "label": "Komla fast",
+   "threads": "1t",
+   "saved": 18.78,
+   "enc": 12.36,
+   "dec": 17.41,
+   "enc_mib": 92.01,
+   "dec_mib": 21.32,
+   "fails": 0
+  },
+  {
+   "id": "komla-fast",
+   "label": "Komla fast",
+   "threads": "mt",
+   "saved": 18.78,
+   "enc": 22.19,
+   "dec": 34.43,
+   "enc_mib": 207.01,
+   "dec_mib": 48.26,
+   "fails": 0
+  },
+  {
+   "id": "komla",
+   "label": "Komla (maximum)",
+   "threads": "1t",
+   "saved": 24.11,
+   "enc": 0.34,
+   "dec": 0.34,
+   "enc_mib": 188.64,
+   "dec_mib": 206.57,
+   "fails": 0
+  },
+  {
+   "id": "komla",
+   "label": "Komla (maximum)",
+   "threads": "mt",
+   "saved": 24.11,
+   "enc": 0.59,
+   "dec": 0.58,
+   "enc_mib": 498.56,
+   "dec_mib": 388.8,
+   "fails": 0
+  },
+  {
+   "id": "jxl",
+   "label": "JPEG XL",
+   "threads": "1t",
+   "saved": 15.85,
+   "enc": 9.22,
+   "dec": 16.67,
+   "enc_mib": 456.95,
+   "dec_mib": 90.91,
+   "fails": 0
+  },
+  {
+   "id": "jxl",
+   "label": "JPEG XL",
+   "threads": "mt",
+   "saved": 15.85,
+   "enc": 13.77,
+   "dec": 28.06,
+   "enc_mib": 457.35,
+   "dec_mib": 95.92,
+   "fails": 0
+  },
+  {
+   "id": "lepton",
+   "label": "Lepton (Dropbox)",
+   "threads": "1t",
+   "saved": 14.57,
+   "enc": 3.61,
+   "dec": 8.04,
+   "enc_mib": 82.68,
+   "dec_mib": 11.19,
+   "fails": 19
+  },
+  {
+   "id": "lepton",
+   "label": "Lepton (Dropbox)",
+   "threads": "mt",
+   "saved": 19.0,
+   "enc": 8.08,
+   "dec": 22.29,
+   "enc_mib": 97.03,
+   "dec_mib": 89.44,
+   "fails": 0
+  },
+  {
+   "id": "lepton-rust",
+   "label": "Lepton (Rust port)",
+   "threads": "1t",
+   "saved": 19.49,
+   "enc": 11.16,
+   "dec": 10.41,
+   "enc_mib": 85.32,
+   "dec_mib": 115.0,
+   "fails": 1
+  },
+  {
+   "id": "lepton-rust",
+   "label": "Lepton (Rust port)",
+   "threads": "mt",
+   "saved": 18.93,
+   "enc": 25.17,
+   "dec": 30.56,
+   "enc_mib": 93.99,
+   "dec_mib": 116.12,
+   "fails": 1
+  },
+  {
+   "id": "brunsli",
+   "label": "brunsli",
+   "threads": "1t",
+   "saved": 18.67,
+   "enc": 9.97,
+   "dec": 12.04,
+   "enc_mib": 262.24,
+   "dec_mib": 86.48,
+   "fails": 0
+  },
+  {
+   "id": "brunsli",
+   "label": "brunsli",
+   "threads": "mt",
+   "saved": 18.67,
+   "enc": 9.97,
+   "dec": 12.04,
+   "enc_mib": 262.24,
+   "dec_mib": 86.48,
+   "fails": 0
+  },
+  {
+   "id": "packjpg",
+   "label": "packJPG",
+   "threads": "1t",
+   "saved": 19.33,
+   "enc": 3.58,
+   "dec": 3.36,
+   "enc_mib": 82.8,
+   "dec_mib": 81.85,
+   "fails": 0
+  },
+  {
+   "id": "packjpg",
+   "label": "packJPG",
+   "threads": "mt",
+   "saved": 19.33,
+   "enc": 3.58,
+   "dec": 3.36,
+   "enc_mib": 82.8,
+   "dec_mib": 81.85,
+   "fails": 0
+  }
+ ]
+}

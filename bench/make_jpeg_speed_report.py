@@ -118,7 +118,15 @@ def main():
             cells.append(f"{100 * (1 - o / i):.2f}%")
         name = f"**{label}**" if cid == "komla-fast" else label
         out.append(f"| {name} | " + " | ".join(cells) + f" | {fmt(table[(cid, '1t')]['saved'])}% |")
-    out += ["", "## Tools", "", "| Tool | Version and command |", "|---|---|"] + [f"| {a} | {b} |" for a, b in TOOLS] + [""]
+    out += [
+        "",
+        "Notes: Dropbox Lepton's single-threaded mode (`-singlethread`) fails its own round-trip check on many progressive files, which therefore count at their original size in its one-thread row; its default (multi-threaded) mode restores them. The Rust port of Lepton rejects one file (a progressive JPEG with two DC first scans). Komla's maximum mode is the default `komla compress`; its stripes are large, so it gains little from threads.",
+        "",
+        "## Tools",
+        "",
+        "| Tool | Version and command |",
+        "|---|---|",
+    ] + [f"| {a} | {b} |" for a, b in TOOLS] + [""]
     rpath = os.path.join(HERE, "results", "JPEG_SPEED_REPORT.md" if args.set == "test" else f"JPEG_SPEED_REPORT_{args.set}.md")
     with open(rpath, "w") as f:
         f.write("\n".join(out))
