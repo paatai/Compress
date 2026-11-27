@@ -13,7 +13,7 @@ ROOT = os.path.dirname(HERE)
 CODECS = [
     ("jxl", "JPEG XL", "libjxl 0.13.0: cjxl --lossless_jpeg=1 -e 9 (decoded with djxl)"),
     ("brunsli", "brunsli", "google/brunsli c18b962: cbrunsli / dbrunsli"),
-    ("lepton", "Lepton (Dropbox)", "dropbox/lepton f34c7f4: lepton -singlethread -allowprogressive"),
+    ("lepton", "Lepton (Dropbox)", "dropbox/lepton f34c7f4: lepton -singlethread -allowprogressive (default threading where single-threaded mode fails)"),
     ("lepton-rust", "Lepton (Rust port)", "microsoft/lepton_jpeg_rust 0.5.9: lepton_jpeg_util --threads 1"),
     ("packjpg", "packJPG", "packJPG 2.5n"),
     ("paq8px", "paq8px", "paq8px v217: paq8px -8"),

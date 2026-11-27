@@ -33,8 +33,11 @@ def t(name):
 # the input as in.jpg; {out} is the compressed file, the decoder must write dec.jpg.
 CODECS = {
     "komla": ([KOMLA, "compress", "in.jpg", "-o", "{out}"], "out.komla", [KOMLA, "decompress", "{out}", "-o", "dec.jpg"]),
-    "lepton": ([t("lepton"), "-unjailed", "-singlethread", "-allowprogressive", "-memory=4096M", "-threadmemory=2048M", "in.jpg", "{out}"], "out.lep",
-               [t("lepton"), "-unjailed", "-singlethread", "-memory=4096M", "-threadmemory=2048M", "{out}", "dec.jpg"]),
+    # single-threaded Lepton fails its own round-trip check on some progressive files; those are
+    # retried in Lepton's default (multi-threaded) mode
+    "lepton": (["sh", "-c", f"{t('lepton')} -unjailed -singlethread -allowprogressive -memory=4096M -threadmemory=2048M in.jpg {{out}} >/dev/null 2>&1"
+                f" || {t('lepton')} -unjailed -allowprogressive -memory=4096M -threadmemory=2048M in.jpg {{out}}"], "out.lep",
+               [t("lepton"), "-unjailed", "-memory=4096M", "-threadmemory=2048M", "{out}", "dec.jpg"]),
     "lepton-rust": ([t("lepton-rust"), "--threads", "1", "--quiet", "--noverify", "in.jpg", "{out}"], "out.lep", [t("lepton-rust"), "--threads", "1", "--quiet", "{out}", "dec.jpg"]),
     "jxl": ([t("cjxl"), "--lossless_jpeg=1", "-e", "9", "--num_threads=0", "--quiet", "in.jpg", "{out}"], "out.jxl", [t("djxl"), "--num_threads=0", "--quiet", "{out}", "dec.jpg"]),
     "packjpg": ([t("packJPG"), "-np", "-o", "in.jpg"], "in.pjg", ["sh", "-c", f"mv in.jpg orig.jpg && {t('packJPG')} -np -o in.pjg && mv in.jpg dec.jpg && mv orig.jpg in.jpg"]),
