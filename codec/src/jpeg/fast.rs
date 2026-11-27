@@ -385,15 +385,21 @@ pub trait Io {
     fn bit(&mut self, p: &mut Bit, b: u32) -> u32;
     /// `n` raw bits (1 to 24), most significant first.
     fn raw(&mut self, v: u32, n: u32) -> u32;
+    /// Called before the symbols of each block (or byte): chunks of the rANS stream end only
+    /// between blocks.
+    fn block(&mut self);
 }
 
-/// Symbols per rANS chunk: the encoder holds at most one chunk of symbols, and the decoder
-/// starts from new states (stored at the head of each chunk) every CHUNK symbols.
-const CHUNK: u32 = 1 << 18;
+/// Symbols after which the encoder ends a rANS chunk at the next block: it holds at most one
+/// chunk of symbols, and the decoder starts from new states (stored at the head of each chunk,
+/// after the chunk's number of blocks).
+const CHUNK: usize = 1 << 18;
 
 pub struct Enc<L: Lanes = Base> {
     lanes: std::marker::PhantomData<L>,
     ops: Vec<u32>,
+    /// blocks in the current chunk
+    blocks: u32,
     out: Vec<u8>,
     raw: Vec<u8>,
     racc: u64,
@@ -408,10 +414,10 @@ impl<L: Lanes> Default for Enc<L> {
 
 impl<L: Lanes> Enc<L> {
     pub fn new() -> Self {
-        Enc { lanes: std::marker::PhantomData, ops: Vec::with_capacity(CHUNK as usize), out: Vec::new(), raw: Vec::new(), racc: 0, rbits: 0 }
+        Enc { lanes: std::marker::PhantomData, ops: Vec::with_capacity(CHUNK + 4096), blocks: 0, out: Vec::new(), raw: Vec::new(), racc: 0, rbits: 0 }
     }
-    /// Codes the buffered symbols in reverse as one chunk: its two final states, then the
-    /// renormalization words in the order the decoder reads them.
+    /// Codes the buffered symbols in reverse as one chunk: its number of blocks and two final
+    /// states, then the renormalization words in the order the decoder reads them.
     fn flush_chunk(&mut self) {
         let mut x = [RANS_L; 2];
         let mut words: Vec<u16> = Vec::with_capacity(self.ops.len() / 2 + 8);
@@ -425,7 +431,7 @@ impl<L: Lanes> Enc<L> {
             }
             *st = ((*st / freq) << PROB_BITS) + (*st % freq) + start;
         }
-        for &s in &[x[1], x[0]] {
+        for &s in &[x[1], x[0], self.blocks] {
             words.push(s as u16);
             words.push((s >> 16) as u16);
         }
@@ -434,13 +440,11 @@ impl<L: Lanes> Enc<L> {
             self.out.extend_from_slice(&w.to_be_bytes());
         }
         self.ops.clear();
+        self.blocks = 0;
     }
     #[inline(always)]
     fn push(&mut self, op: u32) {
         self.ops.push(op);
-        if self.ops.len() == CHUNK as usize {
-            self.flush_chunk();
-        }
     }
     /// Returns (rANS-coded bytes, raw bits).
     pub fn finish(mut self) -> (Vec<u8>, Vec<u8>) {
@@ -487,13 +491,20 @@ impl<L: Lanes> Io for Enc<L> {
         }
         v
     }
+    #[inline(always)]
+    fn block(&mut self) {
+        if self.ops.len() >= CHUNK {
+            self.flush_chunk();
+        }
+        self.blocks += 1;
+    }
 }
 
 pub struct Dec<'a, L: Lanes = Base> {
     lanes: std::marker::PhantomData<L>,
     x0: u32,
     x1: u32,
-    /// symbols left in the current chunk
+    /// blocks left in the current chunk
     left: u32,
     data: &'a [u8],
     pos: usize,
@@ -511,18 +522,30 @@ impl<'a, L: Lanes> Dec<'a, L> {
     }
     #[cold]
     fn next_chunk(&mut self) {
+        self.left = (self.word() << 16) | self.word();
         self.x0 = (self.word() << 16) | self.word();
         self.x1 = (self.word() << 16) | self.word();
-        self.left = CHUNK;
+    }
+    #[inline(always)]
+    fn peek(&self) -> u32 {
+        match self.data.get(self.pos..self.pos + 2) {
+            Some(s) => u16::from_be_bytes([s[0], s[1]]) as u32,
+            None => 0,
+        }
     }
     #[inline(always)]
     fn word(&mut self) -> u32 {
-        let w = match self.data.get(self.pos..self.pos + 2) {
-            Some(s) => u16::from_be_bytes([s[0], s[1]]),
-            None => 0,
-        };
+        let w = self.peek();
         self.pos += 2;
-        w as u32
+        w
+    }
+    /// Renormalizes a state without a branch: below RANS_L it takes the next word.
+    #[inline(always)]
+    fn renorm(&mut self, x: u32) -> u32 {
+        let r = (x < RANS_L) as u32;
+        let w = self.peek() & 0u32.wrapping_sub(r);
+        self.pos += 2 * r as usize;
+        (x << (r << 4)) | w
     }
     /// True if the decoder read well past the end of either stream, which valid data never does.
     pub fn overrun(&self) -> bool {
@@ -534,18 +557,11 @@ impl<L: Lanes> Io for Dec<'_, L> {
     const DEC: bool = true;
     #[inline(always)]
     fn sym(&mut self, c: &mut Cdf, cnt: &mut u8, n: usize, _s: usize) -> usize {
-        if self.left == 0 {
-            self.next_chunk();
-        }
-        self.left -= 1;
         let x = self.x0;
         let slot = x & (PROB_ONE - 1);
         let s = c.find::<L>(slot);
         let (start, freq) = c.interval(s);
-        let mut x = freq * (x >> PROB_BITS) + slot - start;
-        if x < RANS_L {
-            x = (x << 16) | self.word();
-        }
+        let x = self.renorm(freq * (x >> PROB_BITS) + slot - start);
         self.x0 = self.x1;
         self.x1 = x;
         c.update::<L>(cnt, s, n);
@@ -553,19 +569,12 @@ impl<L: Lanes> Io for Dec<'_, L> {
     }
     #[inline(always)]
     fn bit(&mut self, p: &mut Bit, _b: u32) -> u32 {
-        if self.left == 0 {
-            self.next_chunk();
-        }
-        self.left -= 1;
         let x = self.x0;
         let slot = x & (PROB_ONE - 1);
         let q = *p as u32;
         let b = (slot >= q) as u32;
         let (start, freq) = if b != 0 { (q, PROB_ONE - q) } else { (0, q) };
-        let mut x = freq * (x >> PROB_BITS) + slot - start;
-        if x < RANS_L {
-            x = (x << 16) | self.word();
-        }
+        let x = self.renorm(freq * (x >> PROB_BITS) + slot - start);
         self.x0 = self.x1;
         self.x1 = x;
         *p = adapt_bit(*p, b);
@@ -593,6 +602,13 @@ impl<L: Lanes> Io for Dec<'_, L> {
         self.racc <<= n;
         self.rbits -= n;
         v
+    }
+    #[inline(always)]
+    fn block(&mut self) {
+        if self.left == 0 {
+            self.next_chunk();
+        }
+        self.left = self.left.wrapping_sub(1);
     }
 }
 
@@ -711,27 +727,20 @@ const EQ: [u8; 256] = {
     t
 };
 const NEQ: usize = 14;
-/// Zone of an interior position (index into INTERIOR) for magnitudes, times NEQ.
+/// Zone of an interior position (index into INTERIOR) for magnitudes: its anti-diagonal, times
+/// NEQ.
 const IZE: [u16; 49] = {
     let mut t = [0u16; 49];
-    let mut z = [255u8; 39];
-    let mut n = 0;
     let mut i = 0;
     while i < 49 {
         let p = INTERIOR[i] as usize;
-        let (r, c) = (p / 8, p % 8);
-        let k = (r + c - 2) * 3 + if r < c { 0 } else if r == c { 1 } else { 2 };
-        if z[k] == 255 {
-            z[k] = n;
-            n += 1;
-        }
-        t[i] = z[k] as u16 * NEQ as u16;
+        t[i] = ((p / 8 + p % 8 - 2) * NEQ) as u16;
         i += 1;
     }
     t
 };
 
-const NKZ: usize = 29;
+const NKZ: usize = 13;
 
 
 /// Positions with both frequencies nonzero, in zigzag order.
@@ -1191,6 +1200,7 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], rows: &[usize],
                     let al = if bx > 0 { above.map(|ab| <&[i16; 64]>::try_from(&ab[(bx - 1) * 64..bx * 64]).unwrap()) } else { None };
                     let ar = if bx + 1 < w.min(e.ac_w.max(e.dc_w)) { above.map(|ab| <&[i16; 64]>::try_from(&ab[(bx + 1) * 64..bx * 64 + 128]).unwrap()) } else { None };
                     let luma = hints.get(bx).copied().unwrap_or(0) as usize;
+                    io.block();
                     let info = m.block(io, cls, &qs[c], &rqs[c], blk, a, l, (al, ar), luma, cd, ca);
                     now[bx] = info;
                 }
@@ -1319,6 +1329,7 @@ pub fn encode_bytes(data: &[u8]) -> Vec<u8> {
     let mut t = Bits::new(256 * 256);
     let mut prev = 0usize;
     for &b in data {
+        e.block();
         let mut node = 1usize;
         for i in (0..8).rev() {
             let bit = ((b >> i) & 1) as u32;
@@ -1349,6 +1360,7 @@ pub fn decode_bytes(c: &[u8], n: usize) -> Result<Vec<u8>, String> {
             let mut out = Vec::with_capacity(n);
             let mut prev = 0usize;
             for i in 0..n {
+                d.block();
                 let mut node = 1usize;
                 for _ in 0..8 {
                     node = node * 2 + t.bit(&mut d, prev * 256 + node, 0) as usize;
