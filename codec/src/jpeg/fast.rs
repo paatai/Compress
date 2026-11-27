@@ -389,7 +389,7 @@ pub trait Io {
 
 /// Symbols per rANS chunk: the encoder holds at most one chunk of symbols, and the decoder
 /// starts from new states (stored at the head of each chunk) every CHUNK symbols.
-const CHUNK: u32 = 1 << 16;
+const CHUNK: u32 = 1 << 18;
 
 pub struct Enc<L: Lanes = Base> {
     lanes: std::marker::PhantomData<L>,

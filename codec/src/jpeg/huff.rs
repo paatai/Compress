@@ -229,36 +229,72 @@ impl Bw<'_> {
     }
 }
 
-/// Source of the encoder's free choices: while compressing it replays the recorded `ScanSide`
-/// and writes down the `Side` that reproduces it; while decompressing it reads the `Side`.
-pub struct Choices<'a> {
-    rec: Option<&'a ScanSide>,
+/// Source of the encoder's free choices: while compressing it replays the choices found in the
+/// original scan (fed stretch by stretch as the scan is decoded) and writes down the `Side` that
+/// reproduces them; while decompressing it reads the `Side`.
+pub struct Choices {
+    rec: Option<Rec>,
     pub side: Side,
     pad_i: usize,
     eob_i: u32,
     flip_i: usize,
 }
 
-impl<'a> Choices<'a> {
-    pub fn record(rec: &'a ScanSide) -> Self {
-        let side = Side { pads: if rec.pads_not_ones { rec.pads.clone() } else { Vec::new() }, garbage: rec.garbage.clone(), eob_flips: Vec::new() };
-        Choices { rec: Some(rec), side, pad_i: 0, eob_i: 0, flip_i: 0 }
+/// The choices of the original scan fed so far (end-of-band entries before `eob_base` are used).
+#[derive(Default)]
+struct Rec {
+    pads: Vec<u8>,
+    not_ones: bool,
+    eob_end: Vec<bool>,
+    eob_base: u32,
+}
+
+impl Choices {
+    pub fn record() -> Self {
+        Choices { rec: Some(Rec::default()), side: Side::default(), pad_i: 0, eob_i: 0, flip_i: 0 }
     }
     pub fn replay(side: Side) -> Self {
         Choices { rec: None, side, pad_i: 0, eob_i: 0, flip_i: 0 }
     }
+    /// Recording: adds the choices of the next stretch of the original scan, taken from `s`.
+    pub fn feed(&mut self, s: &mut ScanSide) {
+        if let Some(r) = &mut self.rec {
+            r.pads.append(&mut s.pads);
+            r.not_ones |= s.pads_not_ones;
+            let used = (self.eob_i.saturating_sub(r.eob_base) as usize).min(r.eob_end.len());
+            r.eob_end.drain(..used);
+            r.eob_base += used as u32;
+            r.eob_end.append(&mut s.eob_end);
+            if !s.garbage.is_empty() {
+                self.side.garbage = std::mem::take(&mut s.garbage);
+            }
+        }
+    }
+    /// Recording: the side info that reproduces the scan.
+    pub fn into_side(mut self) -> Side {
+        if let Some(r) = self.rec.take() {
+            if r.not_ones {
+                self.side.pads = r.pads;
+            }
+        }
+        self.side
+    }
     fn pad(&mut self, n: u32) -> u32 {
         let ones = (1u32 << n) - 1;
-        let v = if self.side.pads.is_empty() { ones } else { self.side.pads.get(self.pad_i).copied().unwrap_or(0xFF) as u32 & ones };
+        let v = match &self.rec {
+            Some(r) => r.pads.get(self.pad_i).copied().unwrap_or(0xFF) as u32 & ones,
+            None if self.side.pads.is_empty() => ones,
+            None => self.side.pads.get(self.pad_i).copied().unwrap_or(0xFF) as u32 & ones,
+        };
         self.pad_i += 1;
         v
     }
     /// At an end-of-band event where the run may continue: does it end here?
     fn eob_end(&mut self, libjpeg: bool) -> bool {
         let i = self.eob_i;
-        match self.rec {
+        match &self.rec {
             Some(r) => {
-                let v = r.eob_end.get(i as usize).copied().unwrap_or(true);
+                let v = i.checked_sub(r.eob_base).and_then(|k| r.eob_end.get(k as usize)).copied().unwrap_or(true);
                 if v != libjpeg {
                     self.side.eob_flips.push(i);
                 }
@@ -432,7 +468,7 @@ fn encode_ac_refine(w: &mut Bw, s: &Scan, ac: &Codes, blk: &[i16; 64], st: &mut 
 }
 
 /// Incremental encoder of a sequential (baseline or extended) scan, fed MCU rows in order.
-pub struct SeqScan<'a, 'c> {
+pub struct SeqScan<'a> {
     w: Bw<'a>,
     dcs: Vec<Codes>,
     acs: Vec<Codes>,
@@ -442,11 +478,11 @@ pub struct SeqScan<'a, 'c> {
     rst: usize,
     /// MCUs encoded so far
     m: usize,
-    ch: &'a mut Choices<'c>,
+    ch: &'a mut Choices,
 }
 
-impl<'a, 'c> SeqScan<'a, 'c> {
-    pub fn new(s: &Scan, f: &Frame, ch: &'a mut Choices<'c>, out: &'a mut Vec<u8>) -> Result<Self, String> {
+impl<'a> SeqScan<'a> {
+    pub fn new(s: &Scan, f: &Frame, ch: &'a mut Choices, out: &'a mut Vec<u8>) -> Result<Self, String> {
         let codes = |v: &[Option<Huff>]| -> Result<Vec<Codes>, String> { v.iter().map(|h| h.as_ref().map(Codes::new).ok_or_else(|| "missing Huffman table".to_string())).collect() };
         let mut units = Vec::new();
         if s.comps.len() > 1 {
@@ -525,6 +561,10 @@ impl<'a, 'c> SeqScan<'a, 'c> {
         self.w.out
     }
 
+    pub fn choices(&mut self) -> &mut Choices {
+        self.ch
+    }
+
     /// Final padding and the bytes after it.
     pub fn finish(mut self) {
         let n = self.w.pad_len();
@@ -537,7 +577,7 @@ impl<'a, 'c> SeqScan<'a, 'c> {
 /// Incremental encoder of a progressive scan, fed the coefficients of consecutive MCU rows.
 /// It writes into its own buffer (`finish` returns it), so all scans of a file can be fed
 /// stripe by stripe.
-pub struct ProgScan<'a, 'c> {
+pub struct ProgScan<'a> {
     out: Vec<u8>,
     c: u64,
     n: u32,
@@ -554,11 +594,11 @@ pub struct ProgScan<'a, 'c> {
     /// AC scan: the last block fed so far, waiting for the next one (its successor decides
     /// whether an end-of-band run may continue)
     pending: Option<Box<[i16; 64]>>,
-    ch: &'a mut Choices<'c>,
+    ch: &'a mut Choices,
 }
 
-impl<'a, 'c> ProgScan<'a, 'c> {
-    pub fn new(s: &Scan, f: &Frame, ch: &'a mut Choices<'c>, out: Vec<u8>) -> Self {
+impl<'a> ProgScan<'a> {
+    pub fn new(s: &Scan, f: &Frame, ch: &'a mut Choices, out: Vec<u8>) -> Self {
         let mut units = Vec::new();
         if s.comps.len() > 1 {
             for (j, &ci) in s.comps.iter().enumerate() {
@@ -717,6 +757,10 @@ impl<'a, 'c> ProgScan<'a, 'c> {
     /// move them out and clear the vector.
     pub fn bytes(&mut self) -> &mut Vec<u8> {
         &mut self.out
+    }
+
+    pub fn choices(&mut self) -> &mut Choices {
+        self.ch
     }
 
     /// Ends the scan and returns its bytes.

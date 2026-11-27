@@ -569,37 +569,6 @@ pub fn threads() -> usize {
     }
 }
 
-/// Runs `f` on every item with up to `threads` threads; results in item order.
-fn par_map<T: Send, R: Send>(items: Vec<T>, threads: usize, f: impl Fn(usize, T) -> R + Sync) -> Vec<R> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let n = items.len();
-        if threads > 1 && n > 1 {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            use std::sync::Mutex;
-            let slots: Vec<Mutex<Option<T>>> = items.into_iter().map(|t| Mutex::new(Some(t))).collect();
-            let out: Vec<Mutex<Option<R>>> = (0..n).map(|_| Mutex::new(None)).collect();
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(n) {
-                    s.spawn(|| loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= n {
-                            break;
-                        }
-                        let t = slots[i].lock().unwrap().take().unwrap();
-                        let r = f(i, t);
-                        *out[i].lock().unwrap() = Some(r);
-                    });
-                }
-            });
-            return out.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
-        }
-    }
-    let _ = threads;
-    items.into_iter().enumerate().map(|(i, t)| f(i, t)).collect()
-}
-
 /// MCU rows of each fast-mode stripe.
 pub fn fast_stripes(f: &Frame) -> Vec<(usize, usize)> {
     let per_row: usize = f.comps.iter().map(|c| c.pw * c.v).sum();
@@ -720,60 +689,142 @@ pub fn compress_fast(data: &[u8], threads: usize) -> (Vec<u8>, JpegInfo) {
     }
 }
 
+/// A stripe on its way through compression: its coefficients and the choices its scans made.
+struct Stripe {
+    k: usize,
+    bufs: Vec<Vec<i16>>,
+    sides: Vec<format::ScanSide>,
+}
+
+/// Regenerates every scan from the stripes `next` yields (in order) and checks that the bytes
+/// match the input, recording the side info that reproduces them; hands each checked stripe to
+/// `pass`. Returns the side info of all scans.
+fn verify_scans(l: &Layout, data: &[u8], rows: &[(usize, usize)], next: &mut dyn FnMut() -> Result<Option<Stripe>, String>, pass: &mut dyn FnMut(Stripe) -> Result<(), String>) -> Result<Vec<u8>, String> {
+    let f = &l.frame;
+    let n = l.scans.len();
+    let mismatch = || "scan data cannot be reproduced exactly from its coefficients".to_string();
+    let mut chs: Vec<huff::Choices> = (0..n).map(|_| huff::Choices::record()).collect();
+    let mut outs: Vec<Vec<u8>> = (0..n).map(|_| Vec::new()).collect();
+    let mut done = vec![0usize; n];
+    let check = |i: usize, b: &[u8], done: &mut [usize]| -> Result<(), String> {
+        let s = &l.scans[i];
+        if data[s.seg.0..s.seg.1].get(done[i]..done[i] + b.len()) != Some(b) {
+            return Err(mismatch());
+        }
+        done[i] += b.len();
+        Ok(())
+    };
+    {
+        let mut encs: Vec<ScanEnc> = Vec::with_capacity(n);
+        for ((s, ch), out) in l.scans.iter().zip(chs.iter_mut()).zip(outs.iter_mut()) {
+            encs.push(if f.progressive { ScanEnc::Prog(huff::ProgScan::new(s, f, ch, Vec::new())) } else { ScanEnc::Seq(huff::SeqScan::new(s, f, ch, out)?) });
+        }
+        while let Some(mut st) = next()? {
+            let (my0, my1) = rows[st.k];
+            for (i, (e, s)) in encs.iter_mut().zip(&l.scans).enumerate() {
+                e.choices().feed(&mut st.sides[i]);
+                let bufs = &st.bufs;
+                e.rows(f, s, my0, my1, |ci, bx, by| {
+                    let c = &f.comps[ci];
+                    bufs[ci][((by - my0 * c.v) * c.pw + bx) * 64..][..64].try_into().unwrap()
+                })?;
+                let b = e.bytes();
+                check(i, b, &mut done)?;
+                b.clear();
+            }
+            pass(st)?;
+        }
+        for (i, (e, s)) in encs.into_iter().zip(&l.scans).enumerate() {
+            match e {
+                ScanEnc::Prog(e) => {
+                    let rest = e.finish(s)?;
+                    check(i, &rest, &mut done)?;
+                }
+                ScanEnc::Seq(e) => e.finish(),
+            }
+        }
+    }
+    let mut side = Vec::new();
+    for (i, (ch, s)) in chs.into_iter().zip(&l.scans).enumerate() {
+        check(i, &outs[i], &mut done)?;
+        if done[i] != s.seg.1 - s.seg.0 {
+            return Err(mismatch());
+        }
+        put_side(&mut side, &ch.into_side(), s.seg.1 - s.seg.0);
+    }
+    Ok(side)
+}
+
 fn analyze_fast(data: &[u8], threads: usize) -> Result<(Vec<u8>, JpegInfo), String> {
     if data.len() > u32::MAX as usize {
         return Err("file too large".into());
     }
     let l = format::parse(data, true)?;
-    let (mut coefs, sides) = format::decode_scans(&l, data)?;
     let f = &l.frame;
-    // regenerate every scan from the coefficients, recording the side info that reproduces it
-    let side = {
-        let planes: Vec<&[i16]> = coefs.iter().map(|p| &p[..]).collect();
-        let jobs: Vec<usize> = (0..l.scans.len()).collect();
-        let res = par_map(jobs, threads, |_, i| -> Result<huff::Side, String> {
-            let s = &l.scans[i];
-            let mut ch = huff::Choices::record(&sides[i]);
-            let mut out = Vec::with_capacity(s.seg.1 - s.seg.0 + 64);
-            huff::encode_scan(f, s, &planes, &mut ch, &mut out)?;
-            if out[..] != data[s.seg.0..s.seg.1] {
-                return Err("scan data cannot be reproduced exactly from its coefficients".into());
-            }
-            Ok(ch.side)
-        });
-        let mut side = Vec::new();
-        for (r, s) in res.into_iter().zip(&l.scans) {
-            put_side(&mut side, &r?, s.seg.1 - s.seg.0);
-        }
-        side
-    };
     let rows = fast_stripes(f);
     let geom = StripeGeom::new(&l);
-    let streams = {
-        let parts = split_rows(f, &rows, &mut coefs);
-        par_map(parts, threads, |k, mut p| geom.encode(rows[k], &mut p))
-    };
-    drop(coefs);
     let trailer = &data[l.end..];
-    let mut h = Vec::with_capacity(4096 + streams.iter().map(|s| s.0.len() + s.1.len()).sum::<usize>());
+    // the header bytes and the trailer (which may be another JPEG)
+    let extras = || {
+        let blob = fast::encode_bytes(&l.blob);
+        let t = match is_jpeg(trailer).then(|| compress_fast(trailer, threads)) {
+            Some((nested, info)) if info.mode == MODE_FAST && nested.len() < trailer.len() => (TRAILER_FAST, nested),
+            _ => (TRAILER_CM, fast::encode_bytes(trailer)),
+        };
+        (blob, t)
+    };
+    let mut decs: Vec<format::ScanDec> = l.scans.iter().map(|s| format::ScanDec::new(f, s, &data[s.seg.0..s.seg.1])).collect();
+    // the coefficients of stripe k, from every scan
+    let mut decode = |k: usize| -> Result<Stripe, String> {
+        let (my0, my1) = rows[k];
+        let mut bufs: Vec<Vec<i16>> = f.comps.iter().map(|c| vec![0i16; (my1 - my0) * c.v * c.pw * 64]).collect();
+        let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
+        for (d, s) in decs.iter_mut().zip(&l.scans) {
+            d.rows(f, s, my0, my1, my0, &mut planes)?;
+            if my1 == f.mcuy {
+                d.finish()?;
+            }
+        }
+        let sides = decs.iter_mut().map(|d| std::mem::take(&mut d.side)).collect();
+        Ok(Stripe { k, bufs, sides })
+    };
+    let encode = |st: &mut Stripe| {
+        let mut planes: Vec<&mut [i16]> = st.bufs.iter_mut().map(|b| &mut b[..]).collect();
+        geom.encode(rows[st.k], &mut planes)
+    };
+    let mut streams: Vec<Option<(Vec<u8>, Vec<u8>)>> = (0..rows.len()).map(|_| None).collect();
+    let (side, (blob, (kind, tc))) = if threads > 1 {
+        stream_mt(&l, data, &rows, threads, &mut decode, &encode, &extras, &mut streams)?
+    } else {
+        let mut k = 0;
+        let mut next = || -> Result<Option<Stripe>, String> {
+            if k == rows.len() {
+                return Ok(None);
+            }
+            k += 1;
+            decode(k - 1).map(Some)
+        };
+        let side = verify_scans(&l, data, &rows, &mut next, &mut |mut st| {
+            streams[st.k] = Some(encode(&mut st));
+            Ok(())
+        })?;
+        (side, extras())
+    };
+    let streams: Vec<(Vec<u8>, Vec<u8>)> = streams.into_iter().collect::<Option<_>>().ok_or("worker thread failed")?;
+    let mut h = Vec::with_capacity(4096 + blob.len() + tc.len() + side.len() + streams.iter().map(|s| s.0.len() + s.1.len()).sum::<usize>());
     h.extend_from_slice(crate::MAGIC);
     h.push(KIND);
     h.push(VERSION);
     h.push(MODE_FAST);
     put_varint(&mut h, data.len() as u64);
     h.extend_from_slice(&crate::crc32(data).to_le_bytes());
-    let c = fast::encode_bytes(&l.blob);
     put_varint(&mut h, l.blob.len() as u64);
-    put_varint(&mut h, c.len() as u64);
-    h.extend_from_slice(&c);
+    put_varint(&mut h, blob.len() as u64);
+    h.extend_from_slice(&blob);
     put_varint(&mut h, trailer.len() as u64);
-    let (kind, c) = match is_jpeg(trailer).then(|| compress_fast(trailer, threads)) {
-        Some((nested, info)) if info.mode == MODE_FAST && nested.len() < trailer.len() => (TRAILER_FAST, nested),
-        _ => (TRAILER_CM, fast::encode_bytes(trailer)),
-    };
     h.push(kind);
-    put_varint(&mut h, c.len() as u64);
-    h.extend_from_slice(&c);
+    put_varint(&mut h, tc.len() as u64);
+    h.extend_from_slice(&tc);
     put_varint(&mut h, side.len() as u64);
     h.extend_from_slice(&side);
     put_varint(&mut h, streams.len() as u64);
@@ -781,9 +832,9 @@ fn analyze_fast(data: &[u8], threads: usize) -> Result<(Vec<u8>, JpegInfo), Stri
         put_varint(&mut h, r.len() as u64);
         put_varint(&mut h, w.len() as u64);
     }
-    for (r, w) in &streams {
-        h.extend_from_slice(r);
-        h.extend_from_slice(w);
+    for (r, w) in streams {
+        h.extend_from_slice(&r);
+        h.extend_from_slice(&w);
     }
     let info = JpegInfo {
         width: f.width as u32,
@@ -796,6 +847,111 @@ fn analyze_fast(data: &[u8], threads: usize) -> Result<(Vec<u8>, JpegInfo), Stri
         note: String::new(),
     };
     Ok((h, info))
+}
+
+type Extras = (Vec<u8>, (u8, Vec<u8>));
+
+/// The threaded compression pipeline: this thread decodes stripe after stripe, another checks
+/// them in order, the others code them; at most `threads + 2` stripes are held at a time.
+#[allow(clippy::too_many_arguments)]
+fn stream_mt(
+    l: &Layout,
+    data: &[u8],
+    rows: &[(usize, usize)],
+    threads: usize,
+    decode: &mut (dyn FnMut(usize) -> Result<Stripe, String> + Send),
+    encode: &(dyn Fn(&mut Stripe) -> (Vec<u8>, Vec<u8>) + Sync),
+    extras: &(dyn Fn() -> Extras + Sync),
+    streams: &mut [Option<(Vec<u8>, Vec<u8>)>],
+) -> Result<(Vec<u8>, Extras), String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Condvar, Mutex};
+        let window = threads + 2;
+        let live = (Mutex::new(0usize), Condvar::new());
+        let stop = AtomicBool::new(false);
+        let out: Vec<Mutex<Option<(Vec<u8>, Vec<u8>)>>> = (0..rows.len()).map(|_| Mutex::new(None)).collect();
+        let (to_ver, from_dec) = mpsc::sync_channel::<Stripe>(2);
+        let (to_work, from_ver) = mpsc::channel::<Stripe>();
+        let from_ver = Mutex::new(from_ver);
+        let res = std::thread::scope(|sc| -> Result<(Vec<u8>, Extras), String> {
+            let ex = sc.spawn(extras);
+            let (live, stop, out, from_ver) = (&live, &stop, &out, &from_ver);
+            let ver = sc.spawn(move || {
+                let mut next = || Ok(from_dec.recv().ok());
+                let r = verify_scans(l, data, rows, &mut next, &mut |st| to_work.send(st).map_err(|_| "worker thread failed".to_string()));
+                if r.is_err() {
+                    stop.store(true, Ordering::Relaxed);
+                    live.1.notify_all();
+                }
+                r
+            });
+            for _ in 0..threads.saturating_sub(1).max(1) {
+                sc.spawn(move || loop {
+                    let st = from_ver.lock().unwrap().recv();
+                    let Ok(mut st) = st else { break };
+                    if !stop.load(Ordering::Relaxed) {
+                        let r = encode(&mut st);
+                        *out[st.k].lock().unwrap() = Some(r);
+                    }
+                    drop(st);
+                    *live.0.lock().unwrap() -= 1;
+                    live.1.notify_all();
+                });
+            }
+            let mut res = Ok(());
+            for k in 0..rows.len() {
+                let mut g = live.0.lock().unwrap();
+                while *g >= window && !stop.load(Ordering::Relaxed) {
+                    g = live.1.wait(g).unwrap();
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                *g += 1;
+                drop(g);
+                match decode(k) {
+                    Ok(st) => {
+                        if to_ver.send(st).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        res = Err(e);
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+            drop(to_ver);
+            let side = ver.join().map_err(|_| "worker thread failed".to_string())?;
+            let ex = ex.join().map_err(|_| "worker thread failed".to_string())?;
+            res?;
+            Ok((side?, ex))
+        });
+        for (s, o) in streams.iter_mut().zip(out) {
+            *s = o.into_inner().unwrap();
+        }
+        res
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = threads;
+        let mut k = 0;
+        let mut next = || -> Result<Option<Stripe>, String> {
+            if k == rows.len() {
+                return Ok(None);
+            }
+            k += 1;
+            decode(k - 1).map(Some)
+        };
+        let side = verify_scans(l, data, rows, &mut next, &mut |mut st| {
+            streams[st.k] = Some(encode(&mut st));
+            Ok(())
+        })?;
+        Ok((side, extras()))
+    }
 }
 
 /// Runs `produce` on 0..n with up to `threads` threads (at most `window` items ahead of the
@@ -1061,12 +1217,12 @@ impl Part {
     }
 }
 
-enum ScanEnc<'a, 'c> {
-    Seq(huff::SeqScan<'a, 'c>),
-    Prog(huff::ProgScan<'a, 'c>),
+enum ScanEnc<'a> {
+    Seq(huff::SeqScan<'a>),
+    Prog(huff::ProgScan<'a>),
 }
 
-impl ScanEnc<'_, '_> {
+impl ScanEnc<'_> {
     fn rows<'b>(&mut self, f: &Frame, s: &format::Scan, my0: usize, my1: usize, blk: impl Fn(usize, usize, usize) -> &'b [i16; 64]) -> Result<(), String> {
         match self {
             ScanEnc::Seq(e) => e.rows(f, s, my0, my1, blk),
@@ -1077,6 +1233,12 @@ impl ScanEnc<'_, '_> {
         match self {
             ScanEnc::Seq(e) => e.bytes(),
             ScanEnc::Prog(e) => e.bytes(),
+        }
+    }
+    fn choices(&mut self) -> &mut huff::Choices {
+        match self {
+            ScanEnc::Seq(e) => e.choices(),
+            ScanEnc::Prog(e) => e.choices(),
         }
     }
 }

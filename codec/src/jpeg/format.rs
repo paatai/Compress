@@ -549,69 +549,112 @@ pub fn decode_scans(l: &Layout, data: &[u8]) -> Result<(Vec<Vec<i16>>, Vec<ScanS
     let mut coefs: Vec<Vec<i16>> = f.comps.iter().map(|c| vec![0i16; c.pw * c.ph * 64]).collect();
     let mut sides = Vec::with_capacity(l.scans.len());
     for s in &l.scans {
-        sides.push(decode_scan(f, s, &data[s.seg.0..s.seg.1], &mut coefs)?);
+        let mut d = ScanDec::new(f, s, &data[s.seg.0..s.seg.1]);
+        let mut planes: Vec<&mut [i16]> = coefs.iter_mut().map(|p| &mut p[..]).collect();
+        d.rows(f, s, 0, f.mcuy, 0, &mut planes)?;
+        d.finish()?;
+        sides.push(d.side);
     }
     Ok((coefs, sides))
 }
 
-fn decode_scan(f: &Frame, s: &Scan, seg: &[u8], coefs: &mut [Vec<i16>]) -> Result<ScanSide, String> {
-    let map = McuMap::new(f, s);
-    let mut r = BitReader::new(seg);
-    let mut side = ScanSide::default();
-    let mut pred = [0i32; 4];
-    let mut eobrun = 0u32;
-    let mut rst = 0usize;
-    let pw: Vec<usize> = s.comps.iter().map(|&ci| f.comps[ci].pw).collect();
-    for m in 0..map.count {
-        if s.ri > 0 && m > 0 && m % s.ri == 0 {
-            if eobrun > 0 {
-                return Err("end-of-band run crosses a restart marker".into());
-            }
-            let (pad, ones) = r.align()?;
-            side.pads.push(pad);
-            side.pads_not_ones |= !ones;
-            if r.seg.get(r.pos) != Some(&0xFF) || r.seg.get(r.pos + 1) != Some(&(0xD0 + (rst % 8) as u8)) {
-                return Err("missing or unexpected restart marker".into());
-            }
-            r.pos += 2;
-            rst += 1;
-            pred = [0; 4];
+/// Incremental decoder of one scan, fed frame MCU rows in order, so all scans of a file can be
+/// decoded stripe by stripe.
+pub struct ScanDec<'a> {
+    r: BitReader<'a>,
+    map: McuMap,
+    pred: [i32; 4],
+    eobrun: u32,
+    rst: usize,
+    /// MCUs (interleaved scan) or blocks decoded so far
+    m: usize,
+    /// the choices found so far (the caller may take them between calls)
+    pub side: ScanSide,
+}
+
+impl<'a> ScanDec<'a> {
+    pub fn new(f: &Frame, s: &Scan, seg: &'a [u8]) -> Self {
+        ScanDec { r: BitReader::new(seg), map: McuMap::new(f, s), pred: [0; 4], eobrun: 0, rst: 0, m: 0, side: ScanSide::default() }
+    }
+
+    /// Decodes what the scan codes in frame MCU rows `my0..my1` into `planes`: the blocks of
+    /// every component from MCU row `top` on, `pw` blocks per row.
+    pub fn rows(&mut self, f: &Frame, s: &Scan, my0: usize, my1: usize, top: usize, planes: &mut [&mut [i16]]) -> Result<(), String> {
+        let ScanDec { r, map, pred, eobrun, rst, m: done, side } = self;
+        let (m0, m1) = if map.interleaved {
+            (my0 * f.mcux, my1 * f.mcux)
+        } else {
+            let c = &f.comps[s.comps[0]];
+            ((my0 * c.v).min(c.bh) * c.bw, (my1 * c.v).min(c.bh) * c.bw)
+        };
+        if m0 != *done {
+            return Err("scan rows out of order".into());
         }
-        let mut err: Result<(), String> = Ok(());
-        map.blocks(f, s, m, |j, bx, by| {
-            if err.is_err() {
-                return;
-            }
-            let ci = s.comps[j];
-            let off = (by * pw[j] + bx) * 64;
-            let blk = &mut coefs[ci][off..off + 64];
-            err = if !f.progressive {
-                decode_seq(&mut r, s, j, blk, &mut pred[j])
-            } else if s.ss == 0 {
-                if s.ah == 0 {
-                    decode_dc_first(&mut r, s, j, blk, &mut pred[j])
-                } else {
-                    if r.bits(1) != 0 {
-                        blk[0] |= 1 << s.al;
-                    }
-                    Ok(())
+        let mut pw = [0usize; 4];
+        let mut first = [0usize; 4];
+        for (j, &ci) in s.comps.iter().enumerate() {
+            pw[j] = f.comps[ci].pw;
+            first[j] = top * f.comps[ci].v;
+        }
+        for m in m0..m1 {
+            if s.ri > 0 && m > 0 && m % s.ri == 0 {
+                if *eobrun > 0 {
+                    return Err("end-of-band run crosses a restart marker".into());
                 }
-            } else if s.ah == 0 {
-                decode_ac_first(&mut r, s, blk, &mut eobrun, &mut side.eob_end)
-            } else {
-                decode_ac_refine(&mut r, s, blk, &mut eobrun, &mut side.eob_end)
-            };
-        });
-        err?;
+                let (pad, ones) = r.align()?;
+                side.pads.push(pad);
+                side.pads_not_ones |= !ones;
+                if r.seg.get(r.pos) != Some(&0xFF) || r.seg.get(r.pos + 1) != Some(&(0xD0 + (*rst % 8) as u8)) {
+                    return Err("missing or unexpected restart marker".into());
+                }
+                r.pos += 2;
+                *rst += 1;
+                *pred = [0; 4];
+            }
+            let mut err: Result<(), String> = Ok(());
+            map.blocks(f, s, m, |j, bx, by| {
+                if err.is_err() {
+                    return;
+                }
+                let off = ((by - first[j]) * pw[j] + bx) * 64;
+                let blk = &mut planes[s.comps[j]][off..off + 64];
+                err = if !f.progressive {
+                    decode_seq(r, s, j, blk, &mut pred[j])
+                } else if s.ss == 0 {
+                    if s.ah == 0 {
+                        decode_dc_first(r, s, j, blk, &mut pred[j])
+                    } else {
+                        if r.bits(1) != 0 {
+                            blk[0] |= 1 << s.al;
+                        }
+                        Ok(())
+                    }
+                } else if s.ah == 0 {
+                    decode_ac_first(r, s, blk, eobrun, &mut side.eob_end)
+                } else {
+                    decode_ac_refine(r, s, blk, eobrun, &mut side.eob_end)
+                };
+            });
+            err?;
+        }
+        *done = m1;
+        Ok(())
     }
-    if eobrun > 0 {
-        return Err("end-of-band run past the end of the scan".into());
+
+    /// Ends the scan after its last rows: the final padding and the bytes after it.
+    pub fn finish(&mut self) -> Result<(), String> {
+        if self.m != self.map.count {
+            return Err("scan rows missing".into());
+        }
+        if self.eobrun > 0 {
+            return Err("end-of-band run past the end of the scan".into());
+        }
+        let (pad, ones) = self.r.align()?;
+        self.side.pads.push(pad);
+        self.side.pads_not_ones |= !ones;
+        self.side.garbage = self.r.seg[self.r.pos..].to_vec();
+        Ok(())
     }
-    let (pad, ones) = r.align()?;
-    side.pads.push(pad);
-    side.pads_not_ones |= !ones;
-    side.garbage = seg[r.pos..].to_vec();
-    Ok(side)
 }
 
 fn decode_seq(r: &mut BitReader, s: &Scan, j: usize, blk: &mut [i16], pred: &mut i32) -> Result<(), String> {
