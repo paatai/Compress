@@ -764,6 +764,28 @@ const IZ8: [u8; 49] = {
     }
     t
 };
+/// Bucket of the magnitude of the interior coefficient next to an edge coefficient.
+const AQ: [u8; 16] = [0, 1, 2, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5];
+const NAQ: usize = 6;
+/// Bucket of the co-located luma blocks' mean 7x7 count, for chroma blocks.
+const LUMAQ: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = match i {
+            0 => 0,
+            1..=3 => 1,
+            4..=10 => 2,
+            _ => 3,
+        };
+        i += 1;
+    }
+    t
+};
+const NLUMA: usize = 4;
+/// Bucket of the summed magnitudes of an edge coefficient in the neighbouring blocks.
+const BEQ: [u8; 16] = [0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3];
+const NBE: usize = 4;
 /// Zone of an edge position 1..7.
 const EZ: [u8; 8] = [0, 0, 1, 2, 2, 3, 3, 3];
 /// Bucket of a 7x7 nonzero count for the edge contexts.
@@ -790,6 +812,49 @@ const NZQ8: [u8; 64] = {
 /// the contribution of frequency u to the first and last sample of an 8-point inverse DCT.
 const COS0: [i64; 8] = [2896, 4017, 3784, 3406, 2896, 2276, 1567, 799];
 const COS7: [i64; 8] = [2896, -4017, 3784, -3406, 2896, -2276, 1567, -799];
+const COS1: [i64; 8] = [2896, 3406, 1567, -799, -2896, -4017, -3784, -2276];
+const COS6: [i64; 8] = [2896, -3406, 1567, 799, -2896, 4017, -3784, 2276];
+/// Edge prediction weights: each side's profile extrapolated to the boundary, (1 - g) times
+/// the last sample plus g times the linear extrapolation from the last two (g = EDGE_G / 4).
+const EDGE_G: i64 = 4;
+/// The same for DC (g = DC_G / 4).
+const DC_G: i64 = 4;
+const DC_FAR: [i64; 8] = {
+    let mut t = [0i64; 8];
+    let mut j = 0;
+    while j < 8 {
+        t[j] = COS7[j] + DC_G * (COS7[j] - COS6[j]) / 8;
+        j += 1;
+    }
+    t
+};
+const DC_NEAR: [i64; 8] = {
+    let mut t = [0i64; 8];
+    let mut j = 0;
+    while j < 8 {
+        t[j] = COS0[j] + DC_G * (COS0[j] - COS1[j]) / 8;
+        j += 1;
+    }
+    t
+};
+const EDGE_FAR: [i64; 8] = {
+    let mut t = [0i64; 8];
+    let mut j = 0;
+    while j < 8 {
+        t[j] = COS7[j] + EDGE_G * (COS7[j] - COS6[j]) / 8;
+        j += 1;
+    }
+    t
+};
+const EDGE_NEAR: [i64; 8] = {
+    let mut t = [0i64; 8];
+    let mut j = 0;
+    while j < 8 {
+        t[j] = COS0[j] + EDGE_G * (COS0[j] - COS1[j]) / 8;
+        j += 1;
+    }
+    t
+};
 
 /// What a block's right and lower neighbours use: its nonzero counts.
 #[derive(Clone, Copy, Default)]
@@ -850,13 +915,13 @@ impl Model {
         let geo: Vec<u32> = (0..NTOK as u32).map(|t| 1 << (14 - t)).collect();
         let flat8 = Cdf::new(8, &[8; 8]);
         let mut m = Model {
-            nz_hi: Table::new(2 * NNZB, 7, Cdf::new(7, &[8; 7])),
-            nz_lo: Table::new(2 * NNZB * 7, 8, flat8),
+            nz_hi: Table::new(2 * NNZB * NLUMA, 7, Cdf::new(7, &[8; 7])),
+            nz_lo: Table::new(2 * NNZB * NLUMA * 7, 8, flat8),
             zero: Bits::new(2 * NREM * 49 * NEQ),
             mag: Table::new(2 * NREMQ * NKZ * NEQ, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
             nze: Table::new(2 * 2 * 8 * 8, 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
-            ezero: Bits::new(2 * 2 * 7 * 4 * 8),
-            emag: Table::new(2 * 2 * 4 * 8, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
+            ezero: Bits::new(2 * 2 * 7 * 4 * 8 * NAQ * NBE),
+            emag: Table::new(2 * 2 * 4 * 8 * NAQ * NBE, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
             esign: Bits::new(2 * 2 * 8 * 2),
             esc: Table::new(4, 8, flat8),
             dc: Table::new(2 * 8 * 4, NTOK, Cdf::new(NTOK, &geo)),
@@ -912,7 +977,7 @@ impl Model {
     /// continuing the block to the left) of a block.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    fn edge<I: Io>(&mut self, io: &mut I, cls: usize, dir: usize, blk: &mut [i16; 64], nbr: Option<&[i16; 64]>, q: &[i64; 64], rq: &[i64; 64], nzq: usize, pnz: usize) -> u8 {
+    fn edge<I: Io>(&mut self, io: &mut I, cls: usize, dir: usize, blk: &mut [i16; 64], nbr: Option<&[i16; 64]>, near: (&[i16; 64], &[i16; 64]), q: &[i64; 64], rq: &[i64; 64], nzq: usize, pnz: usize) -> u8 {
         let step = if dir == 0 { 1 } else { 8 };
         let across = if dir == 0 { 8 } else { 1 };
         let actual = if I::DEC { 0 } else { (1..8).filter(|&i| blk[i * step] != 0).count() };
@@ -925,10 +990,10 @@ impl Model {
             // profile at its far side
             let p = match nbr {
                 Some(nb) => {
-                    let mut acc = nb[pos] as i64 * q[pos] * COS7[0];
+                    let mut acc = nb[pos] as i64 * q[pos] * EDGE_FAR[0];
                     for j in 1..8 {
                         let o = pos + j * across;
-                        acc += (nb[o] as i64 * COS7[j] - blk[o] as i64 * COS0[j]) * q[o];
+                        acc += (nb[o] as i64 * EDGE_FAR[j] - blk[o] as i64 * EDGE_NEAR[j]) * q[o];
                     }
                     div_round(acc, rq[pos])
                 }
@@ -936,9 +1001,13 @@ impl Model {
             };
             let pb = pbucket(p);
             let v = blk[pos] as i32;
-            let zctx = (((cls * 2 + dir) * 7 + i - 1) * 4 + rem.min(4) - 1) * 8 + pb;
+            // the interior coefficient next to it (same frequency along the edge)
+            let adj = AQ[((blk[pos + across] as i32).unsigned_abs()).min(15) as usize] as usize;
+            // the same coefficient in the blocks above and to the left
+            let nm = BEQ[((near.0[pos] as i32).unsigned_abs() + (near.1[pos] as i32).unsigned_abs()).min(15) as usize] as usize;
+            let zctx = (((((cls * 2 + dir) * 7 + i - 1) * 4 + rem.min(4) - 1) * 8 + pb) * NAQ + adj) * NBE + nm;
             if self.ezero.bit(io, zctx, (v != 0) as u32) != 0 {
-                let t = 1 + self.emag.sym(io, ((cls * 2 + dir) * 4 + EZ[i] as usize) * 8 + pb, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
+                let t = 1 + self.emag.sym(io, ((((cls * 2 + dir) * 4 + EZ[i] as usize) * 8 + pb) * NAQ + adj) * NBE + nm, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
                 let sign = if p != 0 { Some((((cls * 2 + dir) * 8 + pb) * 2 + (p < 0) as usize, p < 0)) } else { None };
                 let x = self.rest(io, t, v, cls * 2, sign);
                 if I::DEC {
@@ -955,7 +1024,7 @@ impl Model {
     /// outside the stripe); `q`: the component's quantization table. Returns the block's `Info`.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    pub fn block<I: Io>(&mut self, io: &mut I, cls: usize, q: &[i64; 64], rq: &[i64; 64], blk: &mut [i16; 64], a: Option<(&[i16; 64], &Info)>, l: Option<(&[i16; 64], &Info)>, diag: (Option<&[i16; 64]>, Option<&[i16; 64]>), code_dc: bool, code_ac: bool) -> Info {
+    pub fn block<I: Io>(&mut self, io: &mut I, cls: usize, q: &[i64; 64], rq: &[i64; 64], blk: &mut [i16; 64], a: Option<(&[i16; 64], &Info)>, l: Option<(&[i16; 64], &Info)>, diag: (Option<&[i16; 64]>, Option<&[i16; 64]>), luma: usize, code_dc: bool, code_ac: bool) -> Info {
         let (na, nl) = match (a, l) {
             (Some(a), Some(l)) => (a.0, l.0),
             (Some(a), None) => (a.0, a.0),
@@ -975,7 +1044,7 @@ impl Model {
         let mut info = Info::default();
         if code_ac {
             let actual = if I::DEC { 0 } else { INTERIOR.iter().filter(|&&p| blk[p as usize] != 0).count() };
-            let ctx = cls * NNZB + NZB[avg(|i| i.nz77) & 63] as usize;
+            let ctx = (cls * NNZB + NZB[avg(|i| i.nz77) & 63] as usize) * NLUMA + luma;
             cat(0);
             let hi = self.nz_hi.sym(io, ctx, 7, actual >> 3);
             let lo = self.nz_lo.sym(io, ctx * 7 + hi, 8, actual & 7);
@@ -1012,17 +1081,17 @@ impl Model {
             }
             let nzq = NZQ8[nz77 & 63] as usize;
             cat(6);
-            info.nzr = self.edge(io, cls, 0, blk, a.map(|x| x.0), q, rq, nzq, avg(|i| i.nzr));
-            info.nzc = self.edge(io, cls, 1, blk, l.map(|x| x.0), q, rq, nzq, avg(|i| i.nzc));
+            info.nzr = self.edge(io, cls, 0, blk, a.map(|x| x.0), (na, nl), q, rq, nzq, avg(|i| i.nzr));
+            info.nzc = self.edge(io, cls, 1, blk, l.map(|x| x.0), (na, nl), q, rq, nzq, avg(|i| i.nzc));
         }
         if code_dc {
             // the mean of the edge column (row) continues the neighbour's last column (row)
             let from_left = l.map(|(lb, _)| {
-                let acc: i64 = lb[0] as i64 * q[0] * COS7[0] + (1..8).map(|u| (lb[u] as i64 * COS7[u] - blk[u] as i64 * COS0[u]) * q[u]).sum::<i64>();
+                let acc: i64 = lb[0] as i64 * q[0] * DC_FAR[0] + (1..8).map(|u| (lb[u] as i64 * DC_FAR[u] - blk[u] as i64 * DC_NEAR[u]) * q[u]).sum::<i64>();
                 div_round(acc, rq[0])
             });
             let from_above = a.map(|(ab, _)| {
-                let acc: i64 = ab[0] as i64 * q[0] * COS7[0] + (1..8).map(|v| (ab[v * 8] as i64 * COS7[v] - blk[v * 8] as i64 * COS0[v]) * q[v * 8]).sum::<i64>();
+                let acc: i64 = ab[0] as i64 * q[0] * DC_FAR[0] + (1..8).map(|v| (ab[v * 8] as i64 * DC_FAR[v] - blk[v * 8] as i64 * DC_NEAR[v]) * q[v * 8]).sum::<i64>();
                 div_round(acc, rq[0])
             });
             let (pred, ub) = match (from_left, from_above) {
@@ -1087,6 +1156,25 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize]
                 }
                 let (before, cur) = planes[c].split_at_mut(by * w * 64);
                 let above: Option<&[i16]> = if by > 0 { Some(&before[(by - 1) * w * 64..]) } else { None };
+                // chroma: mean 7x7 count of the luma blocks at the same place (coded before)
+                let mut hints = Vec::new();
+                if c > 0 && v[0] % v[c] == 0 && width[0] % w == 0 {
+                    let (fx, fy) = (width[0] / w, v[0] / v[c]);
+                    let (luma, _) = infos.split_at(1);
+                    let w0 = width[0];
+                    hints = (0..w)
+                        .map(|bx| {
+                            let mut sum = 0usize;
+                            for dy in 0..fy {
+                                let ly = by * fy + dy;
+                                for dx in 0..fx {
+                                    sum += luma[0][(ly & 1) * w0 + bx * fx + dx].nz77 as usize;
+                                }
+                            }
+                            LUMAQ[(sum / (fx * fy)).min(63)]
+                        })
+                        .collect();
+                }
                 let (i0, i1) = infos[c].split_at_mut(w);
                 let (prev, now) = if by & 1 == 0 { (&*i1, i0) } else { (&*i0, i1) };
                 for bx in 0..w {
@@ -1102,7 +1190,8 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], width: &[usize]
                     let a = above.map(|ab| (<&[i16; 64]>::try_from(&ab[bx * 64..bx * 64 + 64]).unwrap(), &prev[bx]));
                     let al = if bx > 0 { above.map(|ab| <&[i16; 64]>::try_from(&ab[(bx - 1) * 64..bx * 64]).unwrap()) } else { None };
                     let ar = if bx + 1 < w.min(e.ac_w.max(e.dc_w)) { above.map(|ab| <&[i16; 64]>::try_from(&ab[(bx + 1) * 64..bx * 64 + 128]).unwrap()) } else { None };
-                    let info = m.block(io, cls, &qs[c], &rqs[c], blk, a, l, (al, ar), cd, ca);
+                    let luma = hints.get(bx).copied().unwrap_or(0) as usize;
+                    let info = m.block(io, cls, &qs[c], &rqs[c], blk, a, l, (al, ar), luma, cd, ca);
                     now[bx] = info;
                 }
             }
