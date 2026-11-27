@@ -1179,6 +1179,35 @@ pub fn fast_experiment(data: &[u8]) -> Result<(usize, usize, f64, f64, f64), Str
     Ok((arith.len(), raw.len(), t_huff, t_enc, t_dec))
 }
 
+/// Describes a .komla JPEG container of either mode without decoding the image; also returns
+/// the original length and CRC-32.
+pub fn summary(b: &[u8]) -> Result<(JpegInfo, usize, u32), String> {
+    match b.get(6) {
+        Some(&MODE_FAST) | Some(&MODE_BYTES) if is_container(b) && b[5] == VERSION => {
+            let mut pos = 7;
+            let len = usize::try_from(get_varint(b, &mut pos)?).map_err(|_| "corrupt .komla file")?;
+            let crc = u32::from_le_bytes(take(b, &mut pos, 4)?.try_into().unwrap());
+            let mut i = JpegInfo { mode: b[6], ..Default::default() };
+            if b[6] == MODE_FAST {
+                let c = parse_fast(b, len, crc, pos)?;
+                let l = format::parse(&c.blob, false)?;
+                let f = &l.frame;
+                i.width = f.width as u32;
+                i.height = f.height as u32;
+                i.components = f.comps.len() as u8;
+                i.progressive = f.progressive;
+                i.sampling = sampling(f);
+                i.stripes = c.stripes.len() as u32;
+            }
+            Ok((i, len, crc))
+        }
+        _ => {
+            let c = parse_container(b)?;
+            Ok((info(b)?, c.len, c.crc))
+        }
+    }
+}
+
 /// Describes a .komla JPEG container without decoding it.
 pub fn info(b: &[u8]) -> Result<JpegInfo, String> {
     let c = parse_container(b)?;

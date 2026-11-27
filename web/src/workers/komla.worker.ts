@@ -203,6 +203,16 @@ async function handle(req: WorkerRequest): Promise<{ result: unknown; transfer: 
       const j = call(k, 'komla_jpeg_finish', [req.file, req.coefs])
       return { result: j, transfer: [j.buffer] }
     }
+    case 'jpegCompressFast': {
+      const r = call(k, 'komla_jpeg_compress_fast', [new Uint8Array(req.file)])
+      const [info, start] = readJpegInfo(r, 0)
+      const komla = r.slice(start)
+      return { result: { info, komla }, transfer: [komla.buffer] }
+    }
+    case 'jpegDecompress': {
+      const j = call(k, 'komla_jpeg_decompress', [req.file])
+      return { result: j, transfer: [j.buffer] }
+    }
     case 'readImage': {
       const r = call(k, 'komla_read_image', [new Uint8Array(req.file)])
       const v = new DataView(r.buffer)

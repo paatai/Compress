@@ -17,7 +17,8 @@ export interface JpegInfo {
   height: number
   components: number
   progressive: boolean
-  /** 0 stored as is, 1 stored with the byte model, 2 recompressed */
+  /** 0 stored as is, 1 stored with the byte model, 2 recompressed, 3 recompressed in the fast
+   * mode, 4 stored with the fast byte model */
   mode: number
   stripes: number
   /** chroma subsampling, e.g. "4:2:0" or "gray" */
@@ -27,6 +28,8 @@ export interface JpegInfo {
 }
 
 export const JPEG_MODE_RECOMPRESSED = 2
+export const JPEG_MODE_FAST = 3
+export const JPEG_MODE_FAST_STORED = 4
 
 export type WorkerRequest =
   | { op: 'prepare'; file: ArrayBuffer }
@@ -40,6 +43,8 @@ export type WorkerRequest =
   | { op: 'jpegParse'; file: Uint8Array }
   | { op: 'jpegDecodeStripe'; blob: Uint8Array; data: Uint8Array; k: number }
   | { op: 'jpegFinish'; file: Uint8Array; coefs: Uint8Array }
+  | { op: 'jpegCompressFast'; file: ArrayBuffer }
+  | { op: 'jpegDecompress'; file: Uint8Array }
 
 export interface JpegPrepared {
   info: JpegInfo

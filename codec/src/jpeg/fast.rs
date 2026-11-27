@@ -271,6 +271,7 @@ mod avx2 {
 }
 
 /// Lanes at or after `j` take `hi`, the others `lo`.
+#[cfg_attr(not(any(target_arch = "x86_64", all(target_arch = "wasm32", target_feature = "simd128"))), allow(dead_code))]
 static GE_MASK: [[u16; 16]; 16] = {
     let mut t = [[0u16; 16]; 16];
     let mut s = 0;

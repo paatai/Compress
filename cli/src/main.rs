@@ -8,10 +8,10 @@ const USAGE: &str = "\
 Komla - lossless image compression by context mixing
 
 USAGE:
-  komla compress   <input.png|input.bmp|input.jpg> [-o output.komla]
+  komla compress   [--fast] <input.png|input.bmp|input.jpg> [-o output.komla]
   komla decompress <input.komla> [-o output.png|output.bmp|output.jpg]
   komla info       <input.komla>
-  komla bench      [-j threads] [--no-verify] <images...>
+  komla bench      [-j threads] [--no-verify] [--fast] <images...>
   komla pixhash    <images...>   (SHA-256 of pixels normalised to RGBA)
 
 compress writes <input>.komla by default; decompress restores the original
@@ -20,7 +20,9 @@ the embedded CRC-32 of the pixels and fails loudly on any mismatch.
 
 JPEG files are recompressed losslessly: decompress gives back the original file
 byte for byte (checked with a CRC-32 of the whole file). JPEGs that cannot be
-reproduced exactly from their coefficients are stored as they are.";
+reproduced exactly from their coefficients are stored as they are. --fast uses
+the fast JPEG mode: about 50 times faster than the default mode, which saves
+the most, and runs on all cores (KOMLA_THREADS=n limits the threads).";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -287,17 +289,17 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
     let (input, _) = split_out(args)?;
     let bytes = read(&input)?;
     if jpeg::is_container(&bytes) {
-        let c = jpeg::parse_container(&bytes)?;
-        let info = jpeg::info(&bytes)?;
+        let (info, len, crc) = jpeg::summary(&bytes)?;
         println!(
-            "{}: Komla JPEG v{}, {}, original {} bytes, crc32 {:08x}, {} bytes ({:.2}% smaller)",
+            "{}: Komla JPEG v{}{}, {}, original {} bytes, crc32 {:08x}, {} bytes ({:.2}% smaller)",
             input.display(),
             jpeg::VERSION,
+            if info.mode == jpeg::MODE_FAST || info.mode == jpeg::MODE_BYTES { " (fast mode)" } else { "" },
             jpeg_mode(&info),
-            c.len,
-            c.crc,
+            len,
+            crc,
             bytes.len(),
-            100.0 * (1.0 - bytes.len() as f64 / c.len.max(1) as f64)
+            100.0 * (1.0 - bytes.len() as f64 / len.max(1) as f64)
         );
         return Ok(());
     }
@@ -380,7 +382,7 @@ struct JpegRow {
 }
 
 /// Compresses, decompresses and compares JPEG files byte for byte (SHA-256).
-fn bench_jpeg(files: &[PathBuf], threads: usize, verify: bool) -> Result<(), String> {
+fn bench_jpeg(files: &[PathBuf], threads: usize, verify: bool, fast: bool) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let next = AtomicUsize::new(0);
     let rows: Mutex<Vec<Option<JpegRow>>> = Mutex::new((0..files.len()).map(|_| None).collect());
@@ -398,11 +400,11 @@ fn bench_jpeg(files: &[PathBuf], threads: usize, verify: bool) -> Result<(), Str
                         return Err("not a JPEG file".into());
                     }
                     let t0 = Instant::now();
-                    let (c, info) = jpeg::compress(&bytes, &mut |_| {});
+                    let (c, info) = if fast { jpeg::compress_fast(&bytes, 1) } else { jpeg::compress(&bytes, &mut |_| {}) };
                     let enc_s = t0.elapsed().as_secs_f64();
                     let (dec_s, ok) = if verify {
                         let t1 = Instant::now();
-                        let d = jpeg::decompress(&c, &mut |_| {});
+                        let d = jpeg::decompress_with(&c, 1);
                         let dec_s = t1.elapsed().as_secs_f64();
                         (dec_s, Some(d.is_ok_and(|d| Sha256::digest(&d) == Sha256::digest(&bytes))))
                     } else {
@@ -475,6 +477,7 @@ struct BenchRow {
 fn cmd_bench(args: &[String]) -> Result<(), String> {
     let mut threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let mut verify = true;
+    let mut fast = false;
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -484,6 +487,7 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
                 i += 1;
             }
             "--no-verify" => verify = false,
+            "--fast" => fast = true,
             f => files.push(PathBuf::from(f)),
         }
         i += 1;
@@ -493,7 +497,7 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
     }
     let (jpegs, files): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().partition(|f| read(f).is_ok_and(|b| jpeg::is_jpeg(&b)));
     if !jpegs.is_empty() {
-        bench_jpeg(&jpegs, threads, verify)?;
+        bench_jpeg(&jpegs, threads, verify, fast)?;
         if files.is_empty() {
             return Ok(());
         }

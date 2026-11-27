@@ -1,7 +1,7 @@
 // End-to-end check of lossless JPEG recompression against a running dev/preview server:
 // compress each JPEG, download the .komla file, restore it, download the JPG and compare it
 // with the original byte for byte.
-// usage: node e2e/jpeg.mjs <url> <outdir> <images.jpg...>
+// usage: [JPEG_MODE=max] node e2e/jpeg.mjs <url> <outdir> <images.jpg...>  (default: fast mode)
 import { chromium } from 'playwright-core'
 import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync } from 'node:fs'
@@ -18,6 +18,7 @@ page.on('console', (m) => {
   if (m.type() === 'error') errors.push(m.text())
 })
 await page.goto(url)
+if (process.env.JPEG_MODE === 'max') await page.getByRole('tab', { name: 'Maximum compression' }).click()
 let failures = 0
 for (const [i, image] of images.entries()) {
   const t0 = Date.now()

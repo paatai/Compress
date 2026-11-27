@@ -1,4 +1,4 @@
-import { JPEG_MODE_RECOMPRESSED, type ImageInfo, type JpegInfo, type JpegParsed, type JpegPrepared, type ParsedFile, type Prepared, type WorkerRequest } from './protocol'
+import { JPEG_MODE_FAST, JPEG_MODE_FAST_STORED, JPEG_MODE_RECOMPRESSED, type ImageInfo, type JpegInfo, type JpegParsed, type JpegPrepared, type ParsedFile, type Prepared, type WorkerRequest } from './protocol'
 
 type Pending = {
   resolve: (v: unknown) => void
@@ -221,9 +221,15 @@ export interface JpegCompressResult {
   seconds: number
 }
 
-/** Recompresses a JPEG; stripes are coded in parallel workers. */
-export async function compressJpeg(file: ArrayBuffer, onProgress: (p: Progress) => void): Promise<JpegCompressResult> {
+/** Recompresses a JPEG: in the fast mode in one worker, otherwise with stripes coded in
+ * parallel workers. */
+export async function compressJpeg(file: ArrayBuffer, onProgress: (p: Progress) => void, fast = false): Promise<JpegCompressResult> {
   const t0 = performance.now()
+  if (fast) {
+    onProgress({ stage: 'Compressing', fraction: 0 })
+    const r = await pool.run<{ info: JpegInfo; komla: Uint8Array }>({ op: 'jpegCompressFast', file }, [file])
+    return { komla: r.komla, info: r.info, seconds: (performance.now() - t0) / 1000 }
+  }
   onProgress({ stage: 'Reading JPEG', fraction: 0 })
   const prep = await pool.run<JpegPrepared>({ op: 'jpegPrepare', file }, [file])
   if (prep.info.mode !== JPEG_MODE_RECOMPRESSED) {
@@ -250,6 +256,11 @@ export interface JpegDecompressResult {
 export async function decompressJpeg(komla: Uint8Array, onProgress: (p: Progress) => void, stage = 'Restoring JPEG'): Promise<JpegDecompressResult> {
   const t0 = performance.now()
   const parsed = await pool.run<JpegParsed>({ op: 'jpegParse', file: komla })
+  if (parsed.info.mode === JPEG_MODE_FAST || parsed.info.mode === JPEG_MODE_FAST_STORED) {
+    onProgress({ stage, fraction: 0 })
+    const jpeg = await pool.run<Uint8Array>({ op: 'jpegDecompress', file: komla })
+    return { jpeg, info: parsed.info, seconds: (performance.now() - t0) / 1000 }
+  }
   const progress = weightedProgress(
     parsed.stripes.map((s) => s.length),
     stage,

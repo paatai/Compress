@@ -89,12 +89,12 @@ export function useJobs() {
   )
 
   const runCompressJpeg = useCallback(
-    async (id: number, file: File) => {
+    async (id: number, file: File, fast: boolean) => {
       try {
         const buf = await file.arrayBuffer()
         const original = new Uint8Array(buf.slice(0))
         const originalHash = await sha256(original)
-        const res = await compressJpeg(buf, (p) => update(id, { stage: p.stage, fraction: p.fraction }))
+        const res = await compressJpeg(buf, (p) => update(id, { stage: p.stage, fraction: p.fraction }), fast)
         update(id, {
           status: 'verifying',
           jpegInfo: res.info,
@@ -169,8 +169,9 @@ export function useJobs() {
     [update],
   )
 
+  /** `fastJpeg`: recompress JPEGs in the fast mode instead of for maximum compression. */
   const addFiles = useCallback(
-    (files: FileList | File[]) => {
+    (files: FileList | File[], fastJpeg = true) => {
       const list = Array.from(files)
       const created: Job[] = []
       for (const file of list) {
@@ -196,7 +197,7 @@ export function useJobs() {
       setJobs((js) => [...created.slice().reverse(), ...js])
       created.forEach((job, i) => {
         if (job.kind === 'decompress') void runDecompress(job.id, list[i])
-        else if (job.format === 'jpeg') void runCompressJpeg(job.id, list[i])
+        else if (job.format === 'jpeg') void runCompressJpeg(job.id, list[i], fastJpeg)
         else void runCompress(job.id, list[i])
       })
     },
