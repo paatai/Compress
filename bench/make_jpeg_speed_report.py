@@ -125,7 +125,8 @@ def verdict(k, t, axis):
         if not k[axis] or not t[axis]:
             return "n/a", ""
         r = k[axis] / t[axis] - 1
-        return ("win" if r > TIE else "loss" if r < -TIE else "tie"), f"{100 * r:+.0f}% speed"
+        margin = f"{r + 1:.0f}x speed" if r >= 2 else f"{100 * r:+.0f}% speed"
+        return ("win" if r > TIE else "loss" if r < -TIE else "tie"), margin
     a, b = k[axis], t[axis]
     if not a or not b:
         return "n/a", ""

@@ -35,6 +35,7 @@ Komla's fast JPEG mode (`komla compress --fast`) against the leading lossless JP
 | Lepton (Rust port) | 20.12% | 9.52 | 8.68 | 265 MiB | 505 MiB | 0 | 1.0% / 0.4% |
 | brunsli | 19.67% | 8.60 | 10.46 | 788 MiB | 266 MiB | 0 | 0.1% / 1.0% |
 | packJPG | 20.20% | 3.28 | 3.18 | 271 MiB | 268 MiB | 0 | 2.2% / 1.2% |
+| paq8px \* | 20.66% | 0.01 | 0.01 | 2791 MiB | 2791 MiB | 0 | n/a / n/a |
 
 ### All threads (8 cores)
 
@@ -46,6 +47,9 @@ Komla's fast JPEG mode (`komla compress --fast`) against the leading lossless JP
 | Lepton (Rust port) | 19.80% | 21.37 | 24.80 | 277 MiB | 505 MiB | 0 | 1.1% / 1.7% |
 | brunsli | 19.67% | 8.60 | 10.46 | 788 MiB | 266 MiB | 0 | 0.1% / 1.0% |
 | packJPG | 20.20% | 3.28 | 3.18 | 271 MiB | 268 MiB | 0 | 2.2% / 1.2% |
+| paq8px \* | 20.66% | 0.01 | 0.01 | 2791 MiB | 2791 MiB | 0 | n/a / n/a |
+
+\* paq8px takes hours per set, so it ran separately (several files at a time, alongside other work, not interleaved with the other tools); its times are indicative only.
 
 Files restored byte for byte: Komla fast 1t: 66/66; Komla fast mt: 66/66; JPEG XL 1t: 66/66; JPEG XL mt: 66/66; Lepton (Dropbox) 1t: 52/66; Lepton (Dropbox) mt: 66/66; Lepton (Rust port) 1t: 66/66; Lepton (Rust port) mt: 66/66; brunsli 1t: 66/66; packJPG 1t: 66/66.
 
@@ -62,32 +66,18 @@ Size is exact, so any difference counts (margin in percentage points of saving);
 |---|---|---|---|---|---|---|
 | JPEG XL | 1t | win (+1.89 points) | win (+59% speed) | win (+9% speed) | win (-96% memory) | win (-98% memory) |
 | JPEG XL | mt | win (+1.89 points) | win (+176% speed) | win (+77% speed) | win (-92% memory) | win (-73% memory) |
-| Lepton (Dropbox) | 1t | win (+5.06 points) | win (+243% speed) | win (+91% speed) | win (-81% memory) | win (-68% memory) |
-| Lepton (Dropbox) | mt | win (+0.10 points) | win (+353% speed) | win (+98% speed) | win (-72% memory) | win (-74% memory) |
+| Lepton (Dropbox) | 1t | win (+5.06 points) | win (3x speed) | win (+91% speed) | win (-81% memory) | win (-68% memory) |
+| Lepton (Dropbox) | mt | win (+0.10 points) | win (5x speed) | win (+98% speed) | win (-72% memory) | win (-74% memory) |
 | Lepton (Rust port) | 1t | loss (-0.24 points) | win (+22% speed) | win (+70% speed) | win (-84% memory) | win (-99% memory) |
 | Lepton (Rust port) | mt | win (+0.08 points) | win (+59% speed) | win (+67% speed) | win (-71% memory) | win (-85% memory) |
 | brunsli | 1t | win (+0.21 points) | win (+36% speed) | win (+41% speed) | win (-95% memory) | win (-98% memory) |
-| brunsli | mt | win (+0.21 points) | win (+296% speed) | win (+296% speed) | win (-90% memory) | win (-71% memory) |
-| packJPG | 1t | loss (-0.32 points) | win (+256% speed) | win (+365% speed) | win (-85% memory) | win (-98% memory) |
-| packJPG | mt | loss (-0.32 points) | win (+938% speed) | win (+1203% speed) | win (-71% memory) | win (-71% memory) |
+| brunsli | mt | win (+0.21 points) | win (4x speed) | win (4x speed) | win (-90% memory) | win (-71% memory) |
+| packJPG | 1t | loss (-0.32 points) | win (4x speed) | win (5x speed) | win (-85% memory) | win (-98% memory) |
+| packJPG | mt | loss (-0.32 points) | win (10x speed) | win (13x speed) | win (-71% memory) | win (-71% memory) |
+| paq8px | 1t | loss (-0.78 points) | win (1253x speed) | win (1582x speed) | win (-99% memory) | win (-100% memory) |
+| paq8px | mt | loss (-0.78 points) | win (3657x speed) | win (4431x speed) | win (-97% memory) | win (-97% memory) |
 
-Against the other tools (Komla's own maximum mode not counted): one thread: 23 wins, 0 ties, 2 losses; all threads: 24 wins, 0 ties, 1 loss.
-
-### paq8px on part of the set
-
-paq8px finished 17 of the 66 files (39,581,053 bytes) in the time available (it runs at about 0.005 to 0.02 MB/s per file here). On exactly those files, one thread:
-
-| Tool | Smaller | Compress MB/s | Decompress MB/s | Peak memory compress | Peak memory decompress | Round trip failed |
-|---|---|---|---|---|---|---|
-| **Komla fast** | 21.23% | 14.09 | 16.82 | 37 MiB | 6 MiB | 0 |
-| JPEG XL | 18.78% | 7.77 | 15.81 | 715 MiB | 198 MiB | 0 |
-| Lepton (Dropbox) | 21.23% | 3.29 | 7.34 | 190 MiB | 14 MiB | 0 |
-| Lepton (Rust port) | 21.68% | 10.49 | 9.91 | 188 MiB | 195 MiB | 0 |
-| brunsli | 20.93% | 8.99 | 11.72 | 574 MiB | 195 MiB | 0 |
-| packJPG | 21.39% | 3.51 | 3.40 | 187 MiB | 184 MiB | 0 |
-| paq8px \* | 27.45% | 0.021 | 0.020 | 2316 MiB | 2316 MiB | 0 |
-
-\* paq8px times are processor seconds of each process (it ran several files at a time, separately from the other tools); the first files it ran were timed by the clock while other work ran.
+Against the other tools (Komla's own maximum mode not counted): one thread: 27 wins, 0 ties, 3 losses; all threads: 28 wins, 0 ties, 2 losses.
 
 ### Size by group
 
@@ -99,6 +89,7 @@ paq8px finished 17 of the 66 files (39,581,053 bytes) in the time available (it 
 | Lepton (Rust port) | 18.16% | 20.36% | 21.87% | 17.95% | 26.23% | 33.29% | 34.22% | 20.12% |
 | brunsli | 17.31% | 20.47% | 21.86% | 17.43% | 24.23% | 30.47% | 31.55% | 19.67% |
 | packJPG | 17.88% | 20.35% | 22.43% | 17.68% | 25.59% | 32.60% | 33.69% | 20.20% |
+| paq8px | 21.15% | 24.12% | 27.76% | 4.68% | 21.18% | 42.63% | 44.60% | 20.66% |
 
 ## Development set (dev)
 
@@ -114,6 +105,7 @@ paq8px finished 17 of the 66 files (39,581,053 bytes) in the time available (it 
 | Lepton (Rust port) | 18.63% | 11.62 | 10.66 | 122 MiB | 226 MiB | 4 | 1.4% / 2.4% |
 | brunsli | 19.42% | 9.82 | 11.81 | 370 MiB | 125 MiB | 0 | 1.1% / 1.7% |
 | packJPG | 19.31% | 3.62 | 3.46 | 123 MiB | 121 MiB | 1 | 0.9% / 0.3% |
+| paq8px \* | 20.75% | 0.01 | 0.01 | 2751 MiB | 2751 MiB | 0 | n/a / n/a |
 
 ### All threads (8 cores)
 
@@ -125,6 +117,9 @@ paq8px finished 17 of the 66 files (39,581,053 bytes) in the time available (it 
 | Lepton (Rust port) | 18.22% | 26.26 | 31.95 | 132 MiB | 226 MiB | 4 | 2.1% / 0.8% |
 | brunsli | 19.42% | 9.82 | 11.81 | 370 MiB | 125 MiB | 0 | 1.1% / 1.7% |
 | packJPG | 19.31% | 3.62 | 3.46 | 123 MiB | 121 MiB | 1 | 0.9% / 0.3% |
+| paq8px \* | 20.75% | 0.01 | 0.01 | 2751 MiB | 2751 MiB | 0 | n/a / n/a |
+
+\* paq8px takes hours per set, so it ran separately (several files at a time, alongside other work, not interleaved with the other tools); its times are indicative only.
 
 Files restored byte for byte: Komla fast 1t: 80/80; Komla fast mt: 80/80; JPEG XL 1t: 80/80; JPEG XL mt: 80/80; Lepton (Dropbox) 1t: 64/80; Lepton (Dropbox) mt: 79/80; Lepton (Rust port) 1t: 76/80; Lepton (Rust port) mt: 76/80; brunsli 1t: 80/80; packJPG 1t: 79/80.
 
@@ -141,32 +136,18 @@ Size is exact, so any difference counts (margin in percentage points of saving);
 |---|---|---|---|---|---|---|
 | JPEG XL | 1t | win (+4.09 points) | win (+44% speed) | tie (+1% speed) | win (-95% memory) | win (-95% memory) |
 | JPEG XL | mt | win (+4.09 points) | win (+131% speed) | win (+40% speed) | win (-89% memory) | win (-46% memory) |
-| Lepton (Dropbox) | 1t | win (+5.41 points) | win (+253% speed) | win (+98% speed) | win (-73% memory) | win (-51% memory) |
-| Lepton (Dropbox) | mt | win (+1.52 points) | win (+288% speed) | win (+75% speed) | win (-57% memory) | win (-50% memory) |
+| Lepton (Dropbox) | 1t | win (+5.41 points) | win (4x speed) | win (+98% speed) | win (-73% memory) | win (-51% memory) |
+| Lepton (Dropbox) | mt | win (+1.52 points) | win (4x speed) | win (+75% speed) | win (-57% memory) | win (-50% memory) |
 | Lepton (Rust port) | 1t | win (+2.02 points) | win (+12% speed) | win (+52% speed) | win (-76% memory) | win (-97% memory) |
 | Lepton (Rust port) | mt | win (+2.44 points) | win (+15% speed) | win (+18% speed) | win (-54% memory) | win (-68% memory) |
 | brunsli | 1t | win (+1.24 points) | win (+32% speed) | win (+37% speed) | win (-92% memory) | win (-95% memory) |
-| brunsli | mt | win (+1.24 points) | win (+209% speed) | win (+220% speed) | win (-83% memory) | win (-43% memory) |
-| packJPG | 1t | win (+1.35 points) | win (+258% speed) | win (+368% speed) | win (-76% memory) | win (-95% memory) |
-| packJPG | mt | win (+1.35 points) | win (+736% speed) | win (+992% speed) | win (-50% memory) | win (-41% memory) |
+| brunsli | mt | win (+1.24 points) | win (3x speed) | win (3x speed) | win (-83% memory) | win (-43% memory) |
+| packJPG | 1t | win (+1.35 points) | win (4x speed) | win (5x speed) | win (-76% memory) | win (-95% memory) |
+| packJPG | mt | win (+1.35 points) | win (8x speed) | win (11x speed) | win (-50% memory) | win (-41% memory) |
+| paq8px | 1t | loss (-0.10 points) | win (1298x speed) | win (1602x speed) | win (-99% memory) | win (-100% memory) |
+| paq8px | mt | loss (-0.10 points) | win (3029x speed) | win (3736x speed) | win (-98% memory) | win (-97% memory) |
 
-Against the other tools (Komla's own maximum mode not counted): one thread: 24 wins, 1 tie, 0 losses; all threads: 25 wins, 0 ties, 0 losses.
-
-### paq8px on part of the set
-
-paq8px finished 58 of the 80 files (50,440,640 bytes) in the time available (it runs at about 0.005 to 0.02 MB/s per file here). On exactly those files, one thread:
-
-| Tool | Smaller | Compress MB/s | Decompress MB/s | Peak memory compress | Peak memory decompress | Round trip failed |
-|---|---|---|---|---|---|---|
-| **Komla fast** | 22.40% | 14.61 | 17.28 | 29 MiB | 5 MiB | 0 |
-| JPEG XL | 17.57% | 9.96 | 18.69 | 567 MiB | 125 MiB | 0 |
-| Lepton (Dropbox) | 21.02% | 3.55 | 7.90 | 112 MiB | 11 MiB | 8 |
-| Lepton (Rust port) | 21.75% | 12.09 | 11.29 | 116 MiB | 119 MiB | 0 |
-| brunsli | 20.79% | 10.23 | 12.69 | 358 MiB | 117 MiB | 0 |
-| packJPG | 21.48% | 3.74 | 3.59 | 116 MiB | 117 MiB | 0 |
-| paq8px \* | 27.05% | 0.018 | 0.018 | 2517 MiB | 2516 MiB | 0 |
-
-\* paq8px times are processor seconds of each process (it ran several files at a time, separately from the other tools); the first files it ran were timed by the clock while other work ran.
+Against the other tools (Komla's own maximum mode not counted): one thread: 28 wins, 1 tie, 1 loss; all threads: 29 wins, 0 ties, 1 loss.
 
 ### Size by group
 
@@ -178,6 +159,7 @@ paq8px finished 58 of the 80 files (50,440,640 bytes) in the time available (it 
 | Lepton (Rust port) | 20.75% | 19.96% | 22.37% | 18.71% | 18.63% | 11.96% | 12.30% | 25.12% | 18.63% |
 | brunsli | 20.00% | 19.53% | 20.27% | 16.64% | 17.08% | 11.35% | 18.16% | 23.84% | 19.42% |
 | packJPG | 20.44% | 19.78% | 23.59% | 19.27% | 18.96% | 12.44% | 15.95% | 24.85% | 19.31% |
+| paq8px | 26.31% | 24.95% | 28.45% | 24.20% | 24.91% | 1.00% | 4.47% | 32.27% | 20.75% |
 
 ## Test set (test)
 
@@ -224,16 +206,16 @@ Size is exact, so any difference counts (margin in percentage points of saving);
 |---|---|---|---|---|---|---|
 | JPEG XL | 1t | win (+3.83 points) | win (+38% speed) | tie (-3% speed) | win (-94% memory) | win (-93% memory) |
 | JPEG XL | mt | win (+3.83 points) | win (+105% speed) | win (+31% speed) | win (-87% memory) | win (-51% memory) |
-| Lepton (Dropbox) | 1t | win (+5.12 points) | win (+260% speed) | win (+100% speed) | win (-65% memory) | win (-45% memory) |
-| Lepton (Dropbox) | mt | win (+0.68 points) | win (+266% speed) | win (+80% speed) | win (-37% memory) | win (-48% memory) |
+| Lepton (Dropbox) | 1t | win (+5.12 points) | win (4x speed) | win (+100% speed) | win (-65% memory) | win (-45% memory) |
+| Lepton (Dropbox) | mt | win (+0.68 points) | win (4x speed) | win (+80% speed) | win (-37% memory) | win (-48% memory) |
 | Lepton (Rust port) | 1t | win (+0.20 points) | win (+15% speed) | win (+54% speed) | win (-66% memory) | win (-95% memory) |
 | Lepton (Rust port) | mt | win (+0.75 points) | win (+17% speed) | win (+28% speed) | win (-35% memory) | win (-60% memory) |
 | brunsli | 1t | win (+1.02 points) | win (+29% speed) | win (+33% speed) | win (-89% memory) | win (-93% memory) |
-| brunsli | mt | win (+1.02 points) | win (+178% speed) | win (+204% speed) | win (-77% memory) | win (-46% memory) |
-| packJPG | 1t | win (+0.35 points) | win (+262% speed) | win (+373% speed) | win (-65% memory) | win (-93% memory) |
-| packJPG | mt | win (+0.35 points) | win (+676% speed) | win (+977% speed) | win (-27% memory) | win (-43% memory) |
-| paq8px | 1t | loss (-0.29 points) | win (+124830% speed) | win (+153887% speed) | n/a | n/a |
-| paq8px | mt | loss (-0.29 points) | win (+268233% speed) | win (+350509% speed) | n/a | n/a |
+| brunsli | mt | win (+1.02 points) | win (+178% speed) | win (3x speed) | win (-77% memory) | win (-46% memory) |
+| packJPG | 1t | win (+0.35 points) | win (4x speed) | win (5x speed) | win (-65% memory) | win (-93% memory) |
+| packJPG | mt | win (+0.35 points) | win (8x speed) | win (11x speed) | win (-27% memory) | win (-43% memory) |
+| paq8px | 1t | loss (-0.29 points) | win (1249x speed) | win (1540x speed) | n/a | n/a |
+| paq8px | mt | loss (-0.29 points) | win (2683x speed) | win (3506x speed) | n/a | n/a |
 
 Against the other tools (Komla's own maximum mode not counted): one thread: 26 wins, 1 tie, 1 loss; all threads: 27 wins, 0 ties, 1 loss.
 

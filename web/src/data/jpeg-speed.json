@@ -134,6 +134,28 @@
    "enc_mib": 270.62,
    "dec_mib": 267.75,
    "fails": 0
+  },
+  {
+   "id": "paq8px",
+   "label": "paq8px",
+   "threads": "1t",
+   "saved": 20.66,
+   "enc": 0.01,
+   "dec": 0.01,
+   "enc_mib": 2790.88,
+   "dec_mib": 2790.79,
+   "fails": 0
+  },
+  {
+   "id": "paq8px",
+   "label": "paq8px",
+   "threads": "mt",
+   "saved": 20.66,
+   "enc": 0.01,
+   "dec": 0.01,
+   "enc_mib": 2790.88,
+   "dec_mib": 2790.79,
+   "fails": 0
   }
  ]
 }

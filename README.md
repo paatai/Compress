@@ -20,7 +20,7 @@ packJPG, paq8px), on one core and on eight: for example **6 MiB to decompress** 
 the others 266 MiB or more) and **42 MiB to compress** (the others 224 MiB or more). The JPEGs
 got **19.9% smaller**, more than with JPEG XL (18.0%), brunsli (19.7%) and Lepton, but packJPG
 (20.2%) and the single-threaded Rust port of Lepton (20.1%) did slightly better on these files,
-and paq8px far better at a thousandth of the speed. Details and the development and test sets:
+and paq8px (20.7%) better still, at a thousandth of the speed. Details and the development and test sets:
 [below](#fast-mode-size-speed-and-memory).
 
 It comes as
@@ -171,17 +171,17 @@ Random held-out set:
 | Lepton (Rust port) | 1 | 20.12% | 9.52 MB/s | 8.68 MB/s | 265 MiB | 505 MiB | 0 |
 | brunsli | 1 | 19.67% | 8.60 MB/s | 10.46 MB/s | 788 MiB | 266 MiB | 0 |
 | packJPG | 1 | 20.20% | 3.28 MB/s | 3.18 MB/s | 271 MiB | 268 MiB | 0 |
+| paq8px | 1 | 20.66% | 0.009 MB/s | 0.009 MB/s | 2791 MiB | 2791 MiB | 0 |
 | **Komla fast** | 8 | **19.88%** | **34.01 MB/s** | **41.40 MB/s** | **80 MiB** | **77 MiB** | 0 |
 | JPEG XL | 8 | 17.99% | 12.31 MB/s | 23.39 MB/s | 957 MiB | 286 MiB | 0 |
 | Lepton (Dropbox) | 8 | 19.78% | 7.50 MB/s | 20.89 MB/s | 290 MiB | 291 MiB | 0 |
 | Lepton (Rust port) | 8 | 19.80% | 21.37 MB/s | 24.80 MB/s | 277 MiB | 505 MiB | 0 |
 
-brunsli and packJPG have no threads (their rows apply to both). Lepton's single-threaded mode
-refuses 14 files (its own round-trip check fails), which count at their original size; no tool
-crashed or restored a file wrongly, and Komla coded every file in its fast mode. paq8px is far
-too slow to finish this set in the time available (0.02 MB/s): on the 14 files it finished it
-made them 27.1% smaller, against 21.3% for Komla fast, 21.4% for Lepton's Rust port and 21.1%
-for packJPG, with 2.3 GB of memory.
+brunsli, packJPG and paq8px have no threads (their rows apply to both). paq8px needs hours for
+this set, so it ran separately, several files at a time; its times are only indicative.
+Lepton's single-threaded mode refuses 14 files (its own round-trip check fails), which count
+at their original size; no tool crashed or restored a file wrongly, and Komla coded every file
+in its fast mode.
 
 Komla fast against the other tools on all five axes (size, compression speed, decompression
 speed, memory to compress, memory to decompress; speed and memory within 5% count as ties, size
@@ -189,13 +189,13 @@ differences are exact):
 
 | Set | One thread | Eight threads | Not won |
 |---|---|---|---|
-| Random held-out, 66 files | 23 wins, 2 losses | 24 wins, 1 loss | size: packJPG 20.20% and Lepton's Rust port (one thread) 20.12% against 19.88%; paq8px (see above) |
+| Random held-out, 66 files | 27 wins, 3 losses | 28 wins, 2 losses | size: paq8px 20.66%, packJPG 20.20% and Lepton's Rust port (one thread) 20.12% against 19.88% |
 | Test, 80 files | 26 wins, 1 tie, 1 loss | 27 wins, 1 loss | size: paq8px 19.97% against 19.68%; one-thread decompression ties JPEG XL (Komla 2.8% slower) |
-| Development, 80 files (tuning set) | 24 wins, 1 tie | 25 wins | one-thread decompression ties JPEG XL (Komla 0.6% faster); paq8px finished 58 files: 27.1% against 22.4% |
+| Development, 80 files (tuning set) | 28 wins, 1 tie, 1 loss | 29 wins, 1 loss | size: paq8px 20.75% against 20.66%; one-thread decompression ties JPEG XL (Komla 0.6% faster) |
 
 Tuning risk: on the development set Komla fast makes the files 20.66% smaller and is ahead of
-every tool but paq8px on size; on the held-out set it is 0.24 points behind the Rust port of
-Lepton and 0.32 behind packJPG. Part of that gap may be the tuning (the development set shaped
+every tool but paq8px (0.10 points behind) on size; on the held-out set it is 0.24 points behind
+the Rust port of Lepton, 0.32 behind packJPG and 0.78 behind paq8px. Part of that gap may be the tuning (the development set shaped
 the model and its learned starting distributions), part the kind of files: on the held-out set
 Komla fast trails on camera originals, edited photos and scans, and leads on progressive files,
 screenshots and small web images (per-group table in the report). The
