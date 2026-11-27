@@ -21,9 +21,9 @@ the embedded CRC-32 of the pixels and fails loudly on any mismatch.
 JPEG files are recompressed losslessly: decompress gives back the original file
 byte for byte (checked with a CRC-32 of the whole file). JPEGs that cannot be
 reproduced exactly from their coefficients are stored as they are. --fast uses
-the fast JPEG mode: 36 times faster to compress and 51 times faster to restore
-than the default mode (which saves the most) on one core, and it uses all
-cores (KOMLA_THREADS=n limits the threads).";
+the fast JPEG mode: about 35 times faster to compress and 45 times faster to
+restore than the default mode (which saves the most) on one core, and it uses
+all cores (KOMLA_THREADS=n limits the threads).";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
