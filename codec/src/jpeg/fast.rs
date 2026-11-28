@@ -429,6 +429,65 @@ mod simd {
             }
         }
     }
+
+    #[inline(always)]
+    pub fn luma_down(b: [&[i16; 64]; 4], fx: usize, fy: usize, ql: &[i16; 64]) -> [i16; 64] {
+        // SAFETY: SSE2 is part of x86-64; the blocks are eight 128-bit rows.
+        unsafe {
+            let row = |p: &[i16; 64], i: usize| _mm_loadu_si128((p.as_ptr() as *const __m128i).add(i));
+            let (lo, hi) = (_mm_set1_epi16(-16383), _mm_set1_epi16(16383));
+            let deq = |bb: &[i16; 64]| {
+                let mut x = [_mm_setzero_si128(); 8];
+                for (i, x) in x.iter_mut().enumerate() {
+                    let (c, q) = (row(bb, i), row(ql, i));
+                    let (pl, ph) = (_mm_mullo_epi16(c, q), _mm_mulhi_epi16(c, q));
+                    let p = _mm_packs_epi32(_mm_unpacklo_epi16(pl, ph), _mm_unpackhi_epi16(pl, ph));
+                    *x = _mm_min_epi16(_mm_max_epi16(p, lo), hi);
+                }
+                x
+            };
+            // (a + 2048) >> 12 within +-16383, as in `luma_down_scalar`
+            let fin = |a: __m128i, c: __m128i| {
+                let r = _mm_set1_epi32(2048);
+                let p = _mm_packs_epi32(_mm_srai_epi32(_mm_add_epi32(a, r), 11), _mm_srai_epi32(_mm_add_epi32(c, r), 11));
+                _mm_max_epi16(_mm_srai_epi16(p, 1), lo)
+            };
+            let col = |dx: usize| {
+                let x0 = deq(b[dx]);
+                if fy == 1 {
+                    return x0;
+                }
+                let x1 = deq(b[fx + dx]);
+                let il: [__m128i; 8] = std::array::from_fn(|v| _mm_unpacklo_epi16(x0[v], x1[v]));
+                let ih: [__m128i; 8] = std::array::from_fn(|v| _mm_unpackhi_epi16(x0[v], x1[v]));
+                let mut t = [_mm_setzero_si128(); 8];
+                for (s, t) in t.iter_mut().enumerate() {
+                    let (mut a, mut c) = (_mm_setzero_si128(), _mm_setzero_si128());
+                    for v in 0..8 {
+                        if super::DOWN_V[s][v] != 0 {
+                            let k = _mm_set1_epi32(super::DOWN_V[s][v]);
+                            a = _mm_add_epi32(a, _mm_madd_epi16(il[v], k));
+                            c = _mm_add_epi32(c, _mm_madd_epi16(ih[v], k));
+                        }
+                    }
+                    *t = fin(a, c);
+                }
+                t
+            };
+            let rows = |t: [__m128i; 8]| {
+                let mut out = [0i16; 64];
+                for (i, r) in t.iter().enumerate() {
+                    _mm_storeu_si128((out.as_mut_ptr() as *mut __m128i).add(i), *r);
+                }
+                out
+            };
+            let t0 = rows(col(0));
+            if fx == 1 {
+                return t0;
+            }
+            super::down_h(&t0, &rows(col(1)))
+        }
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -464,6 +523,79 @@ mod simd {
             }
         }
     }
+
+    #[inline(always)]
+    pub fn luma_down(b: [&[i16; 64]; 4], fx: usize, fy: usize, ql: &[i16; 64]) -> [i16; 64] {
+        // SAFETY: the blocks are eight 128-bit rows, the table rows four i32.
+        unsafe {
+            let row = |p: &[i16; 64], i: usize| v128_load((p.as_ptr() as *const v128).add(i));
+            let (lo, hi) = (i16x8_splat(-16383), i16x8_splat(16383));
+            let deq = |bb: &[i16; 64]| {
+                let mut x = [i16x8_splat(0); 8];
+                for (i, x) in x.iter_mut().enumerate() {
+                    let (c, q) = (row(bb, i), row(ql, i));
+                    let p = i16x8_narrow_i32x4(i32x4_extmul_low_i16x8(c, q), i32x4_extmul_high_i16x8(c, q));
+                    *x = i16x8_min(i16x8_max(p, lo), hi);
+                }
+                x
+            };
+            // (a + 2048) >> 12 within +-16383, as in `luma_down_scalar`
+            let fin = |a: v128, c: v128| {
+                let r = i32x4_splat(2048);
+                let p = i16x8_narrow_i32x4(i32x4_shr(i32x4_add(a, r), 11), i32x4_shr(i32x4_add(c, r), 11));
+                i16x8_max(i16x8_shr(p, 1), lo)
+            };
+            let col = |dx: usize| {
+                let x0 = deq(b[dx]);
+                if fy == 1 {
+                    return x0;
+                }
+                let x1 = deq(b[fx + dx]);
+                let il: [v128; 8] = std::array::from_fn(|v| i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(x0[v], x1[v]));
+                let ih: [v128; 8] = std::array::from_fn(|v| i16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(x0[v], x1[v]));
+                let mut t = [i16x8_splat(0); 8];
+                for (s, t) in t.iter_mut().enumerate() {
+                    let (mut a, mut c) = (i32x4_splat(0), i32x4_splat(0));
+                    for v in 0..8 {
+                        if super::DOWN_V[s][v] != 0 {
+                            let k = i32x4_splat(super::DOWN_V[s][v]);
+                            a = i32x4_add(a, i32x4_dot_i16x8(il[v], k));
+                            c = i32x4_add(c, i32x4_dot_i16x8(ih[v], k));
+                        }
+                    }
+                    *t = fin(a, c);
+                }
+                t
+            };
+            let t0 = col(0);
+            let r = if fx == 1 {
+                t0
+            } else {
+                let t1 = col(1);
+                let mut r = [i16x8_splat(0); 8];
+                for (s, r) in r.iter_mut().enumerate() {
+                    let l = i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(t0[s], t1[s]);
+                    let h = i16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(t0[s], t1[s]);
+                    let p = [i32x4_shuffle::<0, 0, 0, 0>(l, l), i32x4_shuffle::<1, 1, 1, 1>(l, l), i32x4_shuffle::<2, 2, 2, 2>(l, l), i32x4_shuffle::<3, 3, 3, 3>(l, l), i32x4_shuffle::<0, 0, 0, 0>(h, h), i32x4_shuffle::<1, 1, 1, 1>(h, h), i32x4_shuffle::<2, 2, 2, 2>(h, h), i32x4_shuffle::<3, 3, 3, 3>(h, h)];
+                    let (mut a, mut c) = (i32x4_splat(0), i32x4_splat(0));
+                    for (u, p) in p.iter().enumerate() {
+                        let k = &super::DOWN_H[u];
+                        if *k != [[0; 4]; 2] {
+                            a = i32x4_add(a, i32x4_dot_i16x8(*p, v128_load(k[0].as_ptr() as *const v128)));
+                            c = i32x4_add(c, i32x4_dot_i16x8(*p, v128_load(k[1].as_ptr() as *const v128)));
+                        }
+                    }
+                    *r = fin(a, c);
+                }
+                r
+            };
+            let mut out = [0i16; 64];
+            for (i, r) in r.iter().enumerate() {
+                v128_store((out.as_mut_ptr() as *mut v128).add(i), *r);
+            }
+            out
+        }
+    }
 }
 
 #[cfg(not(any(target_arch = "x86_64", all(target_arch = "wasm32", target_feature = "simd128"))))]
@@ -480,6 +612,11 @@ mod simd {
             let d = (t.wrapping_sub(c[i]) as i16) >> shift;
             c[i] = c[i].wrapping_add(d as u16);
         }
+    }
+
+    #[inline(always)]
+    pub fn luma_down(b: [&[i16; 64]; 4], fx: usize, fy: usize, ql: &[i16; 64]) -> [i16; 64] {
+        super::luma_down_scalar(b, fx, fy, ql)
     }
 }
 
@@ -960,7 +1097,29 @@ const LUMAQ: [u8; 64] = {
     }
     t
 };
-const NLUMA: usize = 4;
+const NLUMA: usize = 24;
+/// Bucket of the earlier chroma component's edge count, for the later one.
+const XEQ: [u8; 8] = [0, 1, 1, 2, 2, 2, 2, 2];
+/// Contexts of a chroma edge count from the other components (see `Model::block`): none, the
+/// earlier chroma component's count, the luma reference's magnitudes, or both.
+const NXE: usize = 20;
+/// Bucket of the earlier chroma component's 7x7 count, for the later one.
+const XNZQ: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = match i {
+            0..=2 => i as u8,
+            3..=4 => 3,
+            5..=7 => 4,
+            8..=11 => 5,
+            12..=17 => 6,
+            _ => 7,
+        };
+        i += 1;
+    }
+    t
+};
 /// Bucket of the summed magnitudes of an edge coefficient in the neighbouring blocks.
 const BEQ: [u8; 16] = [0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3];
 const NBE: usize = 4;
@@ -1003,6 +1162,261 @@ pub struct Info {
     nzc: u8,
     /// token of the DC prediction error
     dct: u8,
+    /// signs that agreed minus signs that disagreed with the other components (see `Cross`)
+    agree: i8,
+    agree2: i8,
+    /// sum of the AC magnitudes (each capped at 4095) if there was a `Cross`
+    asum: u32,
+}
+
+/// Signs predicted from the block of an earlier component at the same place (`r`): its sign at
+/// the same position, times the sign of the agreement so far (this block's coded coefficients
+/// counted twice, plus the neighbours' totals `nb`). `xc`: 0 if `r` is the luma reference (in
+/// half quantization steps), 1 if chroma; then `r2` may hold the luma reference as well, with
+/// its own agreement.
+struct Cross<'a> {
+    r: &'a [i16; 64],
+    xc: usize,
+    /// magnitude of this component per unit of `r` and of `r2`, times 256 (see `code_stripe`)
+    rho: [u32; 2],
+    cum: i32,
+    nb: i32,
+    r2: Option<&'a [i16; 64]>,
+    cum2: i32,
+    nb2: i32,
+    /// decaying sums of the agreement of the component's previous blocks with `r` and `r2`
+    g: [i32; 2],
+    /// sum of the magnitudes coded so far (see `Info::asum`)
+    own: u32,
+}
+
+/// Contexts of `Cross::pred` per zone (interior, edge).
+const NXS: usize = 180;
+
+/// The agreement bucket and reference magnitude bucket (< 36) and the predicted sign (true:
+/// negative) from reference `r` (in half quantization steps if `half`) with agreement `cum`,
+/// `nb`, else `g` (see `Cross`).
+#[inline(always)]
+fn xpred(r: &[i16; 64], cum: i32, nb: i32, g: i32, pos: usize, half: bool) -> Option<(usize, bool)> {
+    let rv = r[pos & 63] as i32;
+    let sc = 2 * cum + nb;
+    if rv == 0 || (sc == 0 && g == 0) {
+        return None;
+    }
+    let a = rv.unsigned_abs() as usize;
+    let rb = if half { [0, 0, 1, 2, 2, 3][a.min(5)] } else { a.min(3) };
+    if sc == 0 {
+        return Some((32 + rb, (rv < 0) != (g < 0)));
+    }
+    Some(((sc.unsigned_abs().min(8) as usize - 1) * 4 + rb, (rv < 0) != (sc < 0)))
+}
+
+/// The context (< NXA) of a sign predicted as `pneg` by how the sign predicted from `r` (see
+/// `xpred`) relates to it: none, else agreeing or not by the confidence of the agreement score.
+/// Without branches: the operands are unpredictable.
+#[inline(always)]
+fn xagree(r: &[i16; 64], cum: i32, nb: i32, g: i32, pos: usize, pneg: bool) -> usize {
+    let rv = r[pos & 63] as i32;
+    let sc = 2 * cum + nb;
+    let s = std::hint::select_unpredictable(sc != 0, sc, g);
+    let x = 1 + 3 * (((rv < 0) != (s < 0)) != pneg) as usize + XCONF[sc.unsigned_abs().min(8) as usize] as usize;
+    x * ((rv != 0) & (s != 0)) as usize
+}
+
+impl Cross<'_> {
+    /// The sign context (< NXS) and the predicted sign (true: negative), if there is a
+    /// prediction: from `r`, with whether `r2` agrees; else from `r2`.
+    #[inline(always)]
+    fn pred(&self, pos: usize) -> Option<(usize, bool)> {
+        let p1 = xpred(self.r, self.cum, self.nb, self.g[0], pos, self.xc == 0);
+        let p2 = self.r2.and_then(|r| xpred(r, self.cum2, self.nb2, self.g[1], pos, true));
+        match (p1, p2) {
+            (Some((k, n)), _) if self.xc == 0 => Some((k, n)),
+            (Some((k, n)), None) => Some((36 + k * 3, n)),
+            (Some((k, n)), Some((_, n2))) => Some((36 + k * 3 + 1 + (n != n2) as usize, n)),
+            (None, Some((k, n))) => Some((144 + k, n)),
+            (None, None) => None,
+        }
+    }
+    /// The context (< NXR) of a sign predicted as `pneg` otherwise (see `xagree`): by `r`, else
+    /// by `r2`; with whether `r2` agrees as well (if both predict).
+    #[inline(always)]
+    fn agree(&self, pos: usize, pneg: bool) -> usize {
+        let x = xagree(self.r, self.cum, self.nb, self.g[0], pos, pneg);
+        match self.r2 {
+            Some(r) => {
+                let x2 = xagree(r, self.cum2, self.nb2, self.g[1], pos, pneg);
+                let both = ((x != 0) & (x2 != 0)) as usize * (1 + (x2 > 3) as usize);
+                std::hint::select_unpredictable(x != 0, x, x2) + NXA * both
+            }
+            None => x,
+        }
+    }
+    #[inline(always)]
+    fn update(&mut self, pos: usize, x: i32) {
+        self.own += x.unsigned_abs().min(4095);
+        let sx = x.signum();
+        self.cum += (self.r[pos & 63] as i32).signum() * sx;
+        if let Some(r) = self.r2 {
+            self.cum2 += (r[pos & 63] as i32).signum() * sx;
+        }
+    }
+}
+
+/// Confidence bucket of an agreement score by its magnitude (8 and more alike; 0: from the
+/// previous blocks, see `Cross::g`).
+const XCONF: [u8; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
+/// Contexts of a predicted sign from another component's (see `xagree`), and from both
+/// references (see `Cross::agree`).
+const NXA: usize = 7;
+const NXR: usize = 3 * NXA;
+/// Weight of the other component's magnitude in the estimate of an interior coefficient.
+const XW: u16 = 8;
+/// The same for the luma reference of the second chroma component.
+const XW2: u16 = 4;
+/// Decay of the magnitude sums behind `Cross::rho` (a window of about 2^RHO_DECAY blocks).
+const RHO_DECAY: u32 = 3;
+
+/// 2:1 downsampling in the DCT domain, times 2^12: row s gives frequency s of the 8-point DCT of
+/// the pairwise means of two adjacent 8-sample blocks, from their coefficients (0..8 the first
+/// block's, 8..16 the second's).
+const DOWN: [[i32; 16]; 8] = [
+    [2048, 0, 0, 0, 0, 0, 0, 0, 2048, 0, 0, 0, 0, 0, 0, 0],
+    [1856, 835, -141, 39, 0, -26, 59, -166, -1856, 835, 141, 39, 0, -26, -59, -166],
+    [0, 2009, 0, 0, 0, 0, 0, -400, 0, -2009, 0, 0, 0, 0, 0, 400],
+    [-652, 1589, 971, -166, 0, 111, -402, -316, 652, 1589, -971, -166, 0, 111, 402, -316],
+    [0, 0, 1892, 0, 0, 0, -784, 0, 0, 0, 1892, 0, 0, 0, -784, 0],
+    [435, -708, 1453, 835, 0, -558, -602, 141, -435, -708, -1453, 835, 0, -558, 602, 141],
+    [0, 0, 0, 1703, 0, -1138, 0, 0, 0, 0, 0, -1703, 0, 1138, 0, 0],
+    [-369, 558, -710, 1474, 0, -985, 294, -111, 369, 558, 710, 1474, 0, -985, -294, -111],
+];
+#[cfg_attr(any(target_arch = "x86_64", all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
+const DOWN16: [[i16; 16]; 8] = {
+    let mut t = [[0i16; 16]; 8];
+    let mut s = 0;
+    while s < 8 {
+        let mut i = 0;
+        while i < 16 {
+            t[s][i] = DOWN[s][i] as i16;
+            i += 1;
+        }
+        s += 1;
+    }
+    t
+};
+#[cfg_attr(all(target_arch = "wasm32", target_feature = "simd128"), allow(dead_code))]
+const DOWN16_T: [[i16; 8]; 16] = {
+    let mut t = [[0i16; 8]; 16];
+    let mut i = 0;
+    while i < 16 {
+        let mut s = 0;
+        while s < 8 {
+            t[i][s] = DOWN[s][i] as i16;
+            s += 1;
+        }
+        i += 1;
+    }
+    t
+};
+/// `DOWN[s][v]` and `DOWN[s][8 + v]` as the low and high halves of a 32-bit lane (the operand of
+/// a 16-bit multiply-add of interleaved rows).
+#[cfg_attr(not(any(target_arch = "x86_64", all(target_arch = "wasm32", target_feature = "simd128"))), allow(dead_code))]
+static DOWN_V: [[i32; 8]; 8] = {
+    let mut t = [[0i32; 8]; 8];
+    let mut s = 0;
+    while s < 8 {
+        let mut v = 0;
+        while v < 8 {
+            t[s][v] = (DOWN[s][v] & 0xFFFF) | (DOWN[s][8 + v] << 16);
+            v += 1;
+        }
+        s += 1;
+    }
+    t
+};
+/// The same for frequencies `4 * h..4 * h + 4` of input coefficient `u`: `DOWN_H[u][h]`.
+#[cfg_attr(not(all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
+static DOWN_H: [[[i32; 4]; 2]; 8] = {
+    let mut t = [[[0i32; 4]; 2]; 8];
+    let mut u = 0;
+    while u < 8 {
+        let mut k = 0;
+        while k < 8 {
+            t[u][k / 4][k % 4] = (DOWN[k][u] & 0xFFFF) | (DOWN[k][8 + u] << 16);
+            k += 1;
+        }
+        u += 1;
+    }
+    t
+};
+
+/// The luma blocks covering a chroma block (`fx` by `fy` of them, 1 or 2 each way, `b[dy * fx +
+/// dx]`) at the chroma block's resolution: the DCT of the means of the luma samples it covers,
+/// from the dequantized coefficients (`ql`: the luma quantization table capped at 16383), within
+/// +-16383.
+// inlined so that it is compiled with AVX2 on the AVX2 paths
+#[inline(always)]
+fn luma_down(b: [&[i16; 64]; 4], fx: usize, fy: usize, ql: &[i16; 64]) -> [i16; 64] {
+    simd::luma_down(b, fx, fy, ql)
+}
+
+/// `luma_down` without SIMD instructions (every implementation computes the same integers).
+#[cfg_attr(any(target_arch = "x86_64", all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
+fn luma_down_scalar(b: [&[i16; 64]; 4], fx: usize, fy: usize, ql: &[i16; 64]) -> [i16; 64] {
+    // 16-bit operands with 32-bit products and sums keep the passes cheap without wider SIMD;
+    // y / 2 (rounded down) within +-16383 as a 16-bit saturation of y, so that it stays one
+    // pack instruction when vectorized
+    let half = |y: i32| ((y.clamp(-32768, 32767) as i16) >> 1).max(-16383);
+    let deq = |bb: &[i16; 64]| -> [i16; 64] { std::array::from_fn(|k| half(2 * bb[k] as i32 * ql[k] as i32)) };
+    // vertical pass: t[s * 8 + u] of the blocks at dx
+    let col = |dx: usize| -> [i16; 64] {
+        let x0 = deq(b[dx]);
+        if fy == 1 {
+            return x0;
+        }
+        let x1 = deq(b[fx + dx]);
+        let mut t = [0i16; 64];
+        for s in 0..8 {
+            let mut acc = [0i32; 8];
+            for v in 0..8 {
+                let (c0, c1) = (DOWN16[s][v] as i32, DOWN16[s][8 + v] as i32);
+                for u in 0..8 {
+                    acc[u] += c0 * x0[v * 8 + u] as i32 + c1 * x1[v * 8 + u] as i32;
+                }
+            }
+            for u in 0..8 {
+                t[s * 8 + u] = half((acc[u] + 2048) >> 11);
+            }
+        }
+        t
+    };
+    let t0 = col(0);
+    if fx == 1 {
+        return t0;
+    }
+    down_h(&t0, &col(1))
+}
+
+/// The horizontal pass of `luma_down_scalar` (which the compiler vectorizes well, with AVX2 where
+/// the caller has it).
+#[cfg_attr(all(target_arch = "wasm32", target_feature = "simd128"), allow(dead_code))]
+#[inline(always)]
+fn down_h(t0: &[i16; 64], t1: &[i16; 64]) -> [i16; 64] {
+    let half = |y: i32| ((y.clamp(-32768, 32767) as i16) >> 1).max(-16383);
+    let mut r = [0i16; 64];
+    for s in 0..8 {
+        let mut acc = [0i32; 8];
+        for u in 0..8 {
+            let (a0, a1) = (t0[s * 8 + u] as i32, t1[s * 8 + u] as i32);
+            for k in 0..8 {
+                acc[k] += DOWN16_T[u][k] as i32 * a0 + DOWN16_T[8 + u][k] as i32 * a1;
+            }
+        }
+        for k in 0..8 {
+            r[s * 8 + k] = half((acc[k] + 2048) >> 11);
+        }
+    }
+    r
 }
 
 /// Candidate weights g of the gradient in the edge extrapolation, in eighths: each side's profile
@@ -1012,8 +1426,11 @@ pub struct Info {
 const EGS: [i64; 5] = [0, 2, 4, 6, 8];
 const NEG: usize = 5;
 const EG_SHIFT: u32 = 5;
-/// Sign contexts of DC (after those of the edges).
-const ESIGN_DC: usize = 2 * 2 * NTOK * 7 * 4 * 2 * 2;
+/// Sign contexts of the edges without another component's sign, then with each context of it
+/// (see NXR; chroma only, fewer), then of DC.
+const ESIGN_X: usize = 2 * 2 * NTOK * 7 * 4 * 2 * 2;
+const ESIGN_XC: usize = 2 * NTOK * 7 * 2;
+const ESIGN_DC: usize = ESIGN_X + (NXR - 1) * ESIGN_XC;
 /// Mantissa contexts of the edges and DC: top bit, then second bit from EMANT2 on.
 const EMANT2: usize = 6 * 5 * 7;
 /// The same for the DC extrapolation of each side.
@@ -1042,6 +1459,10 @@ const NPS: usize = 9;
 /// Bucket of a coded interior magnitude by token: 1, 2, 3, 4-7, 8-15, 16 and more.
 const SAB: [u8; 16] = [0, 0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5];
 const NSAB: usize = 6;
+/// Interior sign contexts without another component's sign, then with each context of it (see
+/// NXR; chroma only).
+const ISIGN_X: usize = 2 * 8 * NPS * NSAB;
+const ISIGN_XC: usize = 8 * NPS * NSAB;
 const MU_SHIFT: u32 = 6;
 
 /// The interior value prediction of one component with its quantization table folded in.
@@ -1155,6 +1576,9 @@ pub static TRAIN_LSW: std::sync::Mutex<Vec<i16>> = std::sync::Mutex::new(Vec::ne
 /// Initial distributions learned from the training set (see `komla jtrain`); empty: flat.
 static PRIORS: &[u8] = include_bytes!("fast_priors.bin");
 
+/// Update count at which the distributions handed from the first stripe to the others start.
+const SEED_COUNT: u8 = 30;
+
 /// Adaptive distributions of one stripe.
 #[derive(Clone)]
 pub struct Model {
@@ -1171,8 +1595,11 @@ pub struct Model {
     emant: CountedBits,
     isign: CountedBits,
     imant: CountedBits,
+    csign: CountedBits,
     /// interior prediction weights (see NLSW)
     lsw: Vec<i16>,
+    /// per component, the adapted weights of its `Pred` at the end of the stripe
+    pw: Vec<[[i32; NLSW]; 49]>,
     /// normal equations of the interior prediction (training only)
     ls_acc: Vec<f64>,
     /// recent errors of the candidate edge extrapolations (see EGS) per class, edge and position
@@ -1205,20 +1632,22 @@ impl Model {
         let geo: Vec<u32> = (0..NTOK as u32).map(|t| 1 << (14 - t)).collect();
         let flat8 = Cdf::new(8, &[8; 8]);
         let mut m = Model {
-            nz_hi: Table::new(2 * NNZB * NLUMA, 7, Cdf::new(7, &[8; 7])),
-            nz_lo: Table::new(2 * NNZB * NLUMA * 7, 8, flat8),
+            nz_hi: Table::new(NNZB * (1 + NLUMA), 7, Cdf::new(7, &[8; 7])),
+            nz_lo: Table::new(NNZB * (1 + NLUMA) * 7, 8, flat8),
             zero: CountedBits::new(2 * NREM * 49 * NEQ),
             mag: Table::new(2 * NREM8 * NKZ * NEQ, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
-            nze: Table::new(2 * 2 * 8 * 8, 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
+            nze: Table::new(2 * 8 * 8 * (1 + NXE), 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
             ezero: CountedBits::new(2 * 2 * 7 * 4 * NPB * NAQ * NBE),
             emag: Table::new(2 * 2 * 4 * NTOK * NAQ * NBE, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
             esign: CountedBits::new(ESIGN_DC + 2 * 4 * 5 * 5 * 2),
             esc: Table::new(4, 8, flat8),
             dc: Table::new(2 * 8 * 4 * 4, NTOK, Cdf::new(NTOK, &geo)),
             emant: CountedBits::new(EMANT2 * 2),
-            isign: CountedBits::new(2 * 8 * NPS * NSAB),
+            isign: CountedBits::new(ISIGN_X + (NXR - 1) * ISIGN_XC),
             imant: CountedBits::new(2 * 11 * 5 * 2),
+            csign: CountedBits::new(2 * NXS * 3),
             lsw: vec![0; NLS],
+            pw: Vec::new(),
             ls_acc: if training() { vec![0.0; 2 * 49 * (NLSW * NLSW + NLSW)] } else { Vec::new() },
             eg: vec![[1, 1, 0, 1, 1]; 64],
             edc: [[1, 1, 0, 1, 1]; 16],
@@ -1232,7 +1661,7 @@ impl Model {
             }
         } else if !PRIORS.is_empty() {
             let mut p = PRIORS;
-            let ok = m.nz_hi.load(&mut p).and_then(|_| m.nz_lo.load(&mut p)).and_then(|_| m.zero.load(&mut p)).and_then(|_| m.mag.load(&mut p)).and_then(|_| m.nze.load(&mut p)).and_then(|_| m.ezero.load(&mut p)).and_then(|_| m.emag.load(&mut p)).and_then(|_| m.esign.load(&mut p)).and_then(|_| m.esc.load(&mut p)).and_then(|_| m.dc.load(&mut p)).and_then(|_| m.emant.load(&mut p)).and_then(|_| m.isign.load(&mut p)).and_then(|_| m.imant.load(&mut p));
+            let ok = m.nz_hi.load(&mut p).and_then(|_| m.nz_lo.load(&mut p)).and_then(|_| m.zero.load(&mut p)).and_then(|_| m.mag.load(&mut p)).and_then(|_| m.nze.load(&mut p)).and_then(|_| m.ezero.load(&mut p)).and_then(|_| m.emag.load(&mut p)).and_then(|_| m.esign.load(&mut p)).and_then(|_| m.esc.load(&mut p)).and_then(|_| m.dc.load(&mut p)).and_then(|_| m.emant.load(&mut p)).and_then(|_| m.isign.load(&mut p)).and_then(|_| m.imant.load(&mut p)).and_then(|_| m.csign.load(&mut p));
             assert!(ok.is_some() && p.len() == 2 * NLS, "priors do not match the model");
             for (w, b) in m.lsw.iter_mut().zip(p.chunks_exact(2)) {
                 *w = i16::from_le_bytes([b[0], b[1]]);
@@ -1265,7 +1694,19 @@ impl Model {
     pub fn stats(&self) -> Vec<(usize, Vec<u32>)> {
         let t = |x: &Table| (x.n, x.stats.clone());
         let c = |x: &CountedBits| (2, x.stats.clone());
-        vec![t(&self.nz_hi), t(&self.nz_lo), c(&self.zero), t(&self.mag), t(&self.nze), c(&self.ezero), t(&self.emag), c(&self.esign), t(&self.esc), t(&self.dc), c(&self.emant), c(&self.isign), c(&self.imant)]
+        vec![t(&self.nz_hi), t(&self.nz_lo), c(&self.zero), t(&self.mag), t(&self.nze), c(&self.ezero), t(&self.emag), c(&self.esign), t(&self.esc), t(&self.dc), c(&self.emant), c(&self.isign), c(&self.imant), c(&self.csign)]
+    }
+
+    /// The model the later stripes of an image start from (see `code_stripe`): this one (the
+    /// first stripe's at its end) with the update counts capped, so that it keeps adapting.
+    pub fn into_seed(mut self) -> Model {
+        for t in [&mut self.nz_hi, &mut self.nz_lo, &mut self.mag, &mut self.nze, &mut self.emag, &mut self.esc, &mut self.dc] {
+            t.cnt.iter_mut().for_each(|k| *k = (*k).min(SEED_COUNT));
+        }
+        for t in [&mut self.zero, &mut self.ezero, &mut self.esign, &mut self.emant, &mut self.isign, &mut self.imant, &mut self.csign] {
+            t.cnt.iter_mut().for_each(|k| *k = (*k).min(SEED_COUNT));
+        }
+        self
     }
 
     /// Codes the sign of an interior value (`t` = its token, `v` the value), as agreement with
@@ -1309,9 +1750,10 @@ impl Model {
     /// Codes a magnitude class and the raw bits of a value (`t` = its token, `v` the value);
     /// `sign`: raw, or predicted (`Some((sign context, predicted negative, predicted magnitude in
     /// 1/16 steps, mantissa context))`), in which case the top two mantissa bits are also coded
-    /// with a probability.
+    /// with a probability; without that, `xs`: the sign predicted from another component
+    /// (`Some((context, predicted negative))`).
     #[inline(always)]
-    fn rest<I: Io>(&mut self, io: &mut I, t: usize, v: i32, esc_ctx: usize, sign: Option<(usize, bool, u32, usize)>) -> i32 {
+    fn rest<I: Io>(&mut self, io: &mut I, t: usize, v: i32, esc_ctx: usize, sign: Option<(usize, bool, u32, usize)>, xs: Option<(usize, bool)>) -> i32 {
         let a = v.unsigned_abs();
         let neg = (v < 0) as u32;
         let (base, low) = if t == ESC {
@@ -1345,10 +1787,17 @@ impl Model {
                 };
                 (flip ^ pneg as u32, base + m)
             }
-            None => {
-                let r = io.raw((neg << low) | (a.wrapping_sub(base) & ((1 << low) - 1)), low + 1);
-                (r >> low, base + (r & ((1 << low) - 1)))
-            }
+            None => match xs {
+                Some((ctx, pneg)) => {
+                    let flip = self.csign.bit(io, ctx * 3 + t.min(3) - 1, neg ^ pneg as u32);
+                    let r = if low > 0 { io.raw(a.wrapping_sub(base) & ((1 << low) - 1), low) } else { 0 };
+                    (flip ^ pneg as u32, base + r)
+                }
+                None => {
+                    let r = io.raw((neg << low) | (a.wrapping_sub(base) & ((1 << low) - 1)), low + 1);
+                    (r >> low, base + (r & ((1 << low) - 1)))
+                }
+            },
         };
         let s = -(neg as i32);
         (m as i32 ^ s) - s
@@ -1358,11 +1807,13 @@ impl Model {
     /// continuing the block to the left) of a block.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    fn edge<I: Io>(&mut self, io: &mut I, cls: usize, dir: usize, blk: &mut [i16; 64], nbr: Option<&[i16; 64]>, near: (&[i16; 64], &[i16; 64]), pr: &Pred, rq: &[i64; 64], nzq: usize, pnz: usize) -> u8 {
+    fn edge<I: Io>(&mut self, io: &mut I, cls: usize, dir: usize, blk: &mut [i16; 64], nbr: Option<&[i16; 64]>, near: (&[i16; 64], &[i16; 64]), pr: &Pred, rq: &[i64; 64], (nzq, xe): (usize, usize), pnz: usize, cross: &mut Option<Cross>) -> u8 {
         let step = if dir == 0 { 1 } else { 8 };
         let across = if dir == 0 { 8 } else { 1 };
         let actual = if I::DEC { 0 } else { (1..8).filter(|&i| blk[i * step] != 0).count() };
-        let n = self.nze.sym(io, ((cls * 2 + dir) * 8 + nzq) * 8 + pnz, 8, actual);
+        // (luma blocks have no other component's counts)
+        let ctx = (dir * 8 + nzq) * 8 + pnz;
+        let n = self.nze.sym(io, if cls == 0 { ctx } else { 2 * 8 * 8 + ctx * NXE + xe }, 8, actual);
         // the sums of the extrapolation below for all positions at once (position 0, DC, is not
         // coded here), in 32 bits, wrapping: exact for the coefficients of 8- and 12-bit images
         let [e0, ed] = match (n > 0, nbr) {
@@ -1401,7 +1852,9 @@ impl Model {
             let av = 2 * (blk[pos + across] as i32).unsigned_abs() + (blk[pos + 2 * across] as i32).unsigned_abs() + prev;
             let adj = AQ[av.min(31) as usize] as usize;
             // the same coefficient in the blocks above and to the left
-            let nm = BEQ[((near.0[pos] as i32).unsigned_abs() + (near.1[pos] as i32).unsigned_abs()).min(15) as usize] as usize;
+            // (and in the other component)
+            let xm = cross.as_ref().map_or(0, |c| ((c.r[pos] as i32).unsigned_abs().min(4095) * c.rho[0] * 2 + 128) >> 8);
+            let nm = BEQ[((near.0[pos] as i32).unsigned_abs() + (near.1[pos] as i32).unsigned_abs() + xm).min(15) as usize] as usize;
             let zctx = (((((cls * 2 + dir) * 7 + i - 1) * 4 + rem.min(4) - 1) * NPB + pb) * NAQ + adj) * NBE + nm;
             if self.ezero.bit(io, zctx, (v != 0) as u32) != 0 {
                 let tp = token(p.unsigned_abs());
@@ -1410,17 +1863,26 @@ impl Model {
                 let dt = (t as i32 - tp as i32).clamp(-3, 3) as usize + 3;
                 // whether the extrapolations without and with the full gradient agree in sign
                 let ag = accs.map_or(0, |(b0, bd)| ((b0 < 0) == (b0 + 8 * bd < 0)) as usize);
-                let sign = if p != 0 {
-                    Some(((((((cls * 2 + dir) * NTOK + tp) * 7 + dt) * 4 + eb) * 2 + ag) * 2 + (p < 0) as usize, p < 0, p16.unsigned_abs(), cls * 2 + dir))
+                // and whether the other component's sign agrees with it
+                let ectx = |pn: bool, tp: usize, dt: usize| {
+                    let x = cross.as_ref().map_or(0, |c| c.agree(pos, pn));
+                    let full = (((((cls * 2 + dir) * NTOK + tp) * 7 + dt) * 4 + eb) * 2 + ag) * 2 + pn as usize;
+                    std::hint::select_unpredictable(x == 0, full, ESIGN_X + x.wrapping_sub(1).wrapping_mul(ESIGN_XC) + ((dir * NTOK + tp) * 7 + dt) * 2 + pn as usize)
+                };
+                let (sign, xs) = if p != 0 {
+                    (Some((ectx(p < 0, tp, dt), p < 0, p16.unsigned_abs(), cls * 2 + dir)), None)
                 } else if p16 != 0 {
                     // a prediction below half a step, by sixteenths (in place of dt)
-                    Some(((((((cls * 2 + dir) * NTOK) * 7 + (p16.unsigned_abs() as usize - 1).min(6)) * 4 + eb) * 2 + ag) * 2 + (p16 < 0) as usize, p16 < 0, p16.unsigned_abs(), cls * 2 + dir))
+                    (Some((ectx(p16 < 0, 0, (p16.unsigned_abs() as usize - 1).min(6)), p16 < 0, p16.unsigned_abs(), cls * 2 + dir)), None)
                 } else {
-                    None
+                    (None, cross.as_ref().and_then(|c| c.pred(pos)).map(|(k, pn)| (NXS + k, pn)))
                 };
-                let x = self.rest(io, t, v, cls * 2, sign);
+                let x = self.rest(io, t, v, cls * 2, sign, xs);
                 if I::DEC {
                     blk[pos] = x as i16;
+                }
+                if let Some(c) = cross.as_mut() {
+                    c.update(pos, x);
                 }
                 prev = TMAG[t & 15] as u32;
                 rem -= 1;
@@ -1441,10 +1903,13 @@ impl Model {
     }
 
     /// Codes one block. `a`, `l`: the blocks above and to the left with their `Info` (`None` if
-    /// outside the stripe); `q`: the component's quantization table. Returns the block's `Info`.
+    /// outside the stripe); `q`: the component's quantization table; `xref`: the block of an
+    /// earlier component at the same place, the kind of relation and the luma reference (see
+    /// `Cross`); `xinfo`: the `Info` of the earlier chroma component's block at the same place.
+    /// Returns the block's `Info`.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    pub fn block<I: Io>(&mut self, io: &mut I, cls: usize, q: &[i64; 64], rq: &[i64; 64], pr: &mut Pred, blk: &mut [i16; 64], a: Option<(&[i16; 64], &Info)>, l: Option<(&[i16; 64], &Info)>, diag: (Option<&[i16; 64]>, Option<&[i16; 64]>), luma: usize, code_dc: bool, code_ac: bool) -> Info {
+    pub fn block<I: Io>(&mut self, io: &mut I, cls: usize, q: &[i64; 64], rq: &[i64; 64], pr: &mut Pred, blk: &mut [i16; 64], a: Option<(&[i16; 64], &Info)>, l: Option<(&[i16; 64], &Info)>, diag: (Option<&[i16; 64]>, Option<&[i16; 64]>), luma: usize, xref: Option<(&[i16; 64], usize, Option<&[i16; 64]>, [u32; 2], [i32; 2])>, xinfo: Option<Info>, code_dc: bool, code_ac: bool) -> Info {
         let (na, nl) = match (a, l) {
             (Some(a), Some(l)) => (a.0, l.0),
             (Some(a), None) => (a.0, a.0),
@@ -1463,8 +1928,13 @@ impl Model {
         };
         let mut info = Info::default();
         if code_ac {
+            let nb = a.map_or(0, |x| x.1.agree as i32) + l.map_or(0, |x| x.1.agree as i32);
+            let nb2 = a.map_or(0, |x| x.1.agree2 as i32) + l.map_or(0, |x| x.1.agree2 as i32);
+            let mut cross = xref.map(|(r, xc, r2, rho, g)| Cross { r, xc, rho, cum: 0, nb, r2, cum2: 0, nb2, g, own: 0 });
             let actual = if I::DEC { 0 } else { INTERIOR.iter().filter(|&&p| blk[p as usize] != 0).count() };
-            let ctx = (cls * NNZB + NZB[avg(|i| i.nz77) & 63] as usize) * NLUMA + luma;
+            // (luma blocks have no hint)
+            let nzb = NZB[avg(|i| i.nz77) & 63] as usize;
+            let ctx = if cls == 0 { nzb } else { NNZB + nzb * NLUMA + luma };
             let hi = self.nz_hi.sym(io, ctx, 7, actual >> 3);
             let lo = self.nz_lo.sym(io, ctx * 7 + hi, 8, actual & 7);
             let nz77 = hi * 8 + lo;
@@ -1487,6 +1957,20 @@ impl Model {
                 let m = |b: &[i16; 64], k: usize| b[k].unsigned_abs().min(4095);
                 for (k, e) in est.iter_mut().enumerate() {
                     *e = 2 * (m(na, k) + m(nl, k)) + m(nal, k) + m(nar, k);
+                }
+                if let Some(c) = &cross {
+                    // min(1023, m * w >> 8) from the halves of the 16-bit products (m, w <= 4096)
+                    let term = |m: u16, w: u16| (((((m as u32 * w as u32) >> 16) as u16).min(4) << 8) | (m.wrapping_mul(w) >> 8)).min(1023);
+                    let w = XW * c.rho[0] as u16;
+                    for (k, e) in est.iter_mut().enumerate() {
+                        *e += term(m(c.r, k), w);
+                    }
+                    if let Some(r2) = c.r2 {
+                        let w = XW2 * c.rho[1] as u16;
+                        for (k, e) in est.iter_mut().enumerate() {
+                            *e += term(m(r2, k), w);
+                        }
+                    }
                 }
                 if let Some((ab, _)) = a {
                     let [sa, ga] = I::L::sums(ab, &ZERO_BLOCK, [&pr.qc, &pr.gc, &pr.qc0, &pr.gc0], false);
@@ -1523,10 +2007,16 @@ impl Model {
                     let nm = EQ[(e as u32 + (pa >> 1)).min(340) as usize] as usize;
                     let t = 1 + self.mag.sym(io, mbase + REM8[rem & 63] as usize + IZE[i] as usize + nm, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
                     let pb = (bitlen(pa >> 1) as usize).min(NPS - 1);
-                    let sctx = ((cls * 8 + IZE[i] as usize / NEQ) * NPS + pb) * NSAB + SAB[t & 15] as usize;
+                    // and whether the other component's sign agrees with the prediction's
+                    let xr = cross.as_ref().map_or(0, |c| c.agree(pos, p < 0));
+                    let sc = (IZE[i] as usize / NEQ * NPS + pb) * NSAB + SAB[t & 15] as usize;
+                    let sctx = std::hint::select_unpredictable(xr == 0, cls * ISIGN_XC + sc, ISIGN_X + xr.wrapping_sub(1).wrapping_mul(ISIGN_XC) + sc);
                     let x = self.irest(io, t, v, cls * 2, cls, sctx, p < 0, pa);
                     if I::DEC {
                         blk[pos] = x as i16;
+                    }
+                    if let Some(c) = cross.as_mut() {
+                        c.update(pos, x);
                     }
                     let dq = x.wrapping_mul(pr.q[pos]);
                     let e = ((x as i64) << 20).wrapping_sub(pw);
@@ -1559,8 +2049,26 @@ impl Model {
                 i += 1;
             }
             let nzq = NZQ8[nz77 & 63] as usize;
-            info.nzr = self.edge(io, cls, 0, blk, a.map(|x| x.0), (na, nl), pr, rq, nzq, avg(|i| i.nzr));
-            info.nzc = self.edge(io, cls, 1, blk, l.map(|x| x.0), (na, nl), pr, rq, nzq, avg(|i| i.nzc));
+            // the edge's count in the earlier chroma component's block and the bucket of the edge's
+            // magnitude sum in the luma reference
+            let lb = |r: &[i16; 64], step: usize| {
+                let s: u32 = (1..8).map(|i| (r[i * step] as i32).unsigned_abs().min(64)).sum();
+                (s >= 6) as usize + (s >= 16) as usize + (s >= 40) as usize
+            };
+            let xe = |n: u8, step: usize| match (&cross, xinfo) {
+                (Some(c), None) if c.xc == 0 => 4 + lb(c.r, step),
+                (Some(Cross { r2: Some(r2), .. }), Some(_)) => 8 + XEQ[n as usize & 7] as usize * 4 + lb(r2, step),
+                (_, Some(_)) => 1 + XEQ[n as usize & 7] as usize,
+                _ => 0,
+            };
+            let (xr, xc) = (xe(xinfo.map_or(0, |i| i.nzr), 1), xe(xinfo.map_or(0, |i| i.nzc), 8));
+            info.nzr = self.edge(io, cls, 0, blk, a.map(|x| x.0), (na, nl), pr, rq, (nzq, xr), avg(|i| i.nzr), &mut cross);
+            info.nzc = self.edge(io, cls, 1, blk, l.map(|x| x.0), (na, nl), pr, rq, (nzq, xc), avg(|i| i.nzc), &mut cross);
+            if let Some(c) = cross {
+                info.agree = c.cum.clamp(-64, 64) as i8;
+                info.agree2 = c.cum2.clamp(-64, 64) as i8;
+                info.asum = c.own;
+            }
         }
         if code_dc {
             // the mean of the edge column (row) continues the neighbour's last column (row),
@@ -1634,7 +2142,7 @@ impl Model {
             let side_of = |x: Option<i32>| x.map_or(0, |x| (x > pred << 4) as i32 - (x < pred << 4) as i32);
             let vote = (side_of(xy.0) + side_of(xy.1) + 2) as usize;
             let sctx = ESIGN_DC + (((cls * 4 + t.min(4) - 1) * 5 + (f.unsigned_abs() as usize + 1) / 2) * 5 + vote) * 2 + (f < 0) as usize;
-            let x = if t != 0 { self.rest(io, t, d, cls * 2 + 1, Some((sctx, f < 0, f.unsigned_abs(), 4 + cls))) } else { 0 };
+            let x = if t != 0 { self.rest(io, t, d, cls * 2 + 1, Some((sctx, f < 0, f.unsigned_abs(), 4 + cls)), None) } else { 0 };
             if I::DEC {
                 blk[0] = (pred + x) as i16;
             }
@@ -1682,16 +2190,42 @@ pub struct Extent {
 /// component c (`width[c]` blocks of 64 coefficients each): block row `by` of the stripe lives
 /// in row `by % rows[c]`, so a ring of two MCU rows is enough (the decoder clears a row before
 /// reusing it). `v[c]`: block rows per MCU row; `q[c]`: quantization table (natural order).
-/// `emit(my, planes)` is called after every MCU row.
+/// `emit(my, planes)` is called after every MCU row. `start`: the model to start from (the
+/// first stripe's, see `Model::into_seed`), else the learned initial one. Returns the model at
+/// the end.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], rows: &[usize], width: &[usize], v: &[usize], ext: &[Extent], q: &[[u16; 64]], mcu_rows: usize, mut emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<Model, String> {
-    let mut m = Model::new();
+pub fn code_stripe<I: Io>(io: &mut I, start: Option<&Model>, planes: &mut [&mut [i16]], rows: &[usize], width: &[usize], v: &[usize], ext: &[Extent], q: &[[u16; 64]], mcu_rows: usize, mut emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<Model, String> {
+    let mut m = start.cloned().unwrap_or_else(Model::new);
     let qs: Vec<[i64; 64]> = q.iter().map(|t| t.map(|x| x as i64)).collect();
     let rqs: Vec<[i64; 64]> = q.iter().map(|t| t.map(|x| (1i64 << 32) / (COS0[0] * x.max(1) as i64))).collect();
     let mut preds: Vec<Pred> = q.iter().enumerate().map(|(c, t)| Pred::new(&m.lsw, (c > 0) as usize, t)).collect();
+    for (p, w) in preds.iter_mut().zip(&m.pw) {
+        p.w = *w;
+    }
+    // a step above 16383 saturates the dequantized luma of any nonzero coefficient anyway
+    let ql: [i16; 64] = q.first().map_or([0; 64], |t| t.map(|x| x.min(16383) as i16));
+    // the reciprocals of half the chroma steps, 65536 / q, as 32768 k + l (both 16-bit)
+    let rcs: Vec<([i16; 64], [i16; 64])> = q.iter().map(|t| (t.map(|x| ((65536 / x.max(1) as i32) >> 15) as i16), t.map(|x| ((65536 / x.max(1) as i32) & 32767) as i16))).collect();
     let mut infos: Vec<Vec<Info>> = width.iter().map(|&w| vec![Info::default(); 2 * w]).collect();
+    // the downsampled luma of this MCU row's chroma block rows, by (block row, width, rows per MCU)
+    let mut down: Vec<((usize, usize, usize), Vec<[i16; 64]>)> = Vec::new();
+    // and the same requantized for a chroma quantization table, with the AC magnitude sum of
+    // every block (as `Info::asum`)
+    #[allow(clippy::type_complexity)]
+    let mut lrefs: Vec<((usize, usize, usize), [u16; 64], Vec<[i16; 64]>, Vec<u32>)> = Vec::new();
+    // per component, decaying sums of the AC magnitudes of its blocks and of their references
+    // (`Cross::rho`), starting at a ratio of 1 for a chroma reference, 1/2 for the luma one
+    let mut mags: Vec<[u32; 4]> = (0..planes.len())
+        .map(|c| {
+            let chroma_ref = (1..c).any(|k| width[k] == width[c] && v[k] == v[c]);
+            [if chroma_ref { 1 << 12 } else { 1 << 11 }, 1 << 12, 1 << 11, 1 << 12]
+        })
+        .collect();
+    let mut gs: Vec<[i32; 2]> = vec![[0; 2]; planes.len()];
     for my in 0..mcu_rows {
+        down.clear();
+        lrefs.clear();
         for c in 0..planes.len() {
             let cls = (c > 0) as usize;
             let w = width[c];
@@ -1705,24 +2239,67 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], rows: &[usize],
                     continue;
                 }
                 let slot = by % rows[c];
+                let (earlier, later) = planes.split_at_mut(c);
+                let plane = &mut *later[0];
                 if I::DEC && by >= rows[c] {
-                    planes[c][slot * len..(slot + 1) * len].fill(0);
+                    plane[slot * len..(slot + 1) * len].fill(0);
                 }
                 let (cur, above): (&mut [i16], Option<&[i16]>) = if by == 0 {
-                    (&mut planes[c][slot * len..(slot + 1) * len], None)
+                    (&mut plane[slot * len..(slot + 1) * len], None)
                 } else {
                     let up = (by - 1) % rows[c];
                     if up < slot {
-                        let (a, b) = planes[c].split_at_mut(slot * len);
+                        let (a, b) = plane.split_at_mut(slot * len);
                         (&mut b[..len], Some(&a[up * len..(up + 1) * len]))
                     } else {
-                        let (a, b) = planes[c].split_at_mut(up * len);
+                        let (a, b) = plane.split_at_mut(up * len);
                         (&mut a[slot * len..(slot + 1) * len], Some(&b[..len]))
                     }
                 };
-                // chroma: mean 7x7 count of the luma blocks at the same place (coded before)
+                // chroma: the luma blocks at the same place (coded before this row) at the
+                // component's resolution and in half its quantization steps
+                let mut li = None;
+                if c > 0 && width[0] % w == 0 && v[0] % v[c] == 0 && matches!((width[0] / w, v[0] / v[c]), (1 | 2, 1 | 2)) {
+                    li = lrefs.iter().position(|d| d.0 == (by, w, v[c]) && d.1 == q[c]);
+                }
+                if li.is_none() && c > 0 && width[0] % w == 0 && v[0] % v[c] == 0 && matches!((width[0] / w, v[0] / v[c]), (1 | 2, 1 | 2)) {
+                    let (fx, fy) = (width[0] / w, v[0] / v[c]);
+                    let at = match down.iter().position(|d| d.0 == (by, w, v[c])) {
+                        Some(i) => i,
+                        None => {
+                            let w0 = width[0];
+                            let luma = &*earlier[0];
+                            let blk = |bx: usize, i: usize| -> &[i16; 64] {
+                                let (dx, dy) = (i % fx, (i / fx).min(fy - 1));
+                                let s = (by * fy + dy) % rows[0];
+                                luma[(s * w0 + bx * fx + dx) * 64..][..64].try_into().unwrap()
+                            };
+                            down.push(((by, w, v[c]), (0..w).map(|bx| luma_down([blk(bx, 0), blk(bx, 1), blk(bx, 2), blk(bx, 3)], fx, fy, &ql)).collect()));
+                            down.len() - 1
+                        }
+                    };
+                    let (rk, rl) = &rcs[c];
+                    let lr: Vec<[i16; 64]> = down[at].1.iter().map(|d| std::array::from_fn(|k| d[k] * rk[k] + ((d[k] as i32 * rl[k] as i32 + 16384) >> 15) as i16)).collect();
+                    let sums = lr.iter().map(|b| b[1..].iter().map(|&x| (x as i32).unsigned_abs().min(4095)).sum()).collect();
+                    lrefs.push(((by, w, v[c]), q[c], lr, sums));
+                    li = Some(lrefs.len() - 1);
+                }
+                let (lref, lsum): (&[[i16; 64]], &[u32]) = li.map_or((&[], &[]), |i| (&lrefs[i].2, &lrefs[i].3));
+                // and the nearest earlier chroma component with the same block grid
+                let xrow = (1..c).rev().find(|&k| width[k] == w && v[k] == v[c]).map(|k| {
+                    let s = by % rows[k];
+                    &earlier[k][s * len..(s + 1) * len]
+                });
+                // chroma: the 7x7 count of the earlier chroma component's block at the same place,
+                // else the mean 7x7 count of the luma blocks there (coded before) with the bucket of
+                // the luma reference's magnitude sum
+                let lsb = |bx: usize| lsum.get(bx).map_or(0, |&s| (s >= 16) as u8 + (s >= 64) as u8 + (s >= 256) as u8);
                 let mut hints = Vec::new();
-                if c > 0 && v[0] % v[c] == 0 && width[0] % w == 0 {
+                let mut xinfos: Vec<Info> = Vec::new();
+                if let Some(k) = (1..c).rev().find(|&k| width[k] == w && v[k] == v[c]) {
+                    xinfos = infos[k][(by & 1) * w..][..w].to_vec();
+                    hints = xinfos.iter().map(|i| 16 + XNZQ[i.nz77 as usize & 63]).collect();
+                } else if c > 0 && v[0] % v[c] == 0 && width[0] % w == 0 {
                     let (fx, fy) = (width[0] / w, v[0] / v[c]);
                     let (luma, _) = infos.split_at(1);
                     let w0 = width[0];
@@ -1735,7 +2312,7 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], rows: &[usize],
                                     sum += luma[0][(ly & 1) * w0 + bx * fx + dx].nz77 as usize;
                                 }
                             }
-                            LUMAQ[(sum / (fx * fy)).min(63)]
+                            LUMAQ[(sum / (fx * fy)).min(63)] * 4 + lsb(bx)
                         })
                         .collect();
                 }
@@ -1755,14 +2332,42 @@ pub fn code_stripe<I: Io>(io: &mut I, planes: &mut [&mut [i16]], rows: &[usize],
                     let al = if bx > 0 { above.map(|ab| <&[i16; 64]>::try_from(&ab[(bx - 1) * 64..bx * 64]).unwrap()) } else { None };
                     let ar = if bx + 1 < w.min(e.ac_w.max(e.dc_w)) { above.map(|ab| <&[i16; 64]>::try_from(&ab[(bx + 1) * 64..bx * 64 + 128]).unwrap()) } else { None };
                     let luma = hints.get(bx).copied().unwrap_or(0) as usize;
+                    let mg = &mags[c];
+                    let rho = |sc: u32, sr: u32| ((sc << 8) / (sr + 1)).min(512);
+                    let rhos = [rho(mg[0], mg[1]), rho(mg[2], mg[3])];
+                    let xref = match (xrow, lref.get(bx)) {
+                        (Some(r), lr) => Some((<&[i16; 64]>::try_from(&r[bx * 64..bx * 64 + 64]).unwrap(), 1, lr, rhos, gs[c])),
+                        (None, Some(lr)) => Some((lr, 0, None, rhos, gs[c])),
+                        (None, None) => None,
+                    };
                     io.block();
-                    let info = m.block(io, cls, &qs[c], &rqs[c], &mut preds[c], blk, a, l, (al, ar), luma, cd, ca);
+                    let info = m.block(io, cls, &qs[c], &rqs[c], &mut preds[c], blk, a, l, (al, ar), luma, xref, xinfos.get(bx).copied(), cd, ca);
+                    if let Some((r, xc, r2, _, _)) = xref {
+                        let g = &mut gs[c];
+                        g[0] = g[0] - g[0] / 16 + info.agree as i32;
+                        g[1] = g[1] - g[1] / 16 + info.agree2 as i32;
+                        let own = info.asum;
+                        // the earlier chroma block's sum is in its Info if it had a reference
+                        let rs = match (xc, xinfos.get(bx)) {
+                            (0, _) => lsum[bx],
+                            (_, Some(i)) if !lref.is_empty() => i.asum,
+                            _ => r[1..].iter().map(|&x| (x as i32).unsigned_abs().min(4095)).sum::<u32>(),
+                        };
+                        let mg = &mut mags[c];
+                        mg[0] = mg[0] - (mg[0] >> RHO_DECAY) + own;
+                        mg[1] = mg[1] - (mg[1] >> RHO_DECAY) + rs;
+                        if r2.is_some() {
+                            mg[2] = mg[2] - (mg[2] >> RHO_DECAY) + own;
+                            mg[3] = mg[3] - (mg[3] >> RHO_DECAY) + lsum[bx];
+                        }
+                    }
                     now[bx] = info;
                 }
             }
         }
         emit(my, planes)?;
     }
+    m.pw = preds.iter().map(|p| p.w).collect();
     Ok(m)
 }
 
@@ -1778,32 +2383,33 @@ pub struct Geometry<'a> {
 }
 
 #[inline(always)]
-fn encode_with<L: Lanes>(planes: &mut [&mut [i16]], g: &Geometry) -> (Vec<u8>, Vec<u8>) {
+fn encode_with<L: Lanes>(planes: &mut [&mut [i16]], g: &Geometry, start: Option<&Model>) -> (Vec<u8>, Vec<u8>, Model) {
     let mut e = Enc::<L>::new();
-    let _ = code_stripe(&mut e, planes, g.rows, g.width, g.v, g.ext, g.q, g.mcu_rows, |_, _| Ok(()));
-    e.finish()
+    let m = code_stripe(&mut e, start, planes, g.rows, g.width, g.v, g.ext, g.q, g.mcu_rows, |_, _| Ok(())).unwrap_or_default();
+    let (r, w) = e.finish();
+    (r, w, m)
 }
 
 #[inline(always)]
-fn decode_with<L: Lanes>(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry, emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<(), String> {
+fn decode_with<L: Lanes>(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry, start: Option<&Model>, emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<Model, String> {
     let mut d = Dec::<L>::new(rans, raw);
-    code_stripe(&mut d, planes, g.rows, g.width, g.v, g.ext, g.q, g.mcu_rows, emit)?;
+    let m = code_stripe(&mut d, start, planes, g.rows, g.width, g.v, g.ext, g.q, g.mcu_rows, emit)?;
     if d.overrun() {
         return Err("corrupt .komla file".into());
     }
-    Ok(())
+    Ok(m)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn encode_avx2(planes: &mut [&mut [i16]], g: &Geometry) -> (Vec<u8>, Vec<u8>) {
-    encode_with::<Avx2>(planes, g)
+unsafe fn encode_avx2(planes: &mut [&mut [i16]], g: &Geometry, start: Option<&Model>) -> (Vec<u8>, Vec<u8>, Model) {
+    encode_with::<Avx2>(planes, g, start)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
-unsafe fn decode_avx2(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry, emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<(), String> {
-    decode_with::<Avx2>(rans, raw, planes, g, emit)
+unsafe fn decode_avx2(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry, start: Option<&Model>, emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<Model, String> {
+    decode_with::<Avx2>(rans, raw, planes, g, start, emit)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1811,25 +2417,26 @@ fn has_avx2() -> bool {
     std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi1") && std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("popcnt")
 }
 
-/// Codes the coefficients of one stripe; returns (rANS bytes, raw bits).
-pub fn encode_stripe(planes: &mut [&mut [i16]], g: &Geometry) -> (Vec<u8>, Vec<u8>) {
+/// Codes the coefficients of one stripe, starting from model `start` (see `code_stripe`);
+/// returns (rANS bytes, raw bits, final model).
+pub fn encode_stripe(planes: &mut [&mut [i16]], g: &Geometry, start: Option<&Model>) -> (Vec<u8>, Vec<u8>, Model) {
     #[cfg(target_arch = "x86_64")]
     if has_avx2() {
         // SAFETY: the CPU has every feature the function is compiled for.
-        return unsafe { encode_avx2(planes, g) };
+        return unsafe { encode_avx2(planes, g, start) };
     }
-    encode_with::<Base>(planes, g)
+    encode_with::<Base>(planes, g, start)
 }
 
 /// Decodes the coefficients of one stripe into zeroed planes, calling `emit` after every MCU
-/// row (see `code_stripe`).
-pub fn decode_stripe(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry, emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<(), String> {
+/// row (see `code_stripe`); returns the final model.
+pub fn decode_stripe(rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &Geometry, start: Option<&Model>, emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<Model, String> {
     #[cfg(target_arch = "x86_64")]
     if has_avx2() {
         // SAFETY: the CPU has every feature the function is compiled for.
-        return unsafe { decode_avx2(rans, raw, planes, g, emit) };
+        return unsafe { decode_avx2(rans, raw, planes, g, start, emit) };
     }
-    decode_with::<Base>(rans, raw, planes, g, emit)
+    decode_with::<Base>(rans, raw, planes, g, start, emit)
 }
 
 /// Builds the priors file from summed `Model::stats` of a training set of `files` files and the
@@ -1849,6 +2456,7 @@ pub fn build_priors(totals: &[(usize, Vec<u64>)], lsw: &[i16], min: u64, count0:
         .chain([&fresh.emag].iter().map(|t| t.cdf.iter().map(|c| c.0).collect()))
         .chain(std::iter::once(Vec::new()))
         .chain([&fresh.esc, &fresh.dc].iter().map(|t| t.cdf.iter().map(|c| c.0).collect()))
+        .chain(std::iter::once(Vec::new()))
         .chain(std::iter::once(Vec::new()))
         .chain(std::iter::once(Vec::new()))
         .chain(std::iter::once(Vec::new()))
@@ -1943,5 +2551,36 @@ pub fn decode_bytes(c: &[u8], n: usize) -> Result<Vec<u8>, String> {
             Ok(out)
         }
         _ => Err("corrupt .komla file".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn luma_down_lanes() {
+        let mut r = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for n in 0..4000 {
+            let mut blocks = [[0i16; 64]; 4];
+            for x in blocks.iter_mut().flatten() {
+                let v = next();
+                *x = match n % 4 {
+                    0 => v as i16,
+                    1 => (v % 65) as i16 - 32,
+                    2 => [i16::MIN, i16::MAX, 0, -1][(v % 4) as usize],
+                    _ => (v as i16) >> 5,
+                };
+            }
+            let ql: [i16; 64] = std::array::from_fn(|_| [16383, 1 + (next() % 255) as i16, (next() % 16384) as i16][n % 3]);
+            let b = [&blocks[0], &blocks[1], &blocks[2], &blocks[3]];
+            for (fx, fy) in [(1, 1), (1, 2), (2, 1), (2, 2)] {
+                assert_eq!(super::simd::luma_down(b, fx, fy, &ql), super::luma_down_scalar(b, fx, fy, &ql), "{n} {fx}x{fy}");
+            }
+        }
     }
 }

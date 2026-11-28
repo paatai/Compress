@@ -208,7 +208,7 @@ fn fast_damaged_container_never_restores_wrong_bytes() {
 #[test]
 fn fast_synthetic_and_multi_stripe() {
     roundtrip_fast(&synthetic_jpeg(100, 61, 3), jpeg::MODE_FAST);
-    let big = synthetic_jpeg(4096, 2400, 9);
+    let big = synthetic_jpeg(4096, 9600, 9);
     let l = format::parse(&big, true).unwrap();
     assert!(jpeg::fast_stripes(&l.frame).len() > 4);
     roundtrip_fast(&big, jpeg::MODE_FAST);

@@ -548,7 +548,7 @@ pub fn decompress(b: &[u8], progress: &mut dyn FnMut(f32)) -> Result<Vec<u8>, St
 // are coded and decoded in parallel, straight from and into the coefficient planes.
 
 /// Stripes of the fast mode hold about this many blocks (all components).
-pub const FAST_STRIPE_BLOCKS: usize = 1 << 15;
+pub const FAST_STRIPE_BLOCKS: usize = 1 << 17;
 pub const MODE_FAST: u8 = 3;
 /// Stored with the fast byte model.
 pub const MODE_BYTES: u8 = 4;
@@ -614,15 +614,51 @@ impl StripeGeom {
             })
             .collect()
     }
-    fn encode(&self, rows: (usize, usize), planes: &mut [&mut [i16]]) -> (Vec<u8>, Vec<u8>) {
+    fn encode(&self, rows: (usize, usize), planes: &mut [&mut [i16]], start: Option<&fast::Model>) -> (Vec<u8>, Vec<u8>, fast::Model) {
         let ext = self.extents(rows.0);
         let held: Vec<usize> = self.v.iter().map(|&v| v * (rows.1 - rows.0)).collect();
-        fast::encode_stripe(planes, &fast::Geometry { rows: &held, width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 })
+        fast::encode_stripe(planes, &fast::Geometry { rows: &held, width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 }, start)
     }
-    fn decode(&self, rows: (usize, usize), rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]]) -> Result<(), String> {
+    fn decode(&self, rows: (usize, usize), rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], start: Option<&fast::Model>) -> Result<fast::Model, String> {
         let ext = self.extents(rows.0);
         let held: Vec<usize> = self.v.iter().map(|&v| v * (rows.1 - rows.0)).collect();
-        fast::decode_stripe(rans, raw, planes, &fast::Geometry { rows: &held, width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 }, |_, _| Ok(()))
+        fast::decode_stripe(rans, raw, planes, &fast::Geometry { rows: &held, width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 }, start, |_, _| Ok(()))
+    }
+}
+
+/// The model every fast-mode stripe after the first starts from: the first stripe's final one
+/// (see `fast::Model::into_seed`), handed from the thread that codes the first stripe to the
+/// others; `None` if the first stripe failed.
+struct Seed(std::sync::Mutex<Option<Option<std::sync::Arc<fast::Model>>>>, std::sync::Condvar);
+
+impl Seed {
+    fn new() -> Seed {
+        Seed(std::sync::Mutex::new(None), std::sync::Condvar::new())
+    }
+    /// The model stripe `k` starts from: none for the first; else the first stripe's, once it
+    /// is there.
+    fn start(&self, k: usize) -> Result<Option<std::sync::Arc<fast::Model>>, String> {
+        if k == 0 {
+            return Ok(None);
+        }
+        let mut g = self.0.lock().unwrap();
+        while g.is_none() {
+            g = self.1.wait(g).unwrap();
+        }
+        g.clone().flatten().map(Some).ok_or_else(damaged)
+    }
+    /// Takes the outcome of coding stripe `k` (its final model); only the first one's is kept.
+    fn offer(&self, k: usize, r: Result<fast::Model, String>) -> Result<(), String> {
+        if k > 0 {
+            return r.map(|_| ());
+        }
+        let (m, r) = match r {
+            Ok(m) => (Some(std::sync::Arc::new(m.into_seed())), Ok(())),
+            Err(e) => (None, Err(e)),
+        };
+        *self.0.lock().unwrap() = Some(m);
+        self.1.notify_all();
+        r
     }
 }
 
@@ -827,9 +863,13 @@ fn analyze_fast(data: &[u8], threads: usize) -> Result<(Vec<u8>, JpegInfo), Stri
         let sides = decs.iter_mut().map(|d| std::mem::take(&mut d.side)).collect();
         Ok(Stripe { k, bufs, sides })
     };
+    let seed = Seed::new();
     let encode = |st: &mut Stripe| {
         let mut planes: Vec<&mut [i16]> = st.bufs.iter_mut().map(|b| &mut b[..]).collect();
-        geom.encode(rows[st.k], &mut planes)
+        let start = seed.start(st.k).unwrap_or(None);
+        let (r, w, m) = geom.encode(rows[st.k], &mut planes, start.as_deref());
+        let _ = seed.offer(st.k, Ok(m));
+        (r, w)
     };
     let mut streams: Vec<Option<(Vec<u8>, Vec<u8>)>> = (0..rows.len()).map(|_| None).collect();
     let (side, (blob, (kind, tc))) = if threads > 1 {
@@ -930,7 +970,8 @@ fn stream_mt(
                 sc.spawn(move || loop {
                     let st = from_ver.lock().unwrap().recv();
                     let Ok(mut st) = st else { break };
-                    if !stop.load(Ordering::Relaxed) {
+                    // the first stripe is coded in any case: the others wait for its model
+                    if st.k == 0 || !stop.load(Ordering::Relaxed) {
                         let r = encode(&mut st);
                         *out[st.k].lock().unwrap() = Some(r);
                     }
@@ -1402,6 +1443,7 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
     if threads > 1 && rows.len() > 1 && !f.progressive {
         // sequential scans can be regenerated stripe by stripe from the stored encoder states,
         // so the threads that decode the stripes also turn them back into scan data
+        let seed = Seed::new();
         pipeline(
             rows.len(),
             threads,
@@ -1411,9 +1453,12 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
                 let mut bufs: Vec<Vec<i16>> = f.comps.iter().map(|comp| vec![0i16; (my1 - my0) * comp.v * comp.pw * 64]).collect();
                 {
                     let mut data = Vec::new();
-                    let split = read(k, &mut data)?;
                     let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
-                    geom.decode(rows[k], &data[..split], &data[split..], &mut planes)?;
+                    let r = seed.start(k).and_then(|start| {
+                        let split = read(k, &mut data)?;
+                        geom.decode(rows[k], &data[..split], &data[split..], &mut planes, start.as_deref())
+                    });
+                    seed.offer(k, r)?;
                 }
                 let mut outs = Vec::with_capacity(l.scans.len());
                 for (i, s) in l.scans.iter().enumerate() {
@@ -1474,6 +1519,7 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
             Ok(())
         };
         if threads > 1 && rows.len() > 1 {
+            let seed = Seed::new();
             pipeline(
                 rows.len(),
                 threads,
@@ -1482,9 +1528,12 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
                     let (my0, my1) = rows[k];
                     let mut bufs: Vec<Vec<i16>> = f.comps.iter().map(|comp| vec![0i16; (my1 - my0) * comp.v * comp.pw * 64]).collect();
                     let mut data = Vec::new();
-                    let split = read(k, &mut data)?;
                     let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
-                    geom.decode(rows[k], &data[..split], &data[split..], &mut planes)?;
+                    let r = seed.start(k).and_then(|start| {
+                        let split = read(k, &mut data)?;
+                        geom.decode(rows[k], &data[..split], &data[split..], &mut planes, start.as_deref())
+                    });
+                    seed.offer(k, r)?;
                     Ok(bufs)
                 },
                 |k, mut bufs| {
@@ -1500,6 +1549,7 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
             let held: Vec<usize> = geom.v.iter().map(|&v| 2 * v).collect();
             let mut ring: Vec<Vec<i16>> = f.comps.iter().zip(&held).map(|(comp, &h)| vec![0i16; h * comp.pw * 64]).collect();
             let mut data = Vec::new();
+            let mut seed = None;
             for k in 0..rows.len() {
                 let (my0, my1) = rows[k];
                 if k > 0 {
@@ -1511,7 +1561,10 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
                 let ext = geom.extents(my0);
                 let mut planes: Vec<&mut [i16]> = ring.iter_mut().map(|b| &mut b[..]).collect();
                 let g = fast::Geometry { rows: &held, width: &geom.width, v: &geom.v, ext: &ext, q: &geom.q, mcu_rows: my1 - my0 };
-                fast::decode_stripe(&data[..split], &data[split..], &mut planes, &g, |my, planes| feed(my0, my0 + my, my0 + my + 1, &held, planes, &mut *sink))?;
+                let m = fast::decode_stripe(&data[..split], &data[split..], &mut planes, &g, seed.as_ref(), |my, planes| feed(my0, my0 + my, my0 + my + 1, &held, planes, &mut *sink))?;
+                if k == 0 {
+                    seed = Some(m.into_seed());
+                }
             }
         }
         for ((e, s), p) in encs.into_iter().zip(&l.scans).zip(scans.iter_mut()) {
@@ -1634,7 +1687,7 @@ pub fn fast_train(files: &[Vec<u8>]) -> (Vec<(usize, Vec<u64>)>, Vec<i16>) {
             for (k, mut p) in split_rows(&l.frame, &rows, &mut coefs).into_iter().enumerate() {
                 let mut e = fast::Enc::<fast::Base>::new();
                 let held: Vec<usize> = geom.v.iter().map(|&v| v * (rows[k].1 - rows[k].0)).collect();
-                let Ok(m) = fast::code_stripe(&mut e, &mut p, &held, &geom.width, &geom.v, &geom.extents(rows[k].0), &geom.q, rows[k].1 - rows[k].0, |_, _| Ok(())) else { continue };
+                let Ok(m) = fast::code_stripe(&mut e, None, &mut p, &held, &geom.width, &geom.v, &geom.extents(rows[k].0), &geom.q, rows[k].1 - rows[k].0, |_, _| Ok(())) else { continue };
                 each(&m);
             }
         }
