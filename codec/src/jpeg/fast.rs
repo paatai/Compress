@@ -139,7 +139,7 @@ impl Table {
     #[inline(always)]
     fn sym<I: Io>(&mut self, io: &mut I, i: usize, n: usize, s: usize) -> usize {
         debug_assert!(i < self.cdf.len() && n == self.n);
-        if !I::DEC && !self.stats.is_empty() {
+        if I::STATS && !self.stats.is_empty() {
             self.stats[i * n + s] += 1;
         }
         // SAFETY: every index is computed from components that are each masked or clamped to
@@ -152,7 +152,7 @@ impl Table {
     #[inline(always)]
     fn sym2<I: Io>(&mut self, t2: &mut Table, io: &mut I, i: usize, j: usize, n: usize, s: usize) -> usize {
         debug_assert!(i < self.cdf.len() && j < t2.cdf.len() && n == self.n && n == t2.n);
-        if !I::DEC && !self.stats.is_empty() {
+        if I::STATS && !self.stats.is_empty() {
             self.stats[i * n + s] += 1;
             t2.stats[j * n + s] += 1;
         }
@@ -183,7 +183,7 @@ impl Table {
     #[allow(clippy::too_many_arguments)]
     fn sym3<I: Io>(&mut self, t2: &mut Table, t3: &mut Table, io: &mut I, m: &Cdf, i: usize, j: usize, k: usize, n: usize, s: usize) -> usize {
         debug_assert!(i < self.cdf.len() && j < t2.cdf.len() && k < t3.cdf.len() && n == self.n && n == t2.n && n == t3.n);
-        if !I::DEC && !self.stats.is_empty() {
+        if I::STATS && !self.stats.is_empty() {
             self.stats[i * n + s] += 1;
             t2.stats[j * n + s] += 1;
             t3.stats[k * n + s] += 1;
@@ -292,7 +292,7 @@ impl CountedBits {
     #[inline(always)]
     fn bit<I: Io>(&mut self, io: &mut I, i: usize, b: u32) -> u32 {
         debug_assert!(i < self.p.len());
-        if !I::DEC && !self.stats.is_empty() {
+        if I::STATS && !self.stats.is_empty() {
             self.stats[i * 2 + b as usize] += 1;
         }
         // SAFETY: every index is computed from components that are each masked or clamped to
@@ -311,7 +311,7 @@ impl CountedBits {
     #[allow(clippy::too_many_arguments)]
     fn bit2<I: Io>(&mut self, t2: &mut CountedBits, io: &mut I, i: usize, j: usize, w2: u32, b: u32) -> u32 {
         debug_assert!(i < self.p.len() && j < t2.p.len() && (w2 == 2 || w2 == 3));
-        if !I::DEC && !self.stats.is_empty() {
+        if I::STATS && !self.stats.is_empty() {
             self.stats[i * 2 + b as usize] += 1;
             t2.stats[j * 2 + b as usize] += 1;
         }
@@ -357,10 +357,7 @@ pub trait Lanes {
     /// (about as good as thirds, and quicker).
     fn mean3(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16];
     /// 1/4 of `a`, 5/8 of `b` and 1/8 of `c`: `mean2(b, mean2(a, mean2(b, c)))`.
-    #[inline(always)]
-    fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
-        Self::mean2(b, &Self::mean2(a, &Self::mean2(b, c)))
-    }
+    fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16];
     /// For each column u (`rows` false) the sums over the rows g of x[g][u] w[0][g][u] -
     /// y[g][u] w[2][g][u] and of x[g][u] w[1][g][u] - y[g][u] w[3][g][u], or the same for each
     /// row over the columns (`rows` true), wrapping (natural order).
@@ -396,6 +393,10 @@ impl Lanes for Base {
     fn mean3(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
         simd::mean3(a, b, c)
     }
+    #[inline(always)]
+    fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
+        simd::mean3b(a, b, c)
+    }
 }
 
 /// AVX2 (only used where the CPU has it, see `encode_stripe` and `decode_stripe`).
@@ -423,6 +424,11 @@ impl Lanes for Avx2 {
     fn mean3(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
         // SAFETY: as above.
         unsafe { avx2::mean3(a, b, c) }
+    }
+    #[inline(always)]
+    fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
+        // SAFETY: as above.
+        unsafe { avx2::mean3b(a, b, c) }
     }
     #[inline(always)]
     fn sums(x: &[i16; 64], y: &[i16; 64], w: [&[i32; 64]; 4], rows: bool) -> [[i32; 8]; 2] {
@@ -470,6 +476,21 @@ mod avx2 {
         let mut r = [0u16; 16];
         let ab = _mm256_avg_epu16(_mm256_loadu_si256(a.as_ptr() as *const __m256i), _mm256_loadu_si256(b.as_ptr() as *const __m256i));
         let m = _mm256_avg_epu16(ab, _mm256_avg_epu16(ab, _mm256_loadu_si256(c.as_ptr() as *const __m256i)));
+        _mm256_storeu_si256(r.as_mut_ptr() as *mut __m256i, m);
+        r
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
+        let mut r = [0u16; 16];
+        let vb = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
+        let bc = _mm256_avg_epu16(vb, _mm256_loadu_si256(c.as_ptr() as *const __m256i));
+        // (the outer two as (x | y) - ((x ^ y) >> 1), the same: nested in the average
+        // instruction's generic form they are widened to 32-bit lanes)
+        let va = _mm256_loadu_si256(a.as_ptr() as *const __m256i);
+        let abc = _mm256_sub_epi16(_mm256_or_si256(va, bc), _mm256_srli_epi16(_mm256_xor_si256(va, bc), 1));
+        let m = _mm256_sub_epi16(_mm256_or_si256(vb, abc), _mm256_srli_epi16(_mm256_xor_si256(vb, abc), 1));
         _mm256_storeu_si256(r.as_mut_ptr() as *mut __m256i, m);
         r
     }
@@ -582,6 +603,30 @@ mod simd {
             for j in 0..2 {
                 let ab = _mm_avg_epu16(_mm_loadu_si128(pa.add(j)), _mm_loadu_si128(pb.add(j)));
                 _mm_storeu_si128(pr.add(j), _mm_avg_epu16(ab, _mm_avg_epu16(ab, _mm_loadu_si128(pc.add(j)))));
+            }
+        }
+        r
+    }
+
+    /// `v` as it is, but opaque to the compiler, which would otherwise widen nested averages to
+    /// 32-bit lanes (several times the work).
+    #[inline(always)]
+    fn opaque(mut v: __m128i) -> __m128i {
+        // SAFETY: the instruction is empty.
+        unsafe { core::arch::asm!("/* {0} */", inout(xmm_reg) v, options(pure, nomem, nostack, preserves_flags)) };
+        v
+    }
+
+    #[inline(always)]
+    pub fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
+        let mut r = [0u16; 16];
+        // SAFETY: SSE2 is part of x86-64; all pointers address 16 u16.
+        unsafe {
+            let (pa, pb, pc, pr) = (a.as_ptr() as *const __m128i, b.as_ptr() as *const __m128i, c.as_ptr() as *const __m128i, r.as_mut_ptr() as *mut __m128i);
+            for j in 0..2 {
+                let vb = _mm_loadu_si128(pb.add(j));
+                let bc = opaque(_mm_avg_epu16(vb, _mm_loadu_si128(pc.add(j))));
+                _mm_storeu_si128(pr.add(j), _mm_avg_epu16(vb, opaque(_mm_avg_epu16(_mm_loadu_si128(pa.add(j)), bc))));
             }
         }
         r
@@ -709,6 +754,21 @@ mod simd {
     }
 
     #[inline(always)]
+    pub fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
+        let mut r = [0u16; 16];
+        // SAFETY: all pointers address 16 u16.
+        unsafe {
+            let (pa, pb, pc, pr) = (a.as_ptr() as *const v128, b.as_ptr() as *const v128, c.as_ptr() as *const v128, r.as_mut_ptr() as *mut v128);
+            for j in 0..2 {
+                let vb = v128_load(pb.add(j));
+                let bc = u16x8_avgr(vb, v128_load(pc.add(j)));
+                v128_store(pr.add(j), u16x8_avgr(vb, u16x8_avgr(v128_load(pa.add(j)), bc)));
+            }
+        }
+        r
+    }
+
+    #[inline(always)]
     pub fn luma_down(b: [&[i16; 64]; 4], fx: usize, fy: usize, ql: &[i16; 64]) -> [i16; 64] {
         // SAFETY: the blocks are eight 128-bit rows, the table rows four i32.
         unsafe {
@@ -818,6 +878,16 @@ mod simd {
     }
 
     #[inline(always)]
+    pub fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
+        let mut r = [0u16; 16];
+        for i in 0..16 {
+            let bc = (b[i] as u32 + c[i] as u32 + 1) >> 1;
+            r[i] = ((b[i] as u32 + ((a[i] as u32 + bc + 1) >> 1) + 1) >> 1) as u16;
+        }
+        r
+    }
+
+    #[inline(always)]
     pub fn luma_down(b: [&[i16; 64]; 4], fx: usize, fy: usize, ql: &[i16; 64]) -> [i16; 64] {
         super::luma_down_scalar(b, fx, fy, ql)
     }
@@ -827,6 +897,8 @@ mod simd {
 /// ignores them and returns what it decodes.
 pub trait Io {
     const DEC: bool;
+    /// Whether the model counts the coded symbols (training, see `Model::stats`).
+    const STATS: bool = false;
     type L: Lanes;
     /// Symbol `s` of an alphabet of `n` symbols; `cnt` counts the distribution's updates.
     fn sym(&mut self, c: &mut Cdf, cnt: &mut u8, n: usize, s: usize) -> usize;
@@ -846,7 +918,8 @@ pub trait Io {
 /// after the chunk's number of blocks).
 const CHUNK: usize = 1 << 18;
 
-pub struct Enc<L: Lanes = Base> {
+/// `S`: whether the model counts the symbols (see `Io::STATS`).
+pub struct Enc<L: Lanes = Base, const S: bool = false> {
     lanes: std::marker::PhantomData<L>,
     ops: Vec<u32>,
     /// blocks in the current chunk
@@ -857,40 +930,70 @@ pub struct Enc<L: Lanes = Base> {
     rbits: u32,
 }
 
-impl<L: Lanes> Default for Enc<L> {
+impl<L: Lanes, const S: bool> Default for Enc<L, S> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<L: Lanes> Enc<L> {
+/// ceil(2^64 / f) for the frequencies f = 1 to PROB_ONE, indexed by f - 1 (2^64 - 1 for f = 1):
+/// the quotient of a state (below 2^32) by f is the top half of its product with that, exactly
+/// (one less for f = 1), which is quicker than a division.
+fn reciprocals() -> &'static [u64; PROB_ONE as usize] {
+    static R: std::sync::OnceLock<Box<[u64; PROB_ONE as usize]>> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        let mut r = Box::new([u64::MAX; PROB_ONE as usize]);
+        for (f, m) in r.iter_mut().enumerate().skip(1) {
+            *m = u64::MAX / (f as u64 + 1) + 1;
+        }
+        r
+    })
+}
+
+impl<L: Lanes, const S: bool> Enc<L, S> {
     pub fn new() -> Self {
         Enc { lanes: std::marker::PhantomData, ops: Vec::with_capacity(CHUNK + 4096), blocks: 0, out: Vec::new(), raw: Vec::new(), racc: 0, rbits: 0 }
     }
     /// Codes the buffered symbols in reverse as one chunk: its number of blocks and two final
     /// states, then the renormalization words in the order the decoder reads them.
     fn flush_chunk(&mut self) {
+        // at most one renormalization word per symbol, then the two states and the count
+        let mut words = vec![0u16; self.ops.len() + 6];
+        let mut n = 0;
         let rcp = reciprocals();
-        let mut words: Vec<u16> = Vec::with_capacity(self.ops.len() / 2 + 8);
+        // (the renormalization without a branch: it is unpredictable)
+        let mut put = |st: u32, op: u32| {
+            let f = (op >> 16) as usize & (PROB_ONE as usize - 1);
+            let freq = f as u32 + 1;
+            let big = st >= freq << (32 - PROB_BITS);
+            words[n] = st as u16;
+            n += big as usize;
+            let st = std::hint::select_unpredictable(big, st >> 16, st);
+            // (the quotient is one short for frequency 1: made up for in the start)
+            let (q, start) = ((st as u128 * rcp[f] as u128 >> 64) as u32, (op & 0xFFFF) + (f == 0) as u32 * (PROB_ONE - 1));
+            // (q << PROB_BITS) + st % freq + start
+            st + start + q * (PROB_ONE - freq)
+        };
         // (symbol i goes with state i & 1; two at a time so that both states stay in registers)
         let (mut x0, mut x1) = (RANS_L, RANS_L);
         let ops = &self.ops;
         let mut i = ops.len();
         if i & 1 == 1 {
             i -= 1;
-            rans_put(&mut x0, ops[i], rcp, &mut words);
+            x0 = put(x0, ops[i]);
         }
-        while i >= 2 {
-            rans_put(&mut x1, ops[i - 1], rcp, &mut words);
-            rans_put(&mut x0, ops[i - 2], rcp, &mut words);
+        while i > 0 {
+            x1 = put(x1, ops[i - 1]);
+            x0 = put(x0, ops[i - 2]);
             i -= 2;
         }
-        for &s in &[x1, x0, self.blocks] {
-            words.push(s as u16);
-            words.push((s >> 16) as u16);
+        for s in [x1, x0, self.blocks] {
+            words[n] = s as u16;
+            words[n + 1] = (s >> 16) as u16;
+            n += 2;
         }
-        self.out.reserve(words.len() * 2);
-        for &w in words.iter().rev() {
+        self.out.reserve(n * 2);
+        for &w in words[..n].iter().rev() {
             self.out.extend_from_slice(&w.to_be_bytes());
         }
         self.ops.clear();
@@ -917,31 +1020,10 @@ impl<L: Lanes> Enc<L> {
     }
 }
 
-/// ceil(2^48 / f) for the frequencies f = 1 to PROB_ONE, indexed by f - 1: the quotient of a
-/// state (below 2^32) by f is the top bits of its product with that, exactly.
-fn reciprocals() -> &'static [u64] {
-    static R: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    R.get_or_init(|| (1..=PROB_ONE as u64).map(|f| ((1u64 << 48) + f - 1) / f).collect())
-}
-
-/// Encodes one buffered symbol (start | (freq - 1) << 16) into state `x`.
-#[inline(always)]
-fn rans_put(x: &mut u32, op: u32, rcp: &[u64], words: &mut Vec<u16>) {
-    let start = op & 0xFFFF;
-    let f = (op >> 16) as usize & (PROB_ONE as usize - 1);
-    let freq = f as u32 + 1;
-    if *x >= (freq << (32 - PROB_BITS)) {
-        words.push(*x as u16);
-        *x >>= 16;
-    }
-    let q = ((*x as u128 * rcp[f] as u128) >> 48) as u32;
-    // (q << PROB_BITS) + x % freq + start
-    *x = x.wrapping_add(q.wrapping_mul(PROB_ONE - freq)).wrapping_add(start);
-}
-
-impl<L: Lanes> Io for Enc<L> {
+impl<L: Lanes, const S: bool> Io for Enc<L, S> {
     type L = L;
     const DEC: bool = false;
+    const STATS: bool = S;
     #[inline(always)]
     fn sym(&mut self, c: &mut Cdf, cnt: &mut u8, n: usize, s: usize) -> usize {
         debug_assert!(s < n);
@@ -2230,13 +2312,15 @@ impl Model {
             let xt = token(xm).min(3);
             let (r3, e2) = if cross.is_some() { (xt, xt) } else { (r4, eb) };
             let (m2, m3) = (((cd * NTOK + tp) * NAQ + adj) * 4 + r4, ((cd * NTOK + tp) * 12 + tn) * 4 + r3);
-            let mean = self.emag.mean3::<I::L>(&self.emag2, &self.emag3, m1, m2, m3);
+            // (the decoder before the zero flag, so that the loads overlap it)
+            let early = if I::DEC { Some(self.emag.mean3::<I::L>(&self.emag2, &self.emag3, m1, m2, m3)) } else { None };
             // also by position, the remaining count, the block's count and the recent error of
             // the extrapolation (for chroma the other component's magnitude in its place; 3/4 of
             // the mean)
             let z2 = ((cd * 8 + rem.min(8) - 1) * 8 + nzq) * 4 + e2;
             // (as many nonzero ones left as positions: all nonzero)
             if rem == 8 - i || self.ezero.bit2(&mut self.ezero2, io, zctx, z2, 3, (v != 0) as u32) != 0 {
+                let mean = early.unwrap_or_else(|| self.emag.mean3::<I::L>(&self.emag2, &self.emag3, m1, m2, m3));
                 let t = 1 + self.emag.sym3(&mut self.emag2, &mut self.emag3, io, &mean, m1, m2, m3, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
                 // the sign follows the prediction more reliably when the magnitudes agree
                 let dt = (t as i32 - tp as i32).clamp(-3, 3) as usize + 3;
@@ -2398,10 +2482,12 @@ impl Model {
                 if rem == 49 - i || self.zero.bit(io, zrow + i * NEQ + nb, (v != 0) as u32) != 0 {
                     let (pv, pu) = (pos / 8, pos % 8);
                     let (c, r) = (colv[pu], rowv[pv]);
-                    let (x8, x9) = cross.as_ref().map_or((0, 0), |cr| cr.inputs(pos, pr.q[pos]));
-                    let f = [c[0], c[1], c[2], c[3], r[0], r[1], r[2], r[3], x8, x9];
+                    let f = [c[0], c[1], c[2], c[3], r[0], r[1], r[2], r[3]];
+                    // (the references' inputs, chroma only: luma's are 0)
+                    let xf = cross.as_ref().map(|cr| cr.inputs(pos, pr.q[pos]));
                     let w = &pr.w[i];
-                    let pw = (0..NLSW).fold(0i64, |s, k| s.wrapping_add(w[k] as i64 * f[k] as i64));
+                    let pw = (0..8).fold(0i64, |s, k| s.wrapping_add(w[k] as i64 * f[k] as i64));
+                    let pw = xf.map_or(pw, |(x8, x9)| pw.wrapping_add(w[8] as i64 * x8 as i64).wrapping_add(w[9] as i64 * x9 as i64));
                     let p = pw >> 16;
                     let pa = p.unsigned_abs().min(1 << 20) as u32;
                     // the magnitude by the estimate with the predicted magnitude added
@@ -2410,7 +2496,7 @@ impl Model {
                     // also by position, that bucket and the block's count (5/8 of the mean), and
                     // by position, the remaining count and (chroma) the other component's scaled
                     // coefficient (1/8)
-                    let xt = cross.as_ref().map_or(0, |c| 1 + token(((c.r[pos] as i32).unsigned_abs().min(4095) * c.rho[0] * 2 + 128) >> 8).min(3));
+                    let xt = cross.as_ref().map_or(0, |c| 1 + (((c.r[pos] as i32).unsigned_abs().min(4095) * c.rho[0] * 2 + 128) >> 8).min(3) as usize);
                     let (m2, m3) = (((cls * 49 + i) * NEQ + nm) * 8 + nzq, ((xt * 2 + cls) * 49 + i) * NREM + REMB[rem & 63] as usize);
                     let mean = self.mag.mean3b::<I::L>(&self.mag2, &self.mag3, m1, m2, m3);
                     let t = 1 + self.mag.sym3(&mut self.mag2, &mut self.mag3, io, &mean, m1, m2, m3, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
@@ -2432,12 +2518,21 @@ impl Model {
                     let mu = std::hint::select_unpredictable(e < 0, -pr.mu[i], pr.mu[i]);
                     let d = std::hint::select_unpredictable(e.unsigned_abs() >= 1 << 19, mu, 0);
                     let w = &mut pr.w[i];
-                    for k in 0..NLSW {
-                        // d with the sign of the input, 0 for a zero input
-                        let m = f[k] >> 31;
-                        w[k] = w[k].wrapping_add(((d ^ m) - m) & -((f[k] != 0) as i32));
+                    // d with the sign of the input, 0 for a zero input
+                    let step = |w: &mut i32, f: i32| {
+                        let m = f >> 31;
+                        *w = w.wrapping_add(((d ^ m) - m) & -((f != 0) as i32));
+                    };
+                    for k in 0..8 {
+                        step(&mut w[k], f[k]);
                     }
-                    if !I::DEC && !self.ls_acc.is_empty() {
+                    if let Some((x8, x9)) = xf {
+                        step(&mut w[8], x8);
+                        step(&mut w[9], x9);
+                    }
+                    if I::STATS && !self.ls_acc.is_empty() {
+                        let (x8, x9) = xf.unwrap_or((0, 0));
+                        let f = [f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], x8, x9];
                         self.ls_add(cls, i, &f.map(|x| x as f64), dq as f64);
                     }
                     let (k, j) = (2 + (pv & 1), 2 + (pu & 1));

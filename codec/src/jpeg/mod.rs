@@ -1560,47 +1560,59 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
     };
     if threads > 1 && rows.len() > 1 && !f.progressive {
         // sequential scans can be regenerated stripe by stripe from the stored encoder states,
-        // so the threads that decode the stripes also turn them back into scan data
+        // so the threads that decode the stripes also turn them back into scan data, every MCU
+        // row at once from a ring of two per component as with one thread (whole stripes would
+        // be large buffers to fault in and fill)
         let seed = Seed::new();
+        let held: Vec<usize> = geom.v.iter().map(|&v| 2 * v).collect();
         pipeline(
             rows.len(),
             threads,
             threads + 2,
             |k| -> Result<Vec<Vec<u8>>, String> {
                 let (my0, my1) = rows[k];
-                let mut bufs: Vec<Vec<i16>> = f.comps.iter().map(|comp| vec![0i16; (my1 - my0) * comp.v * comp.pw * 64]).collect();
-                {
-                    let mut data = Vec::new();
-                    let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
-                    let r = seed.start(k).and_then(|start| {
-                        let split = read(k, &mut data)?;
-                        geom.decode(rows[k], &data[..split], &data[split..], &mut planes, start.as_deref())
-                    });
-                    seed.offer(k, r)?;
-                }
-                let mut outs = Vec::with_capacity(l.scans.len());
-                for (i, s) in l.scans.iter().enumerate() {
-                    let start = if k > 0 { cps[i][k - 1].bytes } else { 0 };
-                    let end = if k + 1 < rows.len() { cps[i][k].bytes } else { lens[i] };
-                    let mut ch = huff::Choices::replay(sides[i].clone());
-                    let mut out = Vec::with_capacity(end.saturating_sub(start) as usize + 64);
-                    let mut e = huff::SeqScan::new(s, f, &mut ch, &mut out)?;
+                let span = |i: usize| (if k > 0 { cps[i][k - 1].bytes } else { 0 }, if k + 1 < rows.len() { cps[i][k].bytes } else { lens[i] });
+                let mut chs: Vec<huff::Choices> = sides.iter().map(|s| huff::Choices::replay(s.clone())).collect();
+                let mut outs: Vec<Vec<u8>> = (0..l.scans.len()).map(&span).map(|(start, end)| Vec::with_capacity(end.saturating_sub(start) as usize + 64)).collect();
+                let mut encs = Vec::with_capacity(l.scans.len());
+                for (i, ((s, ch), out)) in l.scans.iter().zip(chs.iter_mut()).zip(outs.iter_mut()).enumerate() {
+                    let mut e = huff::SeqScan::new(s, f, ch, out)?;
                     if k > 0 {
                         e.resume(f, s, my0, &cps[i][k - 1]);
                     }
-                    e.rows(f, s, my0, my1, |ci, bx, by| {
-                        let comp = &f.comps[ci];
-                        bufs[ci][((by - my0 * comp.v) * comp.pw + bx) * 64..][..64].try_into().unwrap()
-                    })?;
+                    encs.push(e);
+                }
+                let mut ring: Vec<Vec<i16>> = f.comps.iter().zip(&held).map(|(comp, &h)| vec![0i16; h * comp.pw * 64]).collect();
+                let mut data = Vec::new();
+                let r = seed.start(k).and_then(|start| {
+                    let split = read(k, &mut data)?;
+                    let ext = geom.extents(my0);
+                    let mut planes: Vec<&mut [i16]> = ring.iter_mut().map(|b| &mut b[..]).collect();
+                    let g = fast::Geometry { rows: &held, width: &geom.width, v: &geom.v, ext: &ext, q: &geom.q, mcu_rows: my1 - my0 };
+                    fast::decode_stripe(&data[..split], &data[split..], &mut planes, &g, start.as_deref(), |my, planes| {
+                        for (e, s) in encs.iter_mut().zip(&l.scans) {
+                            e.rows(f, s, my0 + my, my0 + my + 1, |ci, bx, by| {
+                                let comp = &f.comps[ci];
+                                let slot = (by - my0 * comp.v) % held[ci];
+                                planes[ci][(slot * comp.pw + bx) * 64..][..64].try_into().unwrap()
+                            })?;
+                        }
+                        Ok(())
+                    })
+                });
+                seed.offer(k, r)?;
+                for e in encs {
                     if k + 1 == rows.len() {
                         e.finish();
                     } else {
                         drop(e);
                     }
+                }
+                for (i, out) in outs.iter().enumerate() {
+                    let (start, end) = span(i);
                     if Some(out.len() as u64) != end.checked_sub(start) {
                         return Err(damaged());
                     }
-                    outs.push(out);
                 }
                 Ok(outs)
             },
@@ -1644,7 +1656,14 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
                 threads + 2,
                 |k| {
                     let (my0, my1) = rows[k];
-                    let mut bufs: Vec<Vec<i16>> = f.comps.iter().map(|comp| vec![0i16; (my1 - my0) * comp.v * comp.pw * 64]).collect();
+                    // zeros written rather than mapped by the allocator: the decoder reads blocks
+                    // before it writes them, and a page read first faults again when written,
+                    // with a TLB flush on every core of the process
+                    let mut bufs: Vec<Vec<i16>> = f.comps.iter().map(|comp| {
+                        let mut b = Vec::new();
+                        b.resize((my1 - my0) * comp.v * comp.pw * 64, 0i16);
+                        b
+                    }).collect();
                     let mut data = Vec::new();
                     let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
                     let r = seed.start(k).and_then(|start| {
@@ -1803,7 +1822,7 @@ pub fn fast_train(files: &[Vec<u8>]) -> (Vec<(usize, Vec<u64>)>, Vec<i16>) {
             let rows = fast_stripes(&l.frame);
             let geom = StripeGeom::new(&l);
             for (k, mut p) in split_rows(&l.frame, &rows, &mut coefs).into_iter().enumerate() {
-                let mut e = fast::Enc::<fast::Base>::new();
+                let mut e = fast::Enc::<fast::Base, true>::new();
                 let held: Vec<usize> = geom.v.iter().map(|&v| v * (rows[k].1 - rows[k].0)).collect();
                 let Ok(m) = fast::code_stripe(&mut e, None, &mut p, &held, &geom.width, &geom.v, &geom.extents(rows[k].0), &geom.q, rows[k].1 - rows[k].0, |_, _| Ok(())) else { continue };
                 each(&m);
