@@ -166,22 +166,45 @@ impl Table {
         c2.update::<I::L>(k2, s, n);
         s
     }
-    /// The mean of distribution `i`, distribution `j` of `t2` and `k` of `t3` (see `Lanes::mean3`).
+    /// As `sym2` with the mean of the two by the weight of group `g` of `w`, which adapts too.
     #[inline(always)]
-    fn mean3<L: Lanes>(&self, t2: &Table, t3: &Table, i: usize, j: usize, k: usize) -> Cdf {
+    #[allow(clippy::too_many_arguments)]
+    fn sym2w<I: Io>(&mut self, t2: &mut Table, w: &mut Walk, g: usize, io: &mut I, i: usize, j: usize, n: usize, s: usize) -> usize {
+        debug_assert!(i < self.cdf.len() && j < t2.cdf.len() && n == self.n && n == t2.n);
+        if I::STATS && !self.stats.is_empty() {
+            self.stats[i * n + s] += 1;
+            t2.stats[j * n + s] += 1;
+        }
+        // SAFETY: as in `sym`.
+        let (c1, k1, c2, k2) = unsafe { (self.cdf.get_unchecked_mut(i), self.cnt.get_unchecked_mut(i), t2.cdf.get_unchecked_mut(j), t2.cnt.get_unchecked_mut(j)) };
+        let [m, d] = I::L::mix(&c1.0, &c2.0, w.get(g));
+        let m = Cdf(m);
+        let s = io.code(&m, s);
+        w.learn(g, &m, &d, s, PAIR_SHIFT);
+        c1.update::<I::L>(k1, s, n);
+        c2.update::<I::L>(k2, s, n);
+        s
+    }
+    /// The mean of distribution `i` and of the mean of distribution `j` of `t2` and `k` of `t3`
+    /// by weight `w`, and the difference of the latter two (see `Lanes::mix`).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn mean_mix<L: Lanes>(&self, t2: &Table, t3: &Table, i: usize, j: usize, k: usize, w: u16) -> (Cdf, [u16; 16]) {
         debug_assert!(i < self.cdf.len() && j < t2.cdf.len() && k < t3.cdf.len());
         // SAFETY: as in `sym`.
-        unsafe { Cdf(L::mean3(&self.cdf.get_unchecked(i).0, &t2.cdf.get_unchecked(j).0, &t3.cdf.get_unchecked(k).0)) }
+        let (a, [m, d]) = unsafe { (&self.cdf.get_unchecked(i).0, L::mix(&t2.cdf.get_unchecked(j).0, &t3.cdf.get_unchecked(k).0, w)) };
+        (Cdf(L::mean2(a, &m)), d)
     }
-    /// The same with most of the weight on distribution `j` of `t2` (see `Lanes::mean3b`).
+    /// The mean of the three with most of the weight on distribution `j` of `t2` (see
+    /// `Lanes::mean3b`).
     #[inline(always)]
     fn mean3b<L: Lanes>(&self, t2: &Table, t3: &Table, i: usize, j: usize, k: usize) -> Cdf {
         debug_assert!(i < self.cdf.len() && j < t2.cdf.len() && k < t3.cdf.len());
         // SAFETY: as in `sym`.
         unsafe { Cdf(L::mean3b(&self.cdf.get_unchecked(i).0, &t2.cdf.get_unchecked(j).0, &t3.cdf.get_unchecked(k).0)) }
     }
-    /// As `sym2` with three distributions, coding with their mean `m` (`mean3` or `mean3b`, which
-    /// may be computed before it is known whether the symbol is coded, so that it is ready).
+    /// As `sym2` with three distributions, coding with their mean `m` (`mean_mix` or `mean3b`,
+    /// which may be computed before it is known whether the symbol is coded, so that it is ready).
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn sym3<I: Io>(&mut self, t2: &mut Table, t3: &mut Table, io: &mut I, m: &Cdf, i: usize, j: usize, k: usize, n: usize, s: usize) -> usize {
@@ -218,6 +241,42 @@ impl Table {
         Some(())
     }
 }
+
+/// The weight (out of 2^15) of the second of two distributions in their mean (`Lanes::mix`) per
+/// group of contexts, adapted from the coded symbols: a symbol coded with frequency p in the mean
+/// and f, t in the two costs about (t - f) / p bits less per unit of weight, so each weight
+/// follows that gradient (2^-shift of it, dividing by p rounded up to a power of two).
+#[derive(Clone)]
+pub struct Walk {
+    w: Vec<i32>,
+}
+
+impl Walk {
+    fn new(groups: usize) -> Self {
+        Walk { w: vec![1 << 14; groups] }
+    }
+    /// The weight of group `g` (an index bounded by construction).
+    #[inline(always)]
+    fn get(&self, g: usize) -> u16 {
+        debug_assert!(g < self.w.len());
+        // SAFETY: see above.
+        unsafe { *self.w.get_unchecked(g) as u16 }
+    }
+    /// Adapts group `g` to symbol `s` coded with mean `m` from a `Lanes::mix` of distributions
+    /// that differ by `d`.
+    #[inline(always)]
+    fn learn(&mut self, g: usize, m: &Cdf, d: &[u16; 16], s: usize, shift: u32) {
+        debug_assert!(g < self.w.len());
+        // (from 1 to 2^15: every symbol has a frequency of at least 1)
+        let p = m.interval(s).1;
+        let dt = d[(s + 1) & 15] as i16 as i32 - d[s & 15] as i16 as i32;
+        // SAFETY: see `get`.
+        let w = unsafe { self.w.get_unchecked_mut(g) };
+        *w = (*w + ((dt << (p.leading_zeros() - 16)) >> shift)).clamp(0, (1 << 15) - 1);
+    }
+}
+const PAIR_SHIFT: u32 = 8;
+const EMAG_SHIFT: u32 = 7;
 
 /// Adaptive binary probability: P(0) out of 2^15, within [1, 2^15 - 1] (see `adapt_bit`).
 pub type Bit = u16;
@@ -356,11 +415,11 @@ pub trait Lanes {
     fn find(c: &[u16; 16], slot: u16) -> usize;
     fn update(c: &mut [u16; 16], j: usize, lo: &[u16; 16], hi: &[u16; 16], shift: u32);
     fn mean2(a: &[u16; 16], b: &[u16; 16]) -> [u16; 16];
-    /// 3/8 of `a` and of `b` and 1/4 of `c`: `mean2(ab, mean2(ab, c))` with `ab = mean2(a, b)`
-    /// (about as good as thirds, and quicker).
-    fn mean3(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16];
     /// 1/4 of `a`, 5/8 of `b` and 1/8 of `c`: `mean2(b, mean2(a, mean2(b, c)))`.
     fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16];
+    /// `a` + (`b` - `a`) w / 2^15 for w below 2^15, rounded (half up: every symbol keeps a
+    /// frequency of at least 1), and `b` - `a` (wrapping).
+    fn mix(a: &[u16; 16], b: &[u16; 16], w: u16) -> [[u16; 16]; 2];
     /// For each column u (`rows` false) the sums over the rows g of x[g][u] w[0][g][u] -
     /// y[g][u] w[2][g][u] and of x[g][u] w[1][g][u] - y[g][u] w[3][g][u], or the same for each
     /// row over the columns (`rows` true), wrapping (natural order).
@@ -393,12 +452,12 @@ impl Lanes for Base {
         simd::mean2(a, b)
     }
     #[inline(always)]
-    fn mean3(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
-        simd::mean3(a, b, c)
-    }
-    #[inline(always)]
     fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
         simd::mean3b(a, b, c)
+    }
+    #[inline(always)]
+    fn mix(a: &[u16; 16], b: &[u16; 16], w: u16) -> [[u16; 16]; 2] {
+        simd::mix(a, b, w)
     }
 }
 
@@ -424,14 +483,14 @@ impl Lanes for Avx2 {
         unsafe { avx2::mean2(a, b) }
     }
     #[inline(always)]
-    fn mean3(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
-        // SAFETY: as above.
-        unsafe { avx2::mean3(a, b, c) }
-    }
-    #[inline(always)]
     fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
         // SAFETY: as above.
         unsafe { avx2::mean3b(a, b, c) }
+    }
+    #[inline(always)]
+    fn mix(a: &[u16; 16], b: &[u16; 16], w: u16) -> [[u16; 16]; 2] {
+        // SAFETY: as above.
+        unsafe { avx2::mix(a, b, w) }
     }
     #[inline(always)]
     fn sums(x: &[i16; 64], y: &[i16; 64], w: [&[i32; 64]; 4], rows: bool) -> [[i32; 8]; 2] {
@@ -475,16 +534,6 @@ mod avx2 {
 
     #[target_feature(enable = "avx2")]
     #[inline]
-    pub unsafe fn mean3(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
-        let mut r = [0u16; 16];
-        let ab = _mm256_avg_epu16(_mm256_loadu_si256(a.as_ptr() as *const __m256i), _mm256_loadu_si256(b.as_ptr() as *const __m256i));
-        let m = _mm256_avg_epu16(ab, _mm256_avg_epu16(ab, _mm256_loadu_si256(c.as_ptr() as *const __m256i)));
-        _mm256_storeu_si256(r.as_mut_ptr() as *mut __m256i, m);
-        r
-    }
-
-    #[target_feature(enable = "avx2")]
-    #[inline]
     pub unsafe fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
         let mut r = [0u16; 16];
         let vb = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
@@ -495,6 +544,17 @@ mod avx2 {
         let abc = _mm256_sub_epi16(_mm256_or_si256(va, bc), _mm256_srli_epi16(_mm256_xor_si256(va, bc), 1));
         let m = _mm256_sub_epi16(_mm256_or_si256(vb, abc), _mm256_srli_epi16(_mm256_xor_si256(vb, abc), 1));
         _mm256_storeu_si256(r.as_mut_ptr() as *mut __m256i, m);
+        r
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn mix(a: &[u16; 16], b: &[u16; 16], w: u16) -> [[u16; 16]; 2] {
+        let mut r = [[0u16; 16]; 2];
+        let va = _mm256_loadu_si256(a.as_ptr() as *const __m256i);
+        let d = _mm256_sub_epi16(_mm256_loadu_si256(b.as_ptr() as *const __m256i), va);
+        _mm256_storeu_si256(r[0].as_mut_ptr() as *mut __m256i, _mm256_add_epi16(va, _mm256_mulhrs_epi16(d, _mm256_set1_epi16(w as i16))));
+        _mm256_storeu_si256(r[1].as_mut_ptr() as *mut __m256i, d);
         r
     }
 
@@ -597,20 +657,6 @@ mod simd {
         r
     }
 
-    #[inline(always)]
-    pub fn mean3(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
-        let mut r = [0u16; 16];
-        // SAFETY: SSE2 is part of x86-64; all pointers address 16 u16.
-        unsafe {
-            let (pa, pb, pc, pr) = (a.as_ptr() as *const __m128i, b.as_ptr() as *const __m128i, c.as_ptr() as *const __m128i, r.as_mut_ptr() as *mut __m128i);
-            for j in 0..2 {
-                let ab = _mm_avg_epu16(_mm_loadu_si128(pa.add(j)), _mm_loadu_si128(pb.add(j)));
-                _mm_storeu_si128(pr.add(j), _mm_avg_epu16(ab, _mm_avg_epu16(ab, _mm_loadu_si128(pc.add(j)))));
-            }
-        }
-        r
-    }
-
     /// `v` as it is, but opaque to the compiler, which would otherwise widen nested averages to
     /// 32-bit lanes (several times the work).
     #[inline(always)]
@@ -630,6 +676,25 @@ mod simd {
                 let vb = _mm_loadu_si128(pb.add(j));
                 let bc = opaque(_mm_avg_epu16(vb, _mm_loadu_si128(pc.add(j))));
                 _mm_storeu_si128(pr.add(j), _mm_avg_epu16(vb, opaque(_mm_avg_epu16(_mm_loadu_si128(pa.add(j)), bc))));
+            }
+        }
+        r
+    }
+
+    #[inline(always)]
+    pub fn mix(a: &[u16; 16], b: &[u16; 16], w: u16) -> [[u16; 16]; 2] {
+        let mut r = [[0u16; 16]; 2];
+        // SAFETY: SSE2 is part of x86-64; all pointers address 16 u16.
+        unsafe {
+            let (pa, pb, pr, pd) = (a.as_ptr() as *const __m128i, b.as_ptr() as *const __m128i, r[0].as_mut_ptr() as *mut __m128i, r[1].as_mut_ptr() as *mut __m128i);
+            let vw = _mm_set1_epi16(w as i16);
+            for j in 0..2 {
+                let va = _mm_loadu_si128(pa.add(j));
+                let d = _mm_sub_epi16(_mm_loadu_si128(pb.add(j)), va);
+                // ((b - a) w + 2^14) >> 15 from the high and the low halves of the products
+                let lo = _mm_srli_epi16(_mm_add_epi16(_mm_srli_epi16(_mm_mullo_epi16(d, vw), 14), _mm_set1_epi16(1)), 1);
+                _mm_storeu_si128(pr.add(j), _mm_add_epi16(va, _mm_add_epi16(_mm_slli_epi16(_mm_mulhi_epi16(d, vw), 1), lo)));
+                _mm_storeu_si128(pd.add(j), d);
             }
         }
         r
@@ -743,20 +808,6 @@ mod simd {
     }
 
     #[inline(always)]
-    pub fn mean3(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
-        let mut r = [0u16; 16];
-        // SAFETY: all pointers address 16 u16.
-        unsafe {
-            let (pa, pb, pc, pr) = (a.as_ptr() as *const v128, b.as_ptr() as *const v128, c.as_ptr() as *const v128, r.as_mut_ptr() as *mut v128);
-            for j in 0..2 {
-                let ab = u16x8_avgr(v128_load(pa.add(j)), v128_load(pb.add(j)));
-                v128_store(pr.add(j), u16x8_avgr(ab, u16x8_avgr(ab, v128_load(pc.add(j)))));
-            }
-        }
-        r
-    }
-
-    #[inline(always)]
     pub fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
         let mut r = [0u16; 16];
         // SAFETY: all pointers address 16 u16.
@@ -766,6 +817,23 @@ mod simd {
                 let vb = v128_load(pb.add(j));
                 let bc = u16x8_avgr(vb, v128_load(pc.add(j)));
                 v128_store(pr.add(j), u16x8_avgr(vb, u16x8_avgr(v128_load(pa.add(j)), bc)));
+            }
+        }
+        r
+    }
+
+    #[inline(always)]
+    pub fn mix(a: &[u16; 16], b: &[u16; 16], w: u16) -> [[u16; 16]; 2] {
+        let mut r = [[0u16; 16]; 2];
+        // SAFETY: all pointers address 16 u16.
+        unsafe {
+            let (pa, pb, pr, pd) = (a.as_ptr() as *const v128, b.as_ptr() as *const v128, r[0].as_mut_ptr() as *mut v128, r[1].as_mut_ptr() as *mut v128);
+            let vw = i16x8_splat(w as i16);
+            for j in 0..2 {
+                let va = v128_load(pa.add(j));
+                let d = i16x8_sub(v128_load(pb.add(j)), va);
+                v128_store(pr.add(j), i16x8_add(va, i16x8_q15mulr_sat(d, vw)));
+                v128_store(pd.add(j), d);
             }
         }
         r
@@ -871,21 +939,21 @@ mod simd {
     }
 
     #[inline(always)]
-    pub fn mean3(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
-        let mut r = [0u16; 16];
-        for i in 0..16 {
-            let ab = (a[i] as u32 + b[i] as u32 + 1) >> 1;
-            r[i] = ((ab + ((ab + c[i] as u32 + 1) >> 1) + 1) >> 1) as u16;
-        }
-        r
-    }
-
-    #[inline(always)]
     pub fn mean3b(a: &[u16; 16], b: &[u16; 16], c: &[u16; 16]) -> [u16; 16] {
         let mut r = [0u16; 16];
         for i in 0..16 {
             let bc = (b[i] as u32 + c[i] as u32 + 1) >> 1;
             r[i] = ((b[i] as u32 + ((a[i] as u32 + bc + 1) >> 1) + 1) >> 1) as u16;
+        }
+        r
+    }
+
+    #[inline(always)]
+    pub fn mix(a: &[u16; 16], b: &[u16; 16], w: u16) -> [[u16; 16]; 2] {
+        let mut r = [[0u16; 16]; 2];
+        for i in 0..16 {
+            r[1][i] = b[i].wrapping_sub(a[i]);
+            r[0][i] = a[i].wrapping_add(((r[1][i] as i16 as i32 * w as i32 + (1 << 14)) >> 15) as u16);
         }
         r
     }
@@ -1993,6 +2061,11 @@ pub struct Model {
     nze2: Table,
     emant2: CountedBits,
     imant2: CountedBits,
+    /// the weights of the means of the edge magnitudes (by class, direction, position and the
+    /// extrapolation's recent error) and of the counts (by class)
+    emag_w: Walk,
+    nz_lo_w: Walk,
+    nze_w: Walk,
 }
 
 impl Default for Model {
@@ -2044,6 +2117,9 @@ impl Model {
             nze2: Table::new(2 * 2 * 8 * 8 * 8, 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
             emant2: CountedBits::new(2 * EMANT2_2),
             imant2: CountedBits::new(2 * IMANT2_2),
+            emag_w: Walk::new(2 * 2 * 7 * 4),
+            nz_lo_w: Walk::new(2),
+            nze_w: Walk::new(2),
         };
         if training() {
             let w = TRAIN_LSW.lock().unwrap();
@@ -2254,7 +2330,7 @@ impl Model {
         // coefficients in the interior row (column) next to the edge and the number of positions
         // predicted nonzero
         let adjc = (1..8).filter(|&i| blk[i * step + across] != 0).count();
-        let n = self.nze.sym2(&mut self.nze2, io, ctx, (((cls * 2 + dir) * 8 + nnz) * 8 + adjc) * 8 + pc, 8, actual);
+        let n = self.nze.sym2w(&mut self.nze2, &mut self.nze_w, cls, io, ctx, (((cls * 2 + dir) * 8 + nnz) * 8 + adjc) * 8 + pc, 8, actual);
         let mut rem = n;
         let mut i = 1;
         // magnitude of the previous edge coefficient, by token (DC is coded later)
@@ -2298,15 +2374,19 @@ impl Model {
             let (r3, e2) = if cross.is_some() { (xt, xt) } else { (r4, eb) };
             let (m2, m3) = (((cd * NTOK + tp) * NAQ + adj) * 4 + r4, ((cd * NTOK + tp) * 12 + tn) * 4 + r3);
             // (the decoder before the zero flag, so that the loads overlap it)
-            let early = if I::DEC { Some(self.emag.mean3::<I::L>(&self.emag2, &self.emag3, m1, m2, m3)) } else { None };
+            let wg = cd * 4 + eb;
+            let wk = self.emag_w.get(wg);
+            let early = if I::DEC { Some(self.emag.mean_mix::<I::L>(&self.emag2, &self.emag3, m1, m2, m3, wk)) } else { None };
             // also by position, the remaining count, the block's count and the recent error of
             // the extrapolation (for chroma the other component's magnitude in its place; 3/4 of
             // the mean)
             let z2 = ((cd * 8 + rem.min(8) - 1) * 8 + nzq) * 4 + e2;
             // (as many nonzero ones left as positions: all nonzero)
             if rem == 8 - i || self.ezero.bit2(&mut self.ezero2, io, zctx, z2, 3, (v != 0) as u32) != 0 {
-                let mean = early.unwrap_or_else(|| self.emag.mean3::<I::L>(&self.emag2, &self.emag3, m1, m2, m3));
-                let t = 1 + self.emag.sym3(&mut self.emag2, &mut self.emag3, io, &mean, m1, m2, m3, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
+                let (mean, d) = early.unwrap_or_else(|| self.emag.mean_mix::<I::L>(&self.emag2, &self.emag3, m1, m2, m3, wk));
+                let t = self.emag.sym3(&mut self.emag2, &mut self.emag3, io, &mean, m1, m2, m3, NTOK - 1, if I::DEC { 0 } else { token(v.unsigned_abs()) - 1 });
+                self.emag_w.learn(wg, &mean, &d, t, EMAG_SHIFT);
+                let t = 1 + t;
                 // the sign follows the prediction more reliably when the magnitudes agree
                 let dt = (t as i32 - tp as i32).clamp(-3, 3) as usize + 3;
                 // whether the extrapolations without and with the full gradient agree in sign
@@ -2404,7 +2484,7 @@ impl Model {
             };
             let c2 = (cls * NNZB + NZB[za.max(zl) & 63] as usize) * NNZB + NZB[za.min(zl) & 63] as usize;
             let hi = self.nz_hi.sym2(&mut self.nz_hi2, io, ctx, c2, 7, actual >> 3);
-            let lo = self.nz_lo.sym2(&mut self.nz_lo2, io, ctx * 7 + hi, c2 * 7 + hi, 8, actual & 7);
+            let lo = self.nz_lo.sym2w(&mut self.nz_lo2, &mut self.nz_lo_w, cls, io, ctx * 7 + hi, c2 * 7 + hi, 8, actual & 7);
             let nz77 = hi * 8 + lo;
             info.nz77 = nz77 as u8;
             let mut rem = nz77;
@@ -3038,6 +3118,33 @@ pub fn decode_bytes(c: &[u8], n: usize) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mix_lanes() {
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for n in 0..4000 {
+            let a: [u16; 16] = std::array::from_fn(|_| next() as u16);
+            let b: [u16; 16] = std::array::from_fn(|_| next() as u16);
+            let w = [0, 1 << 14, (1 << 15) - 1, (next() & 0x7FFF) as u16][n % 4];
+            let mut m = [[0u16; 16]; 2];
+            for i in 0..16 {
+                m[1][i] = b[i].wrapping_sub(a[i]);
+                m[0][i] = a[i].wrapping_add(((m[1][i] as i16 as i32 * w as i32 + (1 << 14)) >> 15) as u16);
+            }
+            assert_eq!(super::simd::mix(&a, &b, w), m, "{n}");
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx2") {
+                // SAFETY: AVX2 is available.
+                assert_eq!(unsafe { super::avx2::mix(&a, &b, w) }, m, "{n}");
+            }
+        }
+    }
+
     #[test]
     fn luma_down_lanes() {
         let mut r = 0x9E37_79B9_7F4A_7C15u64;
