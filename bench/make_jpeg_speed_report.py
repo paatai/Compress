@@ -2,7 +2,7 @@
 """Turns the results of run_jpeg_speed.py (and run_paq8px.py) into
 bench/results/JPEG_SPEED_REPORT.md and the website's web/src/data/jpeg-speed.json.
 
-usage: make_jpeg_speed_report.py [--sets heldout,dev,test] [--site heldout]
+usage: make_jpeg_speed_report.py [--sets heldout2,heldout,dev] [--site heldout2]
 """
 import argparse
 import collections
@@ -12,7 +12,9 @@ import os
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CODECS = [
+    ("komla-strong", "Komla strong"),
     ("komla-fast", "Komla fast"),
+    ("komla-pr2", "Komla fast (PR #2)"),
     ("komla", "Komla (maximum)"),
     ("jxl", "JPEG XL"),
     ("lepton", "Lepton (Dropbox)"),
@@ -22,8 +24,12 @@ CODECS = [
     ("paq8px", "paq8px"),
 ]
 LABEL = dict(CODECS)
+# the Komla modes compared with every other tool; Komla's own modes are not counted as tools
+KOMLA = ["komla-strong", "komla-fast"]
+OWN = {"komla-strong", "komla-fast", "komla-pr2", "komla"}
 SETS = {
-    "heldout": ("Held-out random set", "drawn at random for this evaluation and never used before it (see below); Komla's code and parameters were frozen before its first run"),
+    "heldout2": ("New held-out random set", "drawn at random for this evaluation and frozen by SHA-256 before any work on the model (see above); never used for tuning; Komla's code and parameters were frozen before its first run, and it was run once"),
+    "heldout": ("Previous held-out random set", "drawn at random for the previous evaluation, where Komla's fast mode ran on it once; not used for tuning since"),
     "dev": ("Development set", "used for all tuning of Komla (contexts, priors, parameters)"),
     "test": ("Test set", "held out from tuning, but already used in earlier evaluations of Komla"),
 }
@@ -33,8 +39,9 @@ GROUP_LABEL = {
     "photo": "Edited photos", "scan": "Scans, paintings, maps", "web": "Small web images",
 }
 TOOLS = [
-    ("Komla fast", "this repository: `komla compress --fast`, `komla decompress`; `KOMLA_THREADS=1` for one thread, else all cores"),
-    ("Komla (maximum)", "this repository: `komla compress`, `komla decompress` (same thread settings)"),
+    ("Komla strong", "this repository: `komla compress --strong`, `komla decompress`; `KOMLA_THREADS=1` for one thread, else all cores"),
+    ("Komla fast", "this repository: `komla compress --fast`, `komla decompress` (same thread settings)"),
+    ("Komla fast (PR #2)", "the fast mode as of the previous evaluation (commit 8430279), the reference for the strong mode's speed budget (same commands)"),
     ("JPEG XL", "libjxl 0.13.0: `cjxl --lossless_jpeg=1` at its default effort (7), `djxl`; `--num_threads=0` for one thread, else its default"),
     ("Lepton (Dropbox)", "dropbox/lepton f34c7f4: `lepton -unjailed -allowprogressive -memory=4096M -threadmemory=2048M`; `-singlethread` for one thread"),
     ("Lepton (Rust port)", "microsoft/lepton_jpeg_rust 0.5.9: `lepton_jpeg_util --noverify`; `--threads 1` for one thread"),
@@ -117,7 +124,7 @@ def fmt(x, nd=2, unit=""):
 
 
 def verdict(k, t, axis):
-    """Komla fast (k) against a tool (t) on one axis: (word, margin text)."""
+    """A Komla mode (k) against a tool (t) on one axis: (word, margin text)."""
     if axis == "size":
         d = k["saved"] - t["saved"]
         return ("win" if d > 0 else "loss" if d < 0 else "tie"), f"{d:+.2f} points"
@@ -147,7 +154,7 @@ def paq_subset(rows, images):
         if len(rs) != len(done):
             continue
         v = summary(rs)
-        shown = f"**{label}**" if cid == "komla-fast" else label + (" \\*" if v["separate"] else "")
+        shown = f"**{label}**" if cid in KOMLA else label + (" \\*" if v["separate"] else "")
         out.append(f"| {shown} | {fmt(v['saved'])}% | {fmt(v['enc'], 3 if v['separate'] else 2)} | {fmt(v['dec'], 3 if v['separate'] else 2)} | {fmt(v['enc_mib'], 0, ' MiB')} | {fmt(v['dec_mib'], 0, ' MiB')} | {v['fails']} |")
     return out + ["", "\\* paq8px times are processor seconds of each process (it ran several files at a time, separately from the other tools); the first files it ran were timed by the clock while other work ran.", ""]
 
@@ -169,7 +176,7 @@ def set_section(name, rows):
             v = table.get((cid, th))
             if not v:
                 continue
-            shown = f"**{label}**" if cid == "komla-fast" else label + (" \\*" if v["separate"] else "")
+            shown = f"**{label}**" if cid in KOMLA else label + (" \\*" if v["separate"] else "")
             sp = v["spread"]
             spread = f"{fmt(100 * sp['enc_all'], 1, '%') if 'enc_all' in sp else 'n/a'} / {fmt(100 * sp['dec_all'], 1, '%') if 'dec_all' in sp else 'n/a'}"
             fails = f"{v['fails']}" + (f" (stored: {v['stored']})" if v["stored"] else "")
@@ -185,36 +192,48 @@ def set_section(name, rows):
         if not any("crashed" in e for _, _, v in fails for e in v["errors"]):
             out += ["No tool crashed or restored a file wrongly: every failure was the tool refusing the file (unsupported progressive scan scripts or end-of-band runs, or Lepton's own round-trip check failing)."]
         out.append("")
-    ks = [v for (c, th), v in table.items() if c == "komla-fast"]
-    if ks:
-        n = max(v["stored"] for v in ks)
-        out += [f"Komla stored {n} file(s) without recompressing them (its fallback for input it cannot reproduce exactly)." if n else "Komla coded every file in its fast mode (no file fell back to being stored).", ""]
-    out += ["### Komla fast against each tool", "", f"Size is exact, so any difference counts (margin in percentage points of saving); speed and memory within {TIE * 100:.0f}% count as ties (margin: Komla relative to the tool).", ""]
-    out += ["| Tool | Threads | Size | Compression speed | Decompression speed | Memory, compression | Memory, decompression |", "|---|---|---|---|---|---|---|"]
-    tally = collections.Counter()
-    for cid, label in CODECS:
-        if cid == "komla-fast":
-            continue
-        for th in ("1t", "mt"):
-            k, t = table.get(("komla-fast", th)), table.get((cid, th))
-            if not k or not t:
-                continue
-            cells = []
-            for axis in ("size", "enc", "dec", "enc_mib", "dec_mib"):
-                w, m = verdict(k, t, axis)
-                if cid != "komla":
-                    tally[(th, w)] += 1
-                cells.append(f"{w} ({m})" if m else w)
-            out.append(f"| {label} | {th} | " + " | ".join(cells) + " |")
+    for kid in KOMLA:
+        ks = [v for (c, th), v in table.items() if c == kid]
+        if ks:
+            n = max(v["stored"] for v in ks)
+            out += [f"{LABEL[kid]} stored {n} file(s) without recompressing them (its fallback for input it cannot reproduce exactly)." if n else f"{LABEL[kid]} coded every file (no file fell back to being stored).", ""]
+    ref = [(th, table.get(("komla-strong", th)), table.get(("komla-pr2", th)), table.get(("komla-fast", th))) for th in ("1t", "mt")]
+    if all(s_ and p_ for _, s_, p_, _ in ref):
+        out += ["### Komla strong against the fast mode", "", "Time and peak memory of the strong mode as multiples of the fast mode of the previous evaluation (PR #2, the reference of the speed budget: within about twice its time) and of this version's fast mode.", "",
+                "| Threads | Compression time | Decompression time | Memory, compression | Memory, decompression |", "|---|---|---|---|---|"]
+        for th, s_, p_, f_ in ref:
+            for name_, b in (("PR #2 fast", p_), ("fast", f_)):
+                if b:
+                    out.append(f"| {th}, vs {name_} | {b['enc'] / s_['enc']:.2f}x | {b['dec'] / s_['dec']:.2f}x | {s_['enc_mib'] / b['enc_mib']:.2f}x | {s_['dec_mib'] / b['dec_mib']:.2f}x |")
+        out.append("")
     def count(n, word):
         return f"{n} {word}" + ("" if n == 1 else ("es" if word.endswith("s") else "s"))
-    out += ["", "Against the other tools (Komla's own maximum mode not counted): " + "; ".join(f"{'one thread' if th == '1t' else 'all threads'}: {count(tally[(th, 'win')], 'win')}, {count(tally[(th, 'tie')], 'tie')}, {count(tally[(th, 'loss')], 'loss')}" for th in ("1t", "mt")) + ".", ""]
+    for kid in KOMLA:
+        if not any(c == kid for c, _ in table):
+            continue
+        out += [f"### {LABEL[kid]} against each tool", "", f"Size is exact, so any difference counts (margin in percentage points of saving); speed and memory within {TIE * 100:.0f}% count as ties (margin: Komla relative to the tool).", ""]
+        out += ["| Tool | Threads | Size | Compression speed | Decompression speed | Memory, compression | Memory, decompression |", "|---|---|---|---|---|---|---|"]
+        tally = collections.Counter()
+        for cid, label in CODECS:
+            if cid in OWN:
+                continue
+            for th in ("1t", "mt"):
+                k, t = table.get((kid, th)), table.get((cid, th))
+                if not k or not t:
+                    continue
+                cells = []
+                for axis in ("size", "enc", "dec", "enc_mib", "dec_mib"):
+                    w, m = verdict(k, t, axis)
+                    tally[(th, w)] += 1
+                    cells.append(f"{w} ({m})" if m else w)
+                out.append(f"| {label} | {th} | " + " | ".join(cells) + " |")
+        out += ["", f"{LABEL[kid]} against the other tools (Komla's own modes not counted): " + "; ".join(f"{'one thread' if th == '1t' else 'all threads'}: {count(tally[(th, 'win')], 'win')}, {count(tally[(th, 'tie')], 'tie')}, {count(tally[(th, 'loss')], 'loss')}" for th in ("1t", "mt")) + ".", ""]
     out += paq_subset(rows, images)
     groups = []
     for r in rows:
         if r["group"] not in groups:
             groups.append(r["group"])
-    out += ["### Size by group", "", "| Tool | " + " | ".join(f"{GROUP_LABEL.get(g, g)}<br>{sum(1 for i in images if f'/{g}/' in i)} files" for g in groups) + " | **Total** |", "|---" * (len(groups) + 2) + "|"]
+    out += ["### Size by group", "", "| Tool | " + " | ".join(f"{GROUP_LABEL.get(g, g)}<br>{(n := sum(1 for i in images if f'/{g}/' in i))} file{'' if n == 1 else 's'}" for g in groups) + " | **Total** |", "|---" * (len(groups) + 2) + "|"]
     for cid, label in CODECS:
         rs = [r for r in rows if r["codec"] == cid and r["threads"] == "1t"]
         if len(rs) != len(images):
@@ -225,7 +244,7 @@ def set_section(name, rows):
             i = sum(r["input"] for r in gr)
             o = sum(r["bytes"] if r["ok"] else r["input"] for r in gr)
             cells.append(f"{100 * (1 - o / i):.2f}%")
-        shown = f"**{label}**" if cid == "komla-fast" else label
+        shown = f"**{label}**" if cid in KOMLA else label
         out.append(f"| {shown} | " + " | ".join(cells) + f" | {fmt(table[(cid, '1t')]['saved'])}% |")
     out.append("")
     return out, table, len(images), total
@@ -233,8 +252,8 @@ def set_section(name, rows):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sets", default="heldout,dev,test")
-    ap.add_argument("--site", default="heldout")
+    ap.add_argument("--sets", default="heldout2,heldout,dev")
+    ap.add_argument("--site", default="", help="also write the website's table for this set")
     ap.add_argument("--intro", default=os.path.join(HERE, "results", "jpeg_speed_intro.md"))
     args = ap.parse_args()
     out = ["# Lossless JPEG recompression: size, speed and memory", ""]
@@ -248,7 +267,8 @@ def main():
         sec, table, n, total = set_section(name, rows)
         tables[name] = (table, n, total)
         out += sec
-    out += ["## Tools", "", "| Tool | Version and command |", "|---|---|"] + [f"| {a} | {b} |" for a, b in TOOLS] + [""]
+    shown = {LABEL[r["codec"]] for name in args.sets.split(",") for r in load(name)}
+    out += ["## Tools", "", "| Tool | Version and command |", "|---|---|"] + [f"| {a} | {b} |" for a, b in TOOLS if a in shown] + [""]
     with open(os.path.join(HERE, "results", "JPEG_SPEED_REPORT.md"), "w") as f:
         f.write("\n".join(out))
     print("\n".join(out))
