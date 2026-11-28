@@ -10,9 +10,11 @@ restore it exactly is counted at the original size and reported as a failure. Fi
 order, all codecs on one file before the next, so that every codec sees the same conditions.
 
 Every run's times are kept (enc_all, dec_all) to show the run-to-run variation; for Komla the
-container mode is recorded (3 fast mode, 2 maximum mode; 0 and 4 mean the file was stored).
+container mode is recorded (3 fast mode, 5 strong mode, 2 maximum mode; 0 and 4 mean the file was
+stored). "komla-pr2" is the fast mode as of the previous evaluation (bench/.tools/bin/komla-pr2,
+built from commit 8430279), kept as the reference for the strong mode's speed.
 
-usage: run_jpeg_speed.py --set dev|test|heldout [--codecs a,b] [--threads 1t,mt] [--reps N] [--force a,b]
+usage: run_jpeg_speed.py --set dev|test|heldout|heldout2 [--codecs a,b] [--threads 1t,mt] [--reps N] [--force a,b]
 """
 import argparse
 import hashlib
@@ -39,7 +41,16 @@ LEP = [t("lepton"), "-unjailed", "-allowprogressive", "-memory=4096M", "-threadm
 
 # codec: {variant: (encode command, output name, decode command, environment)}; commands run in a
 # scratch directory holding the input as in.jpg and must leave the restored file in dec.jpg
+KOMLA_PR2 = os.environ.get("KOMLA_PR2", t("komla-pr2"))
 CODECS = {
+    "komla-strong": {
+        "1t": ([KOMLA, "compress", "--strong", "in.jpg", "-o", "out.komla"], "out.komla", [KOMLA, "decompress", "out.komla", "-o", "dec.jpg"], {"KOMLA_THREADS": "1"}),
+        "mt": ([KOMLA, "compress", "--strong", "in.jpg", "-o", "out.komla"], "out.komla", [KOMLA, "decompress", "out.komla", "-o", "dec.jpg"], {}),
+    },
+    "komla-pr2": {
+        "1t": ([KOMLA_PR2, "compress", "--fast", "in.jpg", "-o", "out.komla"], "out.komla", [KOMLA_PR2, "decompress", "out.komla", "-o", "dec.jpg"], {"KOMLA_THREADS": "1"}),
+        "mt": ([KOMLA_PR2, "compress", "--fast", "in.jpg", "-o", "out.komla"], "out.komla", [KOMLA_PR2, "decompress", "out.komla", "-o", "dec.jpg"], {}),
+    },
     "komla-fast": {
         "1t": ([KOMLA, "compress", "--fast", "in.jpg", "-o", "out.komla"], "out.komla", [KOMLA, "decompress", "out.komla", "-o", "dec.jpg"], {"KOMLA_THREADS": "1"}),
         "mt": ([KOMLA, "compress", "--fast", "in.jpg", "-o", "out.komla"], "out.komla", [KOMLA, "decompress", "out.komla", "-o", "dec.jpg"], {}),
@@ -74,7 +85,7 @@ CODECS["brunsli"]["mt"] = CODECS["brunsli"]["1t"]
 CODECS["packjpg"]["mt"] = CODECS["packjpg"]["1t"]
 # slow codecs run once per file
 REPS = {"komla": 1}
-ORDER = ["jxl", "brunsli", "packjpg", "lepton", "lepton-rust", "komla", "komla-fast"]
+ORDER = ["jxl", "brunsli", "packjpg", "lepton", "lepton-rust", "komla", "komla-fast", "komla-strong", "komla-pr2"]
 GROUPS = ["kodak_q50", "kodak_q75", "kodak_q90_444", "kodak_q95_prog", "camera", "progressive", "gray", "screenshot"]
 
 

@@ -8,10 +8,10 @@ const USAGE: &str = "\
 Komla - lossless image compression by context mixing
 
 USAGE:
-  komla compress   [--fast] <input.png|input.bmp|input.jpg> [-o output.komla]
+  komla compress   [--fast | --strong] <input.png|input.bmp|input.jpg> [-o output.komla]
   komla decompress <input.komla> [-o output.png|output.bmp|output.jpg]
   komla info       <input.komla>
-  komla bench      [-j threads] [--no-verify] [--fast] <images...>
+  komla bench      [-j threads] [--no-verify] [--fast | --strong] <images...>
   komla pixhash    <images...>   (SHA-256 of pixels normalised to RGBA)
 
 compress writes <input>.komla by default; decompress restores the original
@@ -23,7 +23,9 @@ byte for byte (checked with a CRC-32 of the whole file). JPEGs that cannot be
 reproduced exactly from their coefficients are stored as they are. --fast uses
 the fast JPEG mode: about 35 times faster to compress and 45 times faster to
 restore than the default mode (which saves the most) on one core, and it uses
-all cores (KOMLA_THREADS=n limits the threads).";
+all cores (KOMLA_THREADS=n limits the threads). --strong uses the strong JPEG
+mode: under twice the time of the fast mode on one core, with clearly smaller
+output.";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -99,9 +101,35 @@ fn read(p: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))
 }
 
+/// The JPEG mode of `compress` and `bench`: the default (maximum), --fast or --strong.
+#[derive(Clone, Copy, PartialEq)]
+enum JpegLevel {
+    Max,
+    Fast,
+    Strong,
+}
+
+impl JpegLevel {
+    fn from_args(args: &[String]) -> Result<JpegLevel, String> {
+        match (args.iter().any(|a| a == "--fast"), args.iter().any(|a| a == "--strong")) {
+            (true, true) => Err("--fast and --strong exclude each other".into()),
+            (true, false) => Ok(JpegLevel::Fast),
+            (false, true) => Ok(JpegLevel::Strong),
+            (false, false) => Ok(JpegLevel::Max),
+        }
+    }
+    fn compress(self, bytes: &[u8], threads: usize) -> (Vec<u8>, jpeg::JpegInfo) {
+        match self {
+            JpegLevel::Max => jpeg::compress(bytes, &mut |_| {}),
+            JpegLevel::Fast => jpeg::compress_fast(bytes, threads),
+            JpegLevel::Strong => jpeg::compress_strong(bytes, threads),
+        }
+    }
+}
+
 fn jpeg_mode(info: &jpeg::JpegInfo) -> String {
     match info.mode {
-        jpeg::MODE_JPEG | jpeg::MODE_FAST => format!(
+        jpeg::MODE_JPEG | jpeg::MODE_FAST | jpeg::MODE_STRONG => format!(
             "{} x {} {} {}JPEG, {} stripe(s)",
             info.width,
             info.height,
@@ -113,9 +141,9 @@ fn jpeg_mode(info: &jpeg::JpegInfo) -> String {
     }
 }
 
-fn compress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8], fast: bool) -> Result<(), String> {
+fn compress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8], level: JpegLevel) -> Result<(), String> {
     let t0 = Instant::now();
-    let (out, info) = if fast { jpeg::compress_fast(bytes, jpeg::threads()) } else { jpeg::compress(bytes, &mut |_| {}) };
+    let (out, info) = level.compress(bytes, jpeg::threads());
     let dt = t0.elapsed().as_secs_f64();
     let output = output.unwrap_or_else(|| {
         let mut s = input.as_os_str().to_owned();
@@ -136,8 +164,8 @@ fn compress_jpeg(input: &Path, output: Option<PathBuf>, bytes: &[u8], fast: bool
     Ok(())
 }
 
-/// Restores a .komla JPEG file straight from file to file (fast-mode files are never held in
-/// memory as a whole).
+/// Restores a .komla JPEG file straight from file to file (fast- and strong-mode files are never
+/// held in memory as a whole).
 fn decompress_jpeg(input: &Path, output: Option<PathBuf>) -> Result<(), String> {
     let t0 = Instant::now();
     let output = output.unwrap_or_else(|| {
@@ -168,12 +196,12 @@ fn decompress_jpeg(input: &Path, output: Option<PathBuf>) -> Result<(), String> 
 }
 
 fn cmd_compress(args: &[String]) -> Result<(), String> {
-    let fast = args.iter().any(|a| a == "--fast");
-    let args: Vec<String> = args.iter().filter(|a| *a != "--fast").cloned().collect();
+    let level = JpegLevel::from_args(args)?;
+    let args: Vec<String> = args.iter().filter(|a| *a != "--fast" && *a != "--strong").cloned().collect();
     let (input, output) = split_out(&args)?;
     let bytes = read(&input)?;
     if jpeg::is_jpeg(&bytes) {
-        return compress_jpeg(&input, output, &bytes, fast);
+        return compress_jpeg(&input, output, &bytes, level);
     }
     let (img, src) = io::read_image(&bytes)?;
     let t0 = Instant::now();
@@ -240,14 +268,21 @@ fn cmd_decompress(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Development aid: learns the fast model's initial distributions from JPEG files.
+/// Development aid: learns the fast model's initial distributions from JPEG files (with
+/// --strong, the strong model's distributions and prediction weights).
 fn cmd_jtrain(args: &[String]) -> Result<(), String> {
-    let (input, output) = split_out(args)?;
+    let strong = args.iter().any(|a| a == "--strong");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--strong").cloned().collect();
+    let (input, output) = split_out(&args)?;
     let _ = input;
     let files: Vec<Vec<u8>> = args.iter().filter(|a| a.ends_with(".jpg") || a.ends_with(".jpeg")).map(|a| read(Path::new(a))).collect::<Result<_, _>>()?;
-    let totals = jpeg::fast_train(&files);
     let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
-    let priors = jpeg::fast::build_priors(&totals, env("PRIOR_MIN", 32), env("PRIOR_COUNT", 12) as u8, env("PRIOR_BITCOUNT", 12) as u8);
+    let priors = if strong {
+        let (totals, lsw) = jpeg::strong_train(&files);
+        jpeg::strong::build_priors(&totals, &lsw, env("PRIOR_MIN", 16), env("PRIOR_COUNT", 8) as u8, env("PRIOR_BITCOUNT", 6) as u8)
+    } else {
+        jpeg::fast::build_priors(&jpeg::fast_train(&files), env("PRIOR_MIN", 16), env("PRIOR_COUNT", 16) as u8, env("PRIOR_BITCOUNT", 6) as u8)
+    };
     let output = output.ok_or("-o output file needed")?;
     std::fs::write(&output, &priors).map_err(|e| e.to_string())?;
     println!("{} files, {} bytes of priors -> {}", files.len(), priors.len(), output.display());
@@ -263,7 +298,11 @@ fn cmd_info(args: &[String]) -> Result<(), String> {
             "{}: Komla JPEG v{}{}, {}, original {} bytes, crc32 {:08x}, {} bytes ({:.2}% smaller)",
             input.display(),
             jpeg::VERSION,
-            if info.mode == jpeg::MODE_FAST || info.mode == jpeg::MODE_BYTES { " (fast mode)" } else { "" },
+            match info.mode {
+                jpeg::MODE_FAST | jpeg::MODE_BYTES => " (fast mode)",
+                jpeg::MODE_STRONG => " (strong mode)",
+                _ => "",
+            },
             jpeg_mode(&info),
             len,
             crc,
@@ -351,7 +390,7 @@ struct JpegRow {
 }
 
 /// Compresses, decompresses and compares JPEG files byte for byte (SHA-256).
-fn bench_jpeg(files: &[PathBuf], threads: usize, verify: bool, fast: bool) -> Result<(), String> {
+fn bench_jpeg(files: &[PathBuf], threads: usize, verify: bool, level: JpegLevel) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let next = AtomicUsize::new(0);
     let rows: Mutex<Vec<Option<JpegRow>>> = Mutex::new((0..files.len()).map(|_| None).collect());
@@ -369,7 +408,7 @@ fn bench_jpeg(files: &[PathBuf], threads: usize, verify: bool, fast: bool) -> Re
                         return Err("not a JPEG file".into());
                     }
                     let t0 = Instant::now();
-                    let (c, info) = if fast { jpeg::compress_fast(&bytes, 1) } else { jpeg::compress(&bytes, &mut |_| {}) };
+                    let (c, info) = level.compress(&bytes, 1);
                     let enc_s = t0.elapsed().as_secs_f64();
                     let (dec_s, ok) = if verify {
                         let t1 = Instant::now();
@@ -446,7 +485,7 @@ struct BenchRow {
 fn cmd_bench(args: &[String]) -> Result<(), String> {
     let mut threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let mut verify = true;
-    let mut fast = false;
+    let level = JpegLevel::from_args(args)?;
     let mut files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -456,7 +495,7 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
                 i += 1;
             }
             "--no-verify" => verify = false,
-            "--fast" => fast = true,
+            "--fast" | "--strong" => {}
             f => files.push(PathBuf::from(f)),
         }
         i += 1;
@@ -466,7 +505,7 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
     }
     let (jpegs, files): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().partition(|f| read(f).is_ok_and(|b| jpeg::is_jpeg(&b)));
     if !jpegs.is_empty() {
-        bench_jpeg(&jpegs, threads, verify, fast)?;
+        bench_jpeg(&jpegs, threads, verify, level)?;
         if files.is_empty() {
             return Ok(());
         }

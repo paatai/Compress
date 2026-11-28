@@ -135,26 +135,38 @@ fn synthetic_and_multi_stripe() {
     roundtrip(&big, jpeg::MODE_JPEG);
 }
 
-/// Fast mode: compresses with 1 and 4 threads (the output must not depend on the thread count),
-/// decompresses with both and requires the exact original bytes.
-fn roundtrip_fast(data: &[u8], expect_mode: u8) -> Vec<u8> {
-    let (packed, info) = jpeg::compress_fast(data, 1);
-    assert_eq!(info.mode, expect_mode, "unexpected mode ({})", info.note);
-    let (packed4, _) = jpeg::compress_fast(data, 4);
-    assert!(packed == packed4, "output depends on the number of threads");
-    for threads in [1, 4] {
-        let back = jpeg::decompress_with(&packed, threads).expect("decompress");
-        assert!(back == data, "restored file differs from the original");
+type Compress = fn(&[u8], usize) -> (Vec<u8>, jpeg::JpegInfo);
+
+/// The fast and the strong mode, with the mode byte of a recompressed file.
+const LEVELS: [(Compress, u8); 2] = [(jpeg::compress_fast, jpeg::MODE_FAST), (jpeg::compress_strong, jpeg::MODE_STRONG)];
+
+/// Fast and strong modes: compresses with 1 and 4 threads (the output must not depend on the
+/// thread count), decompresses with both and requires the exact original bytes. `expect_mode`
+/// is MODE_FAST for a recompressed file (MODE_STRONG in the strong mode) or the stored mode.
+/// Returns the output of both modes.
+fn roundtrip_fast(data: &[u8], expect_mode: u8) -> Vec<Vec<u8>> {
+    let mut outs = Vec::new();
+    for (compress, mode) in LEVELS {
+        let (packed, info) = compress(data, 1);
+        assert_eq!(info.mode, if expect_mode == jpeg::MODE_FAST { mode } else { expect_mode }, "unexpected mode ({})", info.note);
+        let (packed4, _) = compress(data, 4);
+        assert!(packed == packed4, "output depends on the number of threads");
+        for threads in [1, 4] {
+            let back = jpeg::decompress_with(&packed, threads).expect("decompress");
+            assert!(back == data, "restored file differs from the original");
+        }
+        outs.push(packed);
     }
-    packed
+    outs
 }
 
 #[test]
 fn fast_fixtures_restore_byte_for_byte() {
     for name in ["tiny_420.jpg", "tiny_progressive_444.jpg", "tiny_gray_restart.jpg", "tiny_meta.jpg"] {
         let data = fixture(name);
-        let packed = roundtrip_fast(&data, jpeg::MODE_FAST);
-        assert!(packed.len() < data.len(), "{name}: {} -> {}", data.len(), packed.len());
+        for packed in roundtrip_fast(&data, jpeg::MODE_FAST) {
+            assert!(packed.len() < data.len(), "{name}: {} -> {}", data.len(), packed.len());
+        }
     }
 }
 
@@ -184,9 +196,9 @@ fn fast_unsupported_or_damaged_input_is_stored() {
 
 #[test]
 fn fast_damaged_container_never_restores_wrong_bytes() {
-    for name in ["tiny_progressive_444.jpg", "tiny_420.jpg"] {
+    for (name, (compress, _)) in ["tiny_progressive_444.jpg", "tiny_420.jpg"].into_iter().flat_map(|n| LEVELS.map(|l| (n, l))) {
         let data = fixture(name);
-        let (packed, _) = jpeg::compress_fast(&data, 1);
+        let (packed, _) = compress(&data, 1);
         let mut detected = 0;
         for pos in 0..packed.len() {
             for bit in [0x01, 0x10, 0x80] {
@@ -208,8 +220,8 @@ fn fast_damaged_container_never_restores_wrong_bytes() {
 #[test]
 fn fast_synthetic_and_multi_stripe() {
     roundtrip_fast(&synthetic_jpeg(100, 61, 3), jpeg::MODE_FAST);
-    let big = synthetic_jpeg(4096, 2400, 9);
+    let big = synthetic_jpeg(4096, 9600, 9);
     let l = format::parse(&big, true).unwrap();
-    assert!(jpeg::fast_stripes(&l.frame).len() > 4);
+    assert!(jpeg::fast_stripes(&l.frame, jpeg::MODE_STRONG).len() > 4);
     roundtrip_fast(&big, jpeg::MODE_FAST);
 }

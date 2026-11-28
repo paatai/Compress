@@ -323,14 +323,14 @@ pub unsafe extern "C" fn komla_jpeg_encode_stripe(bp: *const u8, bl: usize, cp: 
 }
 
 /// Input: .komla JPEG file. Result: info block, u32 blob_len, blob, u32 n_stripes,
-/// n x (u32 offset, u32 len). Fast-mode files (restored whole with `komla_jpeg_decompress`)
-/// come back with an empty blob and no stripes.
+/// n x (u32 offset, u32 len). Fast- and strong-mode files (restored whole with
+/// `komla_jpeg_decompress`) come back with an empty blob and no stripes.
 /// # Safety
 /// `ptr`/`len` must describe a readable buffer.
 #[no_mangle]
 pub unsafe extern "C" fn komla_jpeg_parse(ptr: *const u8, len: usize) -> i32 {
     let b = slice(ptr, len);
-    if matches!(b.get(6), Some(&jpeg::MODE_FAST) | Some(&jpeg::MODE_BYTES)) {
+    if matches!(b.get(6), Some(&jpeg::MODE_FAST) | Some(&jpeg::MODE_STRONG) | Some(&jpeg::MODE_BYTES)) {
         let r = jpeg::summary(b).map(|(info, _, _)| {
             let mut v = Vec::new();
             jpeg_info_block(&mut v, &info);
@@ -407,7 +407,19 @@ pub unsafe extern "C" fn komla_jpeg_compress_fast(ptr: *const u8, len: usize) ->
     set_result(Ok(v))
 }
 
-/// Restores a .komla JPEG file of either mode (checked against its CRC-32).
+/// Strong mode, whole file. Result: info block, then the .komla file.
+/// # Safety
+/// `ptr`/`len` must describe a readable buffer.
+#[no_mangle]
+pub unsafe extern "C" fn komla_jpeg_compress_strong(ptr: *const u8, len: usize) -> i32 {
+    let (c, info) = jpeg::compress_strong(slice(ptr, len), 1);
+    let mut v = Vec::with_capacity(c.len() + 64);
+    jpeg_info_block(&mut v, &info);
+    v.extend_from_slice(&c);
+    set_result(Ok(v))
+}
+
+/// Restores a .komla JPEG file of any mode (checked against its CRC-32).
 /// # Safety
 /// `ptr`/`len` must describe a readable buffer.
 #[no_mangle]

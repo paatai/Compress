@@ -1,0 +1,732 @@
+{
+ "seed": 20261128,
+ "pool": "jpeg_heldout_pool.json.gz",
+ "files": [
+  {
+   "title": "File:3.4.13 3 Radovljica 08 (8617787396).jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/5/5d/3.4.13_3_Radovljica_08_%288617787396%29.jpg",
+   "sha1": "dbdfa0bfa5732dd1c0bcad340a4fd7d516ae095c",
+   "bytes": 5495450,
+   "licence": "CC BY 2.0",
+   "exif": {
+    "Make": "PENTAX             ",
+    "Model": "PENTAX K-5         "
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:19 South Square, Hampstead Garden Suburb.JPG",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/3/30/19_South_Square%2C_Hampstead_Garden_Suburb.JPG",
+   "sha1": "ca31d970e978a7b0e88bbd900d3bcae39ce9ed57",
+   "bytes": 11283820,
+   "licence": "CC BY-SA 3.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D3200"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:Ancient City of Laodicea, 2019 35.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/e/ed/Ancient_City_of_Laodicea%2C_2019_35.jpg",
+   "sha1": "b0dd3dd8aea754c1e3a6244167a961d9575995d5",
+   "bytes": 3848135,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "HUAWEI",
+    "Model": "CLT-L29"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:14th St 5th Av td (2018-03-22) 02 - 90 Fifth Avenue.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/0/06/14th_St_5th_Av_td_%282018-03-22%29_02_-_90_Fifth_Avenue.jpg",
+   "sha1": "69a321f71d9296de0ae261efe6dc04664681a62c",
+   "bytes": 6871964,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "SONY",
+    "Model": "DSC-RX100"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:100YearsDF43.JPG",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/1/13/100YearsDF43.JPG",
+   "sha1": "453baa254ea0f198f0984994a883e800dd4f85ba",
+   "bytes": 8300781,
+   "licence": "CC BY-SA 3.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D3200"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:1\u05de\u05e2\u05dc\u05d4 \u05d4\u05e9\u05d7\u05e8\u05d5\u05e8.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/9/90/1%D7%9E%D7%A2%D7%9C%D7%94_%D7%94%D7%A9%D7%97%D7%A8%D7%95%D7%A8.jpg",
+   "sha1": "d56932731f9bd7fae156c35fe4b9a0a21273b191",
+   "bytes": 10122347,
+   "licence": "CC BY-SA 3.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D3200"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:Airfield EPGL in Gliwice, 2022.06.25 04.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/b/b1/Airfield_EPGL_in_Gliwice%2C_2022.06.25_04.jpg",
+   "sha1": "775737443cbf8f36134174cecd7224b33a61b7e9",
+   "bytes": 2091568,
+   "licence": "CC BY 3.0",
+   "exif": {
+    "Make": "Xiaomi",
+    "Model": "Redmi Note 8 Pro"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:2017-11-04 Wikimedia Diversity Conference, People at Diversity Conference (05) (freddy2001).jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/4/49/2017-11-04_Wikimedia_Diversity_Conference%2C_People_at_Diversity_Conference_%2805%29_%28freddy2001%29.jpg",
+   "sha1": "da90b5aba55ba11d0f1ad9c9f87cfcb1131634e0",
+   "bytes": 12583952,
+   "licence": "CC BY-SA 3.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D750"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:16th Sustainment Brigade Hosts 'Knight\u2019s Week' to Strengthen Interoperability and Security Commitments in the European Theater (8216305).jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/8/84/16th_Sustainment_Brigade_Hosts_%27Knight%E2%80%99s_Week%27_to_Strengthen_Interoperability_and_Security_Commitments_in_the_European_Theater_%288216305%29.jpg",
+   "sha1": "0bf6f8a722826579f86d5b9d5c06196847aa6841",
+   "bytes": 9152058,
+   "licence": "Public domain",
+   "exif": {
+    "Make": "Canon",
+    "Model": "Canon EOS 5D Mark IV"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:Airfield EPGL in Gliwice, 2024.12.14 18.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/0/09/Airfield_EPGL_in_Gliwice%2C_2024.12.14_18.jpg",
+   "sha1": "ae72a2828c5611cc92147ee235ff9f1e3ebcb784",
+   "bytes": 4639740,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "Xiaomi",
+    "Model": "Redmi Note 8 Pro"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:Access path to the \u00c5krehamn beach, Norway julesvernex2.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/4/4d/Access_path_to_the_%C3%85krehamn_beach%2C_Norway_julesvernex2.jpg",
+   "sha1": "0a38403ed7b67b64dd7803e06eedf9bbe0d28580",
+   "bytes": 7362004,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "FUJIFILM",
+    "Model": "X-T3"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:0 Havr\u00e9 - Ch\u00e2teau de Beaulieu (1).jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/9/96/0_Havr%C3%A9_-_Ch%C3%A2teau_de_Beaulieu_%281%29.jpg",
+   "sha1": "d5f3616ad0ba85edd1708a7844b43980dd82d394",
+   "bytes": 7636140,
+   "licence": "CC BY 3.0",
+   "exif": {
+    "Make": "Canon",
+    "Model": "Canon EOS 600D"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:0 Compi\u00e8gne - Le ch\u00e2teau (1).JPG",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/7/75/0_Compi%C3%A8gne_-_Le_ch%C3%A2teau_%281%29.JPG",
+   "sha1": "ae2d349b5323ddf2247725f79615585ecd5c0d55",
+   "bytes": 7392855,
+   "licence": "CC BY-SA 3.0",
+   "exif": {
+    "Make": "Canon",
+    "Model": "Canon EOS 600D"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:\"Jasper\" (6189276482).jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/f/ff/%22Jasper%22_%286189276482%29.jpg",
+   "sha1": "f215e63dec927b97e35482cb5791551460b9ea53",
+   "bytes": 9877636,
+   "licence": "CC BY 2.0",
+   "exif": {
+    "Make": "Canon",
+    "Model": "Canon EOS 600D"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:Amaranthe, European Co-Headline Tour, Ludwigsburg 2022 (11).jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/9/94/Amaranthe%2C_European_Co-Headline_Tour%2C_Ludwigsburg_2022_%2811%29.jpg",
+   "sha1": "a33ff3552e144650ea39599084fe8ab43fae6de7",
+   "bytes": 5996544,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "SONY",
+    "Model": "ILCE-7M3"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:Afyonkarahisar evleri, 2019 34.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/7/74/Afyonkarahisar_evleri%2C_2019_34.jpg",
+   "sha1": "524e9ad02466e011d5395e3d2cb0282bc63ab0da",
+   "bytes": 2811469,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "HUAWEI",
+    "Model": "CLT-L29"
+   },
+   "group": "camera"
+  },
+  {
+   "title": "File:Baden Villa Epstein 2019.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/8/8f/Baden_Villa_Epstein_2019.jpg",
+   "sha1": "f7b0c2164c56d7920a4d7f456552b4cb8ab80c90",
+   "bytes": 8995309,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "Panasonic",
+    "Model": "DMC-FZ1000"
+   },
+   "group": "progressive"
+  },
+  {
+   "title": "File:Albert Einstein Head.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/d/d3/Albert_Einstein_Head.jpg",
+   "sha1": "51f46ff9897d9125b0d0a513fb5099d2a9462282",
+   "bytes": 2309396,
+   "licence": "Public domain",
+   "exif": {},
+   "group": "progressive"
+  },
+  {
+   "title": "File:\"October\" cinema hall 2019-09-30.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/f/f8/%22October%22_cinema_hall_2019-09-30.jpg",
+   "sha1": "53378ea15eb7e87f5d6dde9bc23c007b8ca3a9ba",
+   "bytes": 10273443,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "SONY",
+    "Model": "DSC-RX100M2"
+   },
+   "group": "progressive"
+  },
+  {
+   "title": "File:001 - Dragline excavator E-10011.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/f/f2/001_-_Dragline_excavator_E-10011.jpg",
+   "sha1": "d9ffbf1f099916cf066a9a6f2b639c4d356cf5cb",
+   "bytes": 6428398,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "Canon",
+    "Model": "Canon EOS M"
+   },
+   "group": "progressive"
+  },
+  {
+   "title": "File:Atractomorpha lata, Burdwan, West Bengal, India 27 10 2012.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/6/61/Atractomorpha_lata%2C_Burdwan%2C_West_Bengal%2C_India_27_10_2012.jpg",
+   "sha1": "4f25a6769b1467fc5718a3eda020963a982754dc",
+   "bytes": 5432843,
+   "licence": "CC BY-SA 3.0",
+   "exif": {},
+   "group": "progressive"
+  },
+  {
+   "title": "File:2013 Cogden Bridge.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/6/61/2013_Cogden_Bridge.jpg",
+   "sha1": "df423d990122b7477e84b2392d4039d842f01b51",
+   "bytes": 8711245,
+   "licence": "CC BY-SA 3.0",
+   "exif": {
+    "Make": "OLYMPUS IMAGING CORP.  ",
+    "Model": "E-M5            "
+   },
+   "group": "progressive"
+  },
+  {
+   "title": "File:At the luol deng foundation basketball awarding ceremony.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/5/57/At_the_luol_deng_foundation_basketball_awarding_ceremony.jpg",
+   "sha1": "74c495cc7e17c8058617ac238d0a3e9e3874c2bb",
+   "bytes": 173435,
+   "licence": "CC BY-SA 4.0",
+   "exif": {},
+   "group": "progressive"
+  },
+  {
+   "title": "File:0688 Norway Lofoten bridge between Sakrisoya and Andoya.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/7/7b/0688_Norway_Lofoten_bridge_between_Sakrisoya_and_Andoya.jpg",
+   "sha1": "ad909d5d2b45fd5c7e7a0d0965f7dfa1f74da766",
+   "bytes": 7494089,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "SONY",
+    "Model": "ILCE"
+   },
+   "group": "progressive"
+  },
+  {
+   "title": "File:- Museo Delta Antico - Comacchio - 2024-09-08 14-50-35 001.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/1/15/-_Museo_Delta_Antico_-_Comacchio_-_2024-09-08_14-50-35_001.jpg",
+   "sha1": "aec58f040e648cba2aef18637814fe7b695895a4",
+   "bytes": 9551053,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D90"
+   },
+   "group": "progressive"
+  },
+  {
+   "title": "File:(Passiflora 'Lady Margaret') cultivator Rakhi flower closeup at Nizampet 01.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/2/29/%28Passiflora_%27Lady_Margaret%27%29_cultivator_Rakhi_flower_closeup_at_Nizampet_01.jpg",
+   "sha1": "e15ba46e4ee15ea404238daec0d7159d1387d74c",
+   "bytes": 2335895,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "SAMSUNG",
+    "Model": "SM-G313HU"
+   },
+   "group": "progressive"
+  },
+  {
+   "title": "File:2016 Pa\u0142ac w Kamie\u0144cu Z\u0105bkowickim 01.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/1/16/2016_Pa%C5%82ac_w_Kamie%C5%84cu_Z%C4%85bkowickim_01.jpg",
+   "sha1": "140772c1aa8149b72a211b4d22c8a4b5d71887ab",
+   "bytes": 7924044,
+   "licence": "CC BY 3.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D7100"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:13-02-27-spielbank-wiesbaden-by-RalfR-093.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/a/a4/13-02-27-spielbank-wiesbaden-by-RalfR-093.jpg",
+   "sha1": "73dc8c0d71dc039affe979b91472f23a2f23b8a5",
+   "bytes": 6545399,
+   "licence": "CC BY-SA 3.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D300S"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:20100911 Kotani village close panorama Xanthi Thrace Greece.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/b/b8/20100911_Kotani_village_close_panorama_Xanthi_Thrace_Greece.jpg",
+   "sha1": "aaa75cce1b3ca56187517baf8ae082a269fe17a8",
+   "bytes": 9015353,
+   "licence": "CC BY-SA 3.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D700"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:013 Wild Alpine chough in flight at Pfyn-Finges (Switzerland) Photo by Giles Laurent.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/9/9c/013_Wild_Alpine_chough_in_flight_at_Pfyn-Finges_%28Switzerland%29_Photo_by_Giles_Laurent.jpg",
+   "sha1": "2b76ea175fc4abd4c7587e5aabe42fe8081710be",
+   "bytes": 6578356,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "SONY",
+    "Model": "ILCE-1"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:2015 Kana\u0142 M\u0142yn\u00f3wka w K\u0142odzku.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/f/fb/2015_Kana%C5%82_M%C5%82yn%C3%B3wka_w_K%C5%82odzku.jpg",
+   "sha1": "29287426a043944af39178bb65783900335b8d8f",
+   "bytes": 4548692,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D7100"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:Beacon Stawa M\u0142yny, \u015awinouj\u015bcie.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/4/4d/Beacon_Stawa_M%C5%82yny%2C_%C5%9Awinouj%C5%9Bcie.jpg",
+   "sha1": "c1d1f5f5c4f59ce12c9e9577d68094b0f4ef29f8",
+   "bytes": 8803705,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D3300"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:'\"As Tr\u00eas Gra\u00e7as\" 1973 marble sculpture by Fernando Fernandes, Jardim Irm\u00e3 L\u00facia, Lisbon, Portugal julesvernex2.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/8/87/%27%22As_Tr%C3%AAs_Gra%C3%A7as%22_1973_marble_sculpture_by_Fernando_Fernandes%2C_Jardim_Irm%C3%A3_L%C3%BAcia%2C_Lisbon%2C_Portugal_julesvernex2.jpg",
+   "sha1": "472789735eb634d7e7b9615141bff40b81157a1b",
+   "bytes": 10296480,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "RICOH IMAGING COMPANY, LTD.",
+    "Model": "RICOH GR III"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:\"Pullman Orient Express\" (\"Love and Peace\") IMGP2029p.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/b/b1/%22Pullman_Orient_Express%22_%28%22Love_and_Peace%22%29_IMGP2029p.jpg",
+   "sha1": "839b42ba071d5d2c94857488cba2b72d93d6775a",
+   "bytes": 9795111,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "RICOH IMAGING COMPANY, LTD.  ",
+    "Model": "PENTAX K-1 Mark II "
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:2015 Villa Barbara w L\u0105dku-Zdroju 01.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/4/4b/2015_Villa_Barbara_w_L%C4%85dku-Zdroju_01.jpg",
+   "sha1": "3bf1c30f548e70d954d089283f8979abd07ca195",
+   "bytes": 12832581,
+   "licence": "CC BY-SA 3.0 pl",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D7100"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:2014 Krzy\u017c przydro\u017cny w Ziele\u0144cu.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/c/c6/2014_Krzy%C5%BC_przydro%C5%BCny_w_Ziele%C5%84cu.jpg",
+   "sha1": "2c97531ac7648f96d462785cecd8f37459265b46",
+   "bytes": 5350397,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D7100"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:006 Giraffe portrait in the Lake Manyara National Park Photo by Giles Laurent.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/2/2f/006_Giraffe_portrait_in_the_Lake_Manyara_National_Park_Photo_by_Giles_Laurent.jpg",
+   "sha1": "e28bc3f684ab9156e86ddd92dc25d19834552de3",
+   "bytes": 13225935,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "SONY",
+    "Model": "ILCE-7RM3"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:2017 Smog nad Now\u0105 Rud\u0105.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/c/c1/2017_Smog_nad_Now%C4%85_Rud%C4%85.jpg",
+   "sha1": "b97ee5b12783f6fb06ff92d9ccb52fae4402c1d5",
+   "bytes": 7491943,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D7100"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:136 Black-backed jackal hunting for food at Cape cross Photo by Giles Laurent.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/d/d0/136_Black-backed_jackal_hunting_for_food_at_Cape_cross_Photo_by_Giles_Laurent.jpg",
+   "sha1": "82a793d1001120b92f7ca8398ad59dacfce8445e",
+   "bytes": 5455237,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "SONY",
+    "Model": "ILCE-1M2"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:2016 FED 5C 01.JPG",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/4/42/2016_FED_5C_01.JPG",
+   "sha1": "054165cfb4ec0e083109685315d3b1e72f7a0e00",
+   "bytes": 4918484,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON D5200"
+   },
+   "group": "photo"
+  },
+  {
+   "title": "File:Above Lock No 3, Worcester and Birmingham Canal - geograph.org.uk - 465394.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/a/a1/Above_Lock_No_3%2C_Worcester_and_Birmingham_Canal_-_geograph.org.uk_-_465394.jpg",
+   "sha1": "f16524821b1db5f43f9aac0486371a32c999981a",
+   "bytes": 108297,
+   "licence": "CC BY-SA 2.0",
+   "exif": {},
+   "group": "gray"
+  },
+  {
+   "title": "File:1 Jackson Place LOC hec.13821.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/7/7e/1_Jackson_Place_LOC_hec.13821.jpg",
+   "sha1": "25e869f05c3f863fbcc5f0fc2c8e4a41125b7310",
+   "bytes": 8327535,
+   "licence": "Public domain",
+   "exif": {},
+   "group": "gray"
+  },
+  {
+   "title": "File:2 illustrations)- 1. Ten cylinder type-revolving printing machine; 2. Eight cylinder type-revolving printing machine LCCN2004670961.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/b/be/2_illustrations%29-_1._Ten_cylinder_type-revolving_printing_machine%3B_2._Eight_cylinder_type-revolving_printing_machine_LCCN2004670961.jpg",
+   "sha1": "8e99c4877abf06c3aaf669c226843859ed8801b0",
+   "bytes": 260388,
+   "licence": "Public domain",
+   "exif": {},
+   "group": "gray"
+  },
+  {
+   "title": "File:Abbaye Saint-Magloire de L\u00e9hon, C\u00f4tes d'Armor, r\u00e9fectoire Sap01 mh033394 p.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/8/8e/Abbaye_Saint-Magloire_de_L%C3%A9hon%2C_C%C3%B4tes_d%27Armor%2C_r%C3%A9fectoire_Sap01_mh033394_p.jpg",
+   "sha1": "11c11426a911c83b625524e43e375ff209edd3f7",
+   "bytes": 50840,
+   "licence": "Public domain",
+   "exif": {},
+   "group": "gray"
+  },
+  {
+   "title": "File:500px photo (49750466).jpeg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/f/f1/500px_photo_%2849750466%29.jpeg",
+   "sha1": "32d497519299da338f79db1e95ee5215c12fe053",
+   "bytes": 261392,
+   "licence": "CC BY-SA 3.0",
+   "exif": {},
+   "group": "gray"
+  },
+  {
+   "title": "File:25. Sz\u00ednh\u00e1z - V\u00f6r\u00f6s zsolt\u00e1r.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/2/2a/25._Sz%C3%ADnh%C3%A1z_-_V%C3%B6r%C3%B6s_zsolt%C3%A1r.jpg",
+   "sha1": "dd4232fd5184933f826e00263b5022a03caa1548",
+   "bytes": 592685,
+   "licence": "CC BY-SA 3.0",
+   "exif": {},
+   "group": "gray"
+  },
+  {
+   "title": "File:CC BY \u043d\u0430 \u0441\u0430\u0439\u0442\u0456 \u041f\u0440\u0435\u0437\u0438\u0434\u0435\u043d\u0442\u0430 \u0423\u043a\u0440\u0430\u0457\u043d\u0438.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/5/52/CC_BY_%D0%BD%D0%B0_%D1%81%D0%B0%D0%B9%D1%82%D1%96_%D0%9F%D1%80%D0%B5%D0%B7%D0%B8%D0%B4%D0%B5%D0%BD%D1%82%D0%B0_%D0%A3%D0%BA%D1%80%D0%B0%D1%97%D0%BD%D0%B8.jpg",
+   "sha1": "e6a01f4de0c9f9fadf34c2a97c7ba31a049c6dd3",
+   "bytes": 151600,
+   "licence": "CC BY-SA 4.0",
+   "exif": {},
+   "group": "screenshot"
+  },
+  {
+   "title": "File:Art &Feminism poster BW.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/1/1d/Art_%26Feminism_poster_BW.jpg",
+   "sha1": "56fbedb836c20808febacf6c22a861236b3dc966",
+   "bytes": 179931,
+   "licence": "CC BY-SA 4.0",
+   "exif": {},
+   "group": "screenshot"
+  },
+  {
+   "title": "File:Banner \u00abWikiDamas en Com\u00fan 2\u00bb.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/8/83/Banner_%C2%ABWikiDamas_en_Com%C3%BAn_2%C2%BB.jpg",
+   "sha1": "6f72219782271b0f2780437e1cd3a60bdf5150b2",
+   "bytes": 92953,
+   "licence": "CC BY-SA 4.0",
+   "exif": {},
+   "group": "screenshot"
+  },
+  {
+   "title": "File:AnomChat.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/b/bd/AnomChat.jpg",
+   "sha1": "05bc74173440a4bd70c944a5361a0ac86cd9839f",
+   "bytes": 77092,
+   "licence": "Public domain",
+   "exif": {},
+   "group": "screenshot"
+  },
+  {
+   "title": "File:Version 2.1.0.0 free.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/d/d6/Version_2.1.0.0_free.jpg",
+   "sha1": "ccc838a64a8dbf4356ea6606b0067ae2eaf7a55b",
+   "bytes": 114023,
+   "licence": "CC BY-SA 4.0",
+   "exif": {},
+   "group": "screenshot"
+  },
+  {
+   "title": "File:ClaraIO Coke Rendering.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/2/29/ClaraIO_Coke_Rendering.jpg",
+   "sha1": "2513bc1d5a893123013a2a9f68162a2d3df1aef0",
+   "bytes": 167899,
+   "licence": "CC BY-SA 3.0",
+   "exif": {},
+   "group": "screenshot"
+  },
+  {
+   "title": "File:Bike Lane Sign.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/0/09/Bike_Lane_Sign.jpg",
+   "sha1": "5d86fc7b4147d441a3bef9cd68eaaf417af930cb",
+   "bytes": 7893159,
+   "licence": "CC0",
+   "exif": {
+    "Make": "samsung",
+    "Model": "SM-G970W"
+   },
+   "group": "scan"
+  },
+  {
+   "title": "File:Descripci\u00f3n de el \"Renacimiento Inca\".jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/8/85/Descripci%C3%B3n_de_el_%22Renacimiento_Inca%22.jpg",
+   "sha1": "3ae1f1981bb70c2ca57cf7527d980b272b2a36fd",
+   "bytes": 153775,
+   "licence": "CC0",
+   "exif": {},
+   "group": "scan"
+  },
+  {
+   "title": "File:Echo City, looking up Weber River. - DPLA - 1240cd70edf1223db7293bca97b31758.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/f/f0/Echo_City%2C_looking_up_Weber_River._-_DPLA_-_1240cd70edf1223db7293bca97b31758.jpg",
+   "sha1": "0ae1b7835be705da44d967ac4a78b735bd98f70b",
+   "bytes": 216579,
+   "licence": "Public domain",
+   "exif": {
+    "Make": "Sinar AG",
+    "Model": "Sinarback 54 FW, Sinar m"
+   },
+   "group": "scan"
+  },
+  {
+   "title": "File:Der Jungbrunnen.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/2/2d/Der_Jungbrunnen.jpg",
+   "sha1": "bfcdbed9c0fd2fe8e25aa5d60bcaee7bb2d25d14",
+   "bytes": 3895731,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "DJI",
+    "Model": "FC3582"
+   },
+   "group": "scan"
+  },
+  {
+   "title": "File:McKenzie w-press, JP car barn - DPLA - 3fff04741f5ae2bb754deb191facd89f.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/d/d9/McKenzie_w-press%2C_JP_car_barn_-_DPLA_-_3fff04741f5ae2bb754deb191facd89f.jpg",
+   "sha1": "1be1d4f434801180995a029d7dab9e974016c4db",
+   "bytes": 303714,
+   "licence": "Public domain",
+   "exif": {},
+   "group": "scan"
+  },
+  {
+   "title": "File:Charles R. Baker, Elaine D. Matthews - DPLA - 35a769d4aaccce8eb038adce61cf3dcb.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/a/a8/Charles_R._Baker%2C_Elaine_D._Matthews_-_DPLA_-_35a769d4aaccce8eb038adce61cf3dcb.jpg",
+   "sha1": "771cc2e83cb1ac840a3989305835fde89902e712",
+   "bytes": 204819,
+   "licence": "Public domain",
+   "exif": {},
+   "group": "scan"
+  },
+  {
+   "title": "File:00004 Keystone (11-22-25).jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/8/8b/00004_Keystone_%2811-22-25%29.jpg",
+   "sha1": "fa0c86d070999c6805f0639796c6caed0650a95e",
+   "bytes": 779552,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "VTech",
+    "Model": "Kidizoom camera"
+   },
+   "group": "scan"
+  },
+  {
+   "title": "File:European Monument Study.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/d/d4/European_Monument_Study.jpg",
+   "sha1": "d4068e56dc3495810474807192ec7135a07d15f0",
+   "bytes": 2953527,
+   "licence": "CC BY 4.0",
+   "exif": {
+    "Make": "Canon",
+    "Model": "Canon PowerShot ELPH 180"
+   },
+   "group": "scan"
+  },
+  {
+   "title": "File:Airspace Chart.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/7/78/Airspace_Chart.jpg",
+   "sha1": "eaae9d81e47ca3b3a9bbe7543892ffbac9898d77",
+   "bytes": 106378,
+   "licence": "CC BY-SA 4.0",
+   "exif": {},
+   "group": "web"
+  },
+  {
+   "title": "File:Deckenmalerei Restaurant Paris-Moskau, Berlin 1984.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/3/35/Deckenmalerei_Restaurant_Paris-Moskau%2C_Berlin_1984.jpg",
+   "sha1": "60e0dc110d68f0b5d6c377b0ca7a726d1b779781",
+   "bytes": 215948,
+   "licence": "CC BY 4.0",
+   "exif": {},
+   "group": "web"
+  },
+  {
+   "title": "File:Campagne Les vacances de Wikimedia au Coll\u00e8ge 8.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/7/72/Campagne_Les_vacances_de_Wikimedia_au_Coll%C3%A8ge_8.jpg",
+   "sha1": "6a82f225120700d3933f4e004bd94ab1eaf1a1ae",
+   "bytes": 86929,
+   "licence": "CC BY-SA 4.0",
+   "exif": {},
+   "group": "web"
+  },
+  {
+   "title": "File:CE17.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/1/1a/CE17.jpg",
+   "sha1": "e3817f29e1c8b365365b8bd830ed48bee535b73b",
+   "bytes": 150890,
+   "licence": "CC BY-SA 4.0",
+   "exif": {},
+   "group": "web"
+  },
+  {
+   "title": "File:4th AWA conference1.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/6/6c/4th_AWA_conference1.jpg",
+   "sha1": "844154f719eeb7bcee67993166188bed3b1324f7",
+   "bytes": 17828,
+   "licence": "CC BY-SA 4.0",
+   "exif": {},
+   "group": "web"
+  },
+  {
+   "title": "File:Exposition FARB, 2018.jpg",
+   "url": "https://upload.wikimedia.org/wikipedia/commons/2/27/Exposition_FARB%2C_2018.jpg",
+   "sha1": "86f5a3b9dbac13d32af202609755eeb7bc8dbd35",
+   "bytes": 209510,
+   "licence": "CC BY-SA 4.0",
+   "exif": {
+    "Make": "SONY",
+    "Model": "NEX-VG30E"
+   },
+   "group": "web"
+  }
+ ],
+ "excluded": [
+  "datasets/jpeg_heldout.json"
+ ]
+}
