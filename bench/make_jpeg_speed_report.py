@@ -141,6 +141,49 @@ def verdict(k, t, axis):
     return ("win" if r < -TIE else "loss" if r > TIE else "tie"), f"{100 * r:+.0f}% memory"
 
 
+def progressive(path):
+    """Whether the JPEG file at `path` (relative to bench/) has a progressive frame, from its markers."""
+    b = open(os.path.join(HERE, path), "rb").read()
+    i = 2
+    while i + 4 <= len(b) and b[i] == 0xFF:
+        m = b[i + 1]
+        if m == 0xFF:
+            i += 1
+            continue
+        if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:
+            i += 2
+            continue
+        if m in (0xC0, 0xC1, 0xC3, 0xC9, 0xCB):
+            return False
+        if m in (0xC2, 0xCA, 0xC6, 0xCE):
+            return True
+        i += 2 + int.from_bytes(b[i + 2:i + 4], "big")
+    return False
+
+
+def frame_split(rows, images):
+    """Sizes on the sequential and the progressive files of a set (one thread; Dropbox's Lepton
+    with all threads, as its single-threaded mode refuses many progressive files), and on the
+    files every tool restored."""
+    prog = {im: progressive(im) for im in images}
+    ids = [c for c, _ in CODECS if c != "komla-pr2"]
+    th = {c: "mt" if c == "lepton" else "1t" for c in ids}
+    sets = {c: [r for r in rows if r["codec"] == c and r["threads"] == th[c]] for c in ids}
+    sets = {c: rs for c, rs in sets.items() if len(rs) == len(images)}
+    restored = {im for im in images if all(r["ok"] for rs in sets.values() for r in rs if r["image"] == im)}
+    ns, np_ = sum(1 for im in images if not prog[im]), sum(1 for im in images if prog[im])
+    out = ["### Sequential and progressive files", "", f"paq8px has no model for progressive JPEGs, so its total depends on how many a set has. Sizes on the {ns} sequential (baseline) and {np_} progressive files, and on the {len(restored)} files every tool restored (failures count at the original size elsewhere). One thread, except Dropbox's Lepton (all threads: single-threaded, it refuses many progressive files).", "",
+           f"| Tool | Sequential | Progressive | Total | Files every tool restored |", "|---|---|---|---|---|"]
+    def saved(sel):
+        i = sum(r["input"] for r in sel)
+        o = sum(r["bytes"] if r["ok"] else r["input"] for r in sel)
+        return f"{100 * (1 - o / i):.2f}%" if i else "n/a"
+    for c, rs in sets.items():
+        shown = f"**{LABEL[c]}**" if c in KOMLA else LABEL[c].replace(")", ", all threads)") if th[c] == "mt" else LABEL[c]
+        out.append(f"| {shown} | {saved([r for r in rs if not prog[r['image']]])} | {saved([r for r in rs if prog[r['image']]])} | {saved(rs)} | {saved([r for r in rs if r['image'] in restored])} |")
+    return out + [""]
+
+
 def paq_subset(rows, images):
     """When paq8px finished only part of a set: every tool's size on exactly those files."""
     done = {r["image"] for r in rows if r["codec"] == "paq8px" and r["threads"] == "1t"}
@@ -247,6 +290,7 @@ def set_section(name, rows):
         shown = f"**{label}**" if cid in KOMLA else label
         out.append(f"| {shown} | " + " | ".join(cells) + f" | {fmt(table[(cid, '1t')]['saved'])}% |")
     out.append("")
+    out += frame_split(rows, images)
     return out, table, len(images), total
 
 
