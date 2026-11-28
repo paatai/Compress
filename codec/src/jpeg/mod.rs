@@ -539,7 +539,7 @@ pub fn decompress(b: &[u8], progress: &mut dyn FnMut(f32)) -> Result<Vec<u8>, St
 // Fast mode
 //
 //   "KMLA" | 'J' | version | MODE_FAST | varint original length | CRC-32 of the original file
-//   varint header-blob length | varint coded length | header blob (`fast::encode_bytes`)
+//   varint header-blob length | varint coded length | header blob (`encode_blob`)
 //   varint trailer length | trailer kind | varint coded length | coded trailer
 //   varint side-info length | side info (per scan: padding, garbage, end-of-band choices)
 //   varint stripe count | per stripe: varint rANS length, varint raw length | stripe data
@@ -752,10 +752,128 @@ fn stored_fast(data: &[u8], note: String) -> (Vec<u8>, JpegInfo) {
 /// Compresses a JPEG file in the fast mode with up to `threads` threads. Never fails: input
 /// that cannot be recompressed exactly is stored.
 pub fn compress_fast(data: &[u8], threads: usize) -> (Vec<u8>, JpegInfo) {
-    match analyze_fast(data, threads) {
+    compress_nested(data, threads, 0)
+}
+
+/// `compress_fast` for a container nested `depth` deep (see `restore`).
+fn compress_nested(data: &[u8], threads: usize, depth: u32) -> (Vec<u8>, JpegInfo) {
+    match analyze_fast(data, threads, depth) {
         Ok(r) => r,
         Err(e) => stored_fast(data, e),
     }
+}
+
+/// First byte of a coded header blob in the forms of `encode_blob` (`fast::encode_bytes`
+/// starts with 0 or 1).
+const BLOB_PICTURES: u8 = 2;
+const BLOB_LITE: u8 = 3;
+
+/// Codes a header blob: JPEG pictures embedded in it (thumbnails in Exif or Photoshop
+/// segments, often the same one twice) in the fast mode where that is smaller, the rest with
+/// the light context-mixing model, or the byte model where that is not larger. Without
+/// pictures and with the byte model this is `fast::encode_bytes`; otherwise
+///   BLOB_PICTURES or BLOB_LITE | varint count | per picture: varint bytes of the rest before
+///   it, varint length, varint coded length, coded picture (length 0: varint index of an
+///   earlier picture with the same bytes) | rest (`fast::encode_bytes` or
+///   `bytecm::encode_lite`)
+fn encode_blob(blob: &[u8], depth: u32) -> Vec<u8> {
+    // (gap, start, length, coded or earlier index)
+    let mut pics: Vec<(usize, usize, usize, Result<Vec<u8>, usize>)> = Vec::new();
+    let mut rest = Vec::new();
+    // (the blob itself starts with a start-of-image marker; every candidate may be parsed up to
+    // the end of the blob, so there are only a few)
+    let (mut from, mut i) = (0, 1);
+    for _ in 0..if depth < MAX_DEPTH { 16 } else { 0 } {
+        let Some(k) = blob[i..].windows(3).position(|w| w == [0xFF, 0xD8, 0xFF]) else { break };
+        let s = i + k;
+        i = s + 1;
+        let Ok(l) = format::parse(&blob[s..], true) else { continue };
+        let n = l.end;
+        let pic = &blob[s..s + n];
+        let coded = match pics.iter().position(|p| &blob[p.1..p.1 + p.2] == pic) {
+            Some(j) => Err(j),
+            None => match compress_nested(pic, 1, depth + 1) {
+                (c, info) if info.mode == MODE_FAST && c.len() < n => Ok(c),
+                _ => continue,
+            },
+        };
+        rest.extend_from_slice(&blob[from..s]);
+        pics.push((s - from, s, n, coded));
+        from = s + n;
+        i = from;
+    }
+    rest.extend_from_slice(&blob[from..]);
+    let plain = fast::encode_bytes(&rest);
+    let lite = bytecm::encode_lite(&rest);
+    if pics.is_empty() && plain.len() <= lite.len() {
+        return plain;
+    }
+    let mut out = vec![if plain.len() <= lite.len() { BLOB_PICTURES } else { BLOB_LITE }];
+    put_varint(&mut out, pics.len() as u64);
+    for (gap, _, n, coded) in &pics {
+        put_varint(&mut out, *gap as u64);
+        put_varint(&mut out, *n as u64);
+        match coded {
+            Ok(c) => {
+                put_varint(&mut out, c.len() as u64);
+                out.extend_from_slice(c);
+            }
+            Err(j) => {
+                put_varint(&mut out, 0);
+                put_varint(&mut out, *j as u64);
+            }
+        }
+    }
+    out.extend_from_slice(if plain.len() <= lite.len() { &plain } else { &lite });
+    out
+}
+
+/// Inverse of `encode_blob` for a blob of `n` bytes in a container nested `depth` deep.
+fn decode_blob(c: &[u8], n: usize, threads: usize, depth: u32) -> Result<Vec<u8>, String> {
+    let kind = c.first().copied();
+    if kind != Some(BLOB_PICTURES) && kind != Some(BLOB_LITE) {
+        return fast::decode_bytes(c, n);
+    }
+    let mut pos = 1;
+    let count = get_varint(c, &mut pos)?;
+    if count > c.len() as u64 {
+        return Err("corrupt .komla file".into());
+    }
+    let mut pics = Vec::new();
+    let mut left = n as u64;
+    for _ in 0..count {
+        let gap = get_varint(c, &mut pos)?;
+        let len = get_varint(c, &mut pos)?;
+        let cl = get_varint(c, &mut pos)?;
+        left = left.checked_sub(len).ok_or("corrupt .komla file")?;
+        pics.push((gap, len, if cl == 0 { Err(get_varint(c, &mut pos)?) } else { Ok(take(c, &mut pos, cl)?) }));
+    }
+    let rest = if kind == Some(BLOB_LITE) { bytecm::decode_lite(&c[pos..], left as usize)? } else { fast::decode_bytes(&c[pos..], left as usize)? };
+    let mut out = Vec::with_capacity(n);
+    let mut at = 0usize;
+    // where each picture went
+    let mut done: Vec<(usize, u64)> = Vec::with_capacity(pics.len());
+    for (gap, len, pic) in pics {
+        let g = usize::try_from(gap).ok().filter(|&g| g <= rest.len() - at).ok_or("corrupt .komla file")?;
+        out.extend_from_slice(&rest[at..at + g]);
+        at += g;
+        let start = out.len();
+        match pic {
+            Ok(pic) => {
+                let (m, _) = restore(&pic, start as u64, &mut out, threads, depth + 1)?;
+                if m != len {
+                    return Err(damaged());
+                }
+            }
+            Err(j) => {
+                let &(s, m) = usize::try_from(j).ok().and_then(|j| done.get(j)).filter(|d| d.1 == len).ok_or("corrupt .komla file")?;
+                out.extend_from_within(s..s + m as usize);
+            }
+        }
+        done.push((start, len));
+    }
+    out.extend_from_slice(&rest[at..]);
+    Ok(out)
 }
 
 /// A stripe on its way through compression: its coefficients and the choices its scans made.
@@ -830,7 +948,7 @@ fn verify_scans(l: &Layout, data: &[u8], rows: &[(usize, usize)], next: &mut dyn
     Ok(side)
 }
 
-fn analyze_fast(data: &[u8], threads: usize) -> Result<(Vec<u8>, JpegInfo), String> {
+fn analyze_fast(data: &[u8], threads: usize, depth: u32) -> Result<(Vec<u8>, JpegInfo), String> {
     if data.len() > u32::MAX as usize {
         return Err("file too large".into());
     }
@@ -841,8 +959,8 @@ fn analyze_fast(data: &[u8], threads: usize) -> Result<(Vec<u8>, JpegInfo), Stri
     let trailer = &data[l.end..];
     // the header bytes and the trailer (which may be another JPEG)
     let extras = || {
-        let blob = fast::encode_bytes(&l.blob);
-        let t = match is_jpeg(trailer).then(|| compress_fast(trailer, threads)) {
+        let blob = encode_blob(&l.blob, depth);
+        let t = match (is_jpeg(trailer) && depth < MAX_DEPTH).then(|| compress_nested(trailer, threads, depth + 1)) {
             Some((nested, info)) if info.mode == MODE_FAST && nested.len() < trailer.len() => (TRAILER_FAST, nested),
             _ => (TRAILER_CM, fast::encode_bytes(trailer)),
         };
@@ -1237,14 +1355,14 @@ struct FastContainer {
     stripes: Vec<(u64, u64, u64)>,
 }
 
-fn parse_fast(inp: &dyn Input, len: u64, pos: u64) -> Result<FastContainer, String> {
+fn parse_fast(inp: &dyn Input, len: u64, pos: u64, threads: usize, depth: u32) -> Result<FastContainer, String> {
     let mut r = Rd { inp, pos };
     let n = r.varint()?;
     let cl = r.varint()?;
     if n > len {
         return Err("corrupt .komla file".into());
     }
-    let blob = fast::decode_bytes(&r.bytes(cl)?, n as usize)?;
+    let blob = decode_blob(&r.bytes(cl)?, n as usize, threads, depth)?;
     let tl = r.varint()?;
     if tl > len {
         return Err("corrupt .komla file".into());
@@ -1392,7 +1510,7 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
         MODE_FAST => {}
         _ => return Err("not a fast-mode Komla JPEG file".into()),
     }
-    let c = parse_fast(inp, len, r.pos)?;
+    let c = parse_fast(inp, len, r.pos, threads, depth)?;
     let l = format::parse(&c.blob, false)?;
     let f = &l.frame;
     let rows = fast_stripes(f);
@@ -1730,7 +1848,7 @@ pub fn summary(b: &[u8]) -> Result<(JpegInfo, usize, u32), String> {
             let crc = u32::from_le_bytes(take(b, &mut pos, 4)?.try_into().unwrap());
             let mut i = JpegInfo { mode: b[6], ..Default::default() };
             if b[6] == MODE_FAST {
-                let c = parse_fast(&b, len as u64, pos as u64)?;
+                let c = parse_fast(&b, len as u64, pos as u64, 1, 0)?;
                 let l = format::parse(&c.blob, false)?;
                 let f = &l.frame;
                 i.width = f.width as u32;
