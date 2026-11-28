@@ -1974,13 +1974,14 @@ pub struct Model {
     pw: Vec<[[i32; NLSW]; 49]>,
     /// normal equations of the interior prediction (training only)
     ls_acc: Vec<f64>,
-    /// recent errors of the candidate edge extrapolations (see EGS) per class, edge and position
+    /// recent errors of the candidate edge extrapolations (see EGS) per class, edge, position and
+    /// activity
     eg: Vec<[u32; NEG]>,
-    /// the same for DC (see DGS) per class and side, and for the weights of the two sides (also
-    /// by NOB)
+    /// the same for DC (see DGS) per class, activity and side, and for the weights of the two
+    /// sides (also by NOB) and of the median predictor (both also by the sides' relative activity)
     edc: [[u32; NDGS]; 144],
-    edw: [[u32; NDG]; 24 * NOB],
-    edm: [[u32; NDG]; 24],
+    edw: [[u32; NDG]; 24 * NOB * 9],
+    edm: [[u32; NDG]; 24 * 9],
     // second (and third) distributions or probabilities of the same decisions in other
     // contexts, averaged with the first
     ezero2: CountedBits,
@@ -2022,7 +2023,7 @@ impl Model {
             nz_lo: Table::new(NNZB * (1 + NLUMA) * 7, 8, flat8),
             zero: CountedBits::new(2 * NREM * 49 * NEQ),
             mag: Table::new(2 * NREM8 * NKZ * NEQ, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
-            nze: Table::new(2 * 8 * 6 * (8 + NXE), 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
+            nze: Table::new(2 * 6 * (12 * 8 + 8 * NXE), 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
             ezero: CountedBits::new(2 * 2 * 7 * 4 * NPB * NAQ * NBE),
             emag: Table::new(2 * 2 * 4 * NTOK * NAQ * NBE * 4, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
             esign: CountedBits::new(ESIGN_DC + 2 * 4 * 5 * 5 * 2),
@@ -2037,17 +2038,17 @@ impl Model {
             ls_acc: if training() { vec![0.0; 2 * 49 * (NLSW * NLSW + NLSW)] } else { Vec::new() },
             eg: vec![[1, 1, 1, 1, 0, 1, 1, 1, 1]; 1152],
             edc: [[1, 1, 1, 0, 1, 1, 1, 1, 1]; 144],
-            edw: [[1, 1, 0, 1, 1]; 24 * NOB],
-            edm: [[0, 1, 1, 1, 1]; 24],
+            edw: [[1, 1, 0, 1, 1]; 24 * NOB * 9],
+            edm: [[0, 1, 1, 1, 1]; 24 * 9],
             ezero2: CountedBits::new(2 * 2 * 7 * 8 * 8 * 4),
             emag2: Table::new(2 * 2 * 7 * NTOK * NAQ * 4, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
             emag3: Table::new(2 * 2 * 7 * NTOK * 12 * 4, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
             mag2: Table::new(2 * 49 * NEQ * 8, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
             mag3: Table::new(5 * 2 * 49 * NREM, NTOK - 1, Cdf::new(NTOK - 1, &geo[1..])),
-            dc2: Table::new(2 * 16 * 4 * 10, NTOK, Cdf::new(NTOK, &geo)),
+            dc2: Table::new(24 * 16 * 10, NTOK, Cdf::new(NTOK, &geo)),
             nz_hi2: Table::new(2 * NNZB * NNZB, 7, Cdf::new(7, &[8; 7])),
             nz_lo2: Table::new(2 * NNZB * NNZB * 7, 8, flat8),
-            nze2: Table::new(2 * 2 * 8 * 8, 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
+            nze2: Table::new(2 * 2 * 8 * 8 * 8, 8, Cdf::new(8, &[64, 32, 16, 8, 4, 2, 1, 1])),
             emant2: CountedBits::new(2 * EMANT2_2),
             imant2: CountedBits::new(2 * IMANT2_2),
         };
@@ -2256,20 +2257,23 @@ impl Model {
         // it), and the count by their summed magnitudes
         let mut pp = [(0i32, (0i64, 0i64), 0usize); 8];
         let mut psum = 0u32;
+        let mut pc = 0;
         if nbr.is_some() {
             for (j, x) in pp.iter_mut().enumerate().skip(1) {
-                *x = edge_pred(&self.eg[ge(j) % 1152], e0[j], ed[j], rq[j * step]);
+                *x = edge_pred(&self.eg[ge(j)], e0[j], ed[j], rq[j * step]);
                 psum += ((x.0 + 8) >> 4).unsigned_abs();
+                pc += ((x.0 + 8) >> 4 != 0) as usize;
             }
         }
         // (luma blocks have no other component's counts; chroma has them in place of the
-        // neighbours')
+        // neighbours'; luma by the interior's activity in place of its count)
         let ps = PSQ[bitlen(psum).min(15) as usize] as usize;
-        let ctx = if cls == 0 { ((dir * 8 + nzq) * 8 + pnz) * 6 + ps } else { 2 * 8 * 8 * 6 + ((dir * 8 + nzq) * 6 + ps) * NXE + xe };
-        // and by the count of the block that the edge continues and the number of nonzero
-        // coefficients in the interior row (column) next to the edge
+        let ctx = if cls == 0 { ((dir * 12 + lv) * 8 + pnz) * 6 + ps } else { 2 * 12 * 8 * 6 + ((dir * 8 + nzq) * 6 + ps) * NXE + xe };
+        // and by the count of the block that the edge continues, the number of nonzero
+        // coefficients in the interior row (column) next to the edge and the number of positions
+        // predicted nonzero
         let adjc = (1..8).filter(|&i| blk[i * step + across] != 0).count();
-        let n = self.nze.sym2(&mut self.nze2, io, ctx, ((cls * 2 + dir) * 8 + nnz) * 8 + adjc, 8, actual);
+        let n = self.nze.sym2(&mut self.nze2, io, ctx, (((cls * 2 + dir) * 8 + nnz) * 8 + adjc) * 8 + pc, 8, actual);
         let mut rem = n;
         let mut i = 1;
         // magnitude of the previous edge coefficient, by token (DC is coded later)
@@ -2284,7 +2288,7 @@ impl Model {
                 Some(_) => {
                     let (p16, b, k) = pp[i];
                     // and its recent mean error: below 2 steps, 4, 8, more
-                    (p16, Some(b), bitlen(self.eg[ge(i) % 1152][k] >> 10).min(3) as usize)
+                    (p16, Some(b), bitlen(self.eg[ge(i)][k] >> 10).min(3) as usize)
                 }
                 None => (0, None, 0),
             };
@@ -2358,7 +2362,7 @@ impl Model {
             }
             if let Some((b0, bd)) = accs {
                 let v = ((blk[pos] as i64) << 24) - b0;
-                let e = &mut self.eg[ge(i) % 1152];
+                let e = &mut self.eg[ge(i)];
                 for (c, x) in e.iter_mut().enumerate() {
                     let d = ((v - EGS[c] * bd).unsigned_abs() >> 20).min(1024) as u32;
                     *x = *x - (*x >> EG_SHIFT) + d;
@@ -2632,7 +2636,7 @@ impl Model {
             };
             let (ol, oa) = (off.1 + DC_MEM * ml * q[0] as u64, off.0 + DC_MEM * ma * q[0] as u64);
             let ob = 2 + (4 * oa < ol) as usize + (2 * oa < ol) as usize - (4 * ol < oa) as usize - (2 * ol < oa) as usize;
-            let ew = ec * NOB + ob;
+            let ew = (ec * NOB + ob) * 9 + rel(l) * 3 + rel(a);
             let kw = best(&self.edw[ew]);
             // the median predictor from the neighbours' DC, mixed in by quarters
             let pm = match (a, l) {
@@ -2649,7 +2653,8 @@ impl Model {
                 None => p,
             };
             let pb = comb(xy, kw as i32).unwrap_or(0);
-            let p16 = mix(pb, best(&self.edm[ec]) as i32);
+            let em = ec * 9 + rel(l) * 3 + rel(a);
+            let p16 = mix(pb, best(&self.edm[em]) as i32);
             let ub = match xy {
                 (Some(x), Some(y)) => 1 + bitlen(((x - y + 8) >> 4).unsigned_abs()).min(8) as usize,
                 (Some(_), None) | (None, Some(_)) => 10,
@@ -2663,12 +2668,13 @@ impl Model {
             // octaves up to 256 and more
             let (m, step) = (ol.min(oa), 16 * q[0].max(1) as u64);
             let dl = (1..10).map(|k| (m >= step << (k - 1)) as usize).sum::<usize>();
-            // and by the difference of the two extrapolations (and that level)
+            // and by the difference of the two extrapolations (and that level; this one by the
+            // AC octave in place of the count)
             let dif = match xy {
                 (Some(x), Some(y)) => token(((x - y + 8) >> 4).unsigned_abs()),
                 _ => 15,
             };
-            let t = self.dc.sym2(&mut self.dc2, io, (((cls * 11 + ub) * 4 + nzq) * 4 + dq) * 10 + dl, ((cls * 16 + dif) * 4 + nzq) * 10 + dl, NTOK, if I::DEC { 0 } else { token(d.unsigned_abs()) });
+            let t = self.dc.sym2(&mut self.dc2, io, (((cls * 11 + ub) * 4 + nzq) * 4 + dq) * 10 + dl, (ec * 16 + dif) * 10 + dl, NTOK, if I::DEC { 0 } else { token(d.unsigned_abs()) });
             info.dct = t as u8;
             // the sign by the rounding of the prediction
             let f = p16 - (pred << 4);
@@ -2700,7 +2706,7 @@ impl Model {
                 }
             }
             if pm.is_some() {
-                for (c, x) in self.edm[ec].iter_mut().enumerate() {
+                for (c, x) in self.edm[em].iter_mut().enumerate() {
                     let d = (v16 - mix(pb, c as i32) as i64).unsigned_abs().min(1024) as u32;
                     *x = *x - (*x >> EG_SHIFT) + d;
                 }
