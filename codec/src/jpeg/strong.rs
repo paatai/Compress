@@ -30,30 +30,26 @@ const RANS_L: u32 = 1 << 16;
 #[repr(C, align(32))]
 pub struct Cdf([u16; 16]);
 
-const LIMIT: u8 = 62;
+/// Update count at which the distributions settle (the counts stop there).
+const LIMIT: u8 = 180;
 
-/// Update shift after n updates: log2(n + 2) + 1, between 3 and 8 (at most 7 with the counts
-/// capped at `LIMIT`).
-static SHIFT: [u32; 128] = {
-    let mut r = [0u32; 128];
+/// Update shifts by count: `first`, then one more from each count in `at` on.
+const fn steps(first: u32, at: &[usize]) -> [u32; 256] {
+    let mut r = [first; 256];
     let mut i = 0;
-    while i < 128 {
-        let mut s = 0u32;
-        while (1usize << (s + 1)) <= i + 2 {
-            s += 1;
+    while i < 256 {
+        let mut k = 0;
+        while k < at.len() {
+            r[i] += (i >= at[k]) as u32;
+            k += 1;
         }
-        s += 1;
-        r[i] = if s < 3 {
-            3
-        } else if s > 8 {
-            8
-        } else {
-            s
-        };
         i += 1;
     }
     r
-};
+}
+
+/// Update shift after n updates: 3, then one more from 6, 14, 50, 120 and `LIMIT` updates on.
+static SHIFT: [u32; 256] = steps(3, &[6, 14, 50, 120, LIMIT as usize]);
 
 /// Targets of the update for an alphabet of n symbols: the starts of symbols up to the coded one
 /// move towards LO, the others towards HI, which keeps one unit of frequency for every symbol.
@@ -108,11 +104,11 @@ impl Cdf {
         let start = self.0[s & 15] as u32;
         (start, self.0[(s + 1) & 15] as u32 - start)
     }
-    /// Moves every cumulative frequency towards its target by 2^-shift of the distance; `cnt`
-    /// counts the updates.
+    /// Moves every cumulative frequency towards its target by 2^-shift of the distance, rounded
+    /// up; `cnt` counts the updates.
     #[inline(always)]
     fn update<L: Lanes>(&mut self, cnt: &mut u8, s: usize, n: usize) {
-        L::update(&mut self.0, s + 1, &TARGETS.lo[n & 15], &TARGETS.hi[n & 15], SHIFT[(*cnt & 127) as usize]);
+        L::update(&mut self.0, s + 1, &TARGETS.lo[n & 15], &TARGETS.hi[n & 15], SHIFT[*cnt as usize]);
         *cnt += (*cnt < LIMIT) as u8;
     }
 }
@@ -408,9 +404,10 @@ impl CountedBits {
 }
 
 /// The vector operations on a distribution: `find` counts the cumulative frequencies at or
-/// below a slot, `update` moves lanes from `j` on towards `hi` and the others towards `lo`,
-/// `mean2` averages two distributions over the same alphabet, rounding up (so every symbol
-/// keeps a frequency of at least 1). Every implementation computes the same integers.
+/// below a slot, `update` moves lanes from `j` on towards `hi` and the others towards `lo` by
+/// 2^-shift of the distance rounded up (so they get there), `mean2` averages two distributions
+/// over the same alphabet, rounding up (so every symbol keeps a frequency of at least 1). Every
+/// implementation computes the same integers.
 pub trait Lanes {
     fn find(c: &[u16; 16], slot: u16) -> usize;
     fn update(c: &mut [u16; 16], j: usize, lo: &[u16; 16], hi: &[u16; 16], shift: u32);
@@ -519,7 +516,8 @@ mod avx2 {
         let v = _mm256_loadu_si256(p);
         let m = _mm256_loadu_si256(super::GE_MASK[j & 15].as_ptr() as *const __m256i);
         let t = _mm256_blendv_epi8(_mm256_loadu_si256(lo.as_ptr() as *const __m256i), _mm256_loadu_si256(hi.as_ptr() as *const __m256i), m);
-        let d = _mm256_sra_epi16(_mm256_sub_epi16(t, v), _mm_cvtsi32_si128(shift as i32));
+        // (the mask is -1 on the upward lanes: one less before the shift and one more after it)
+        let d = _mm256_sub_epi16(_mm256_sra_epi16(_mm256_add_epi16(_mm256_sub_epi16(t, v), m), _mm_cvtsi32_si128(shift as i32)), m);
         _mm256_storeu_si256(p, _mm256_add_epi16(v, d));
     }
 
@@ -638,7 +636,7 @@ mod simd {
                 let v = _mm_loadu_si128(p.add(j));
                 let mk = _mm_loadu_si128(m.add(j));
                 let t = _mm_or_si128(_mm_and_si128(mk, _mm_loadu_si128(h.add(j))), _mm_andnot_si128(mk, _mm_loadu_si128(l.add(j))));
-                let d = _mm_sra_epi16(_mm_sub_epi16(t, v), sh);
+                let d = _mm_sub_epi16(_mm_sra_epi16(_mm_add_epi16(_mm_sub_epi16(t, v), mk), sh), mk);
                 _mm_storeu_si128(p.add(j), _mm_add_epi16(v, d));
             }
         }
@@ -786,9 +784,9 @@ mod simd {
             let m = super::GE_MASK[j & 15].as_ptr() as *const v128;
             let (l, h) = (lo.as_ptr() as *const v128, hi.as_ptr() as *const v128);
             for j in 0..2 {
-                let v = v128_load(p.add(j));
-                let t = v128_bitselect(v128_load(h.add(j)), v128_load(l.add(j)), v128_load(m.add(j)));
-                let d = i16x8_shr(i16x8_sub(t, v), shift);
+                let (v, mk) = (v128_load(p.add(j)), v128_load(m.add(j)));
+                let t = v128_bitselect(v128_load(h.add(j)), v128_load(l.add(j)), mk);
+                let d = i16x8_sub(i16x8_shr(i16x8_add(i16x8_sub(t, v), mk), shift), mk);
                 v128_store(p.add(j), i16x8_add(v, d));
             }
         }
@@ -923,8 +921,8 @@ mod simd {
     #[inline(always)]
     pub fn update(c: &mut [u16; 16], j: usize, lo: &[u16; 16], hi: &[u16; 16], shift: u32) {
         for i in 0..16 {
-            let t = if i >= j { hi[i] } else { lo[i] };
-            let d = (t.wrapping_sub(c[i]) as i16) >> shift;
+            let (t, k) = if i >= j { (hi[i], 1) } else { (lo[i], 0) };
+            let d = ((t.wrapping_sub(c[i]) as i16).wrapping_sub(k) >> shift).wrapping_add(k);
             c[i] = c[i].wrapping_add(d as u16);
         }
     }
@@ -1873,6 +1871,8 @@ const DGS: [i64; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 const NDGS: usize = 9;
 /// Candidate weights of the two sides and of the median predictor (quarters).
 const NDG: usize = 5;
+/// Decay of the recent errors of the DC candidates (`Model::edc`, `edw`, `edm`; see EG_SHIFT).
+const DC_SHIFT: u32 = 7;
 /// Buckets of the ratio of a block's own boundary errors left and above: below 1/4, 1/2, about
 /// even, above 2, 4.
 const NOB: usize = 5;
@@ -2762,20 +2762,20 @@ impl Model {
                     let v = (v16 << 20) - b0;
                     for (c, x) in self.edc[es[s]].iter_mut().enumerate() {
                         let d = ((v - DGS[c] * bd).unsigned_abs() >> 20).min(1024) as u32;
-                        *x = *x - (*x >> EG_SHIFT) + d;
+                        *x = *x - (*x >> DC_SHIFT) + d;
                     }
                 }
             }
             if pm.is_some() {
                 for (c, x) in self.edm[em].iter_mut().enumerate() {
                     let d = (v16 - mix(pb, c as i32) as i64).unsigned_abs().min(1024) as u32;
-                    *x = *x - (*x >> EG_SHIFT) + d;
+                    *x = *x - (*x >> DC_SHIFT) + d;
                 }
             }
             if let (Some(_), Some(_)) = xy {
                 for (c, x) in self.edw[ew].iter_mut().enumerate() {
                     let d = (v16 - comb(xy, c as i32).unwrap() as i64).unsigned_abs().min(1024) as u32;
-                    *x = *x - (*x >> EG_SHIFT) + d;
+                    *x = *x - (*x >> DC_SHIFT) + d;
                 }
             }
         }
@@ -3169,6 +3169,45 @@ mod tests {
             let b = [&blocks[0], &blocks[1], &blocks[2], &blocks[3]];
             for (fx, fy) in [(1, 1), (1, 2), (2, 1), (2, 2)] {
                 assert_eq!(super::simd::luma_down(b, fx, fy, &ql), super::luma_down_scalar(b, fx, fy, &ql), "{n} {fx}x{fy}");
+            }
+        }
+    }
+
+    #[test]
+    fn update_lanes() {
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for k in 0..600 {
+            let n = 2 + k % 14;
+            let w: Vec<u32> = (0..n).map(|_| [0, 1, 1000][(next() % 3) as usize]).collect();
+            let mut c = super::Cdf::new(n, &w).0;
+            let (lo, hi) = (&super::TARGETS.lo[n], &super::TARGETS.hi[n]);
+            for _ in 0..400 {
+                // mostly one symbol, which takes the others down to their least frequency
+                let s = if next() % 8 == 0 { (next() % n as u64) as usize } else { k % n };
+                let (j, shift) = (s + 1, 3 + (next() % 6) as u32);
+                let mut e = c;
+                for (i, x) in e.iter_mut().enumerate() {
+                    let d = if i >= j { hi[i] } else { lo[i] } as i32 - *x as i32;
+                    *x = (*x as i32 + if d > 0 { (d + (1 << shift) - 1) >> shift } else { d >> shift }) as u16;
+                }
+                let mut a = c;
+                super::simd::update(&mut a, j, lo, hi, shift);
+                assert_eq!(a, e, "{k}");
+                #[cfg(target_arch = "x86_64")]
+                if super::has_avx2() {
+                    let mut b = c;
+                    // SAFETY: the CPU has AVX2.
+                    unsafe { super::avx2::update(&mut b, j, lo, hi, shift) };
+                    assert_eq!(b, e, "{k}");
+                }
+                c = e;
+                assert!(c[0] == 0 && (1..n).all(|i| c[i] > c[i - 1]) && c[n - 1] < 1 << 15, "{k}");
             }
         }
     }
