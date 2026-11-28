@@ -247,7 +247,7 @@ fn cmd_jtrain(args: &[String]) -> Result<(), String> {
     let files: Vec<Vec<u8>> = args.iter().filter(|a| a.ends_with(".jpg") || a.ends_with(".jpeg")).map(|a| read(Path::new(a))).collect::<Result<_, _>>()?;
     let (totals, lsw) = jpeg::fast_train(&files);
     let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
-    let priors = jpeg::fast::build_priors(&totals, &lsw, env("PRIOR_MIN", 16), env("PRIOR_COUNT", 16) as u8, env("PRIOR_BITCOUNT", 6) as u8);
+    let priors = jpeg::fast::build_priors(&totals, &lsw, env("PRIOR_MIN", 16), env("PRIOR_COUNT", 8) as u8, env("PRIOR_BITCOUNT", 6) as u8);
     let output = output.ok_or("-o output file needed")?;
     std::fs::write(&output, &priors).map_err(|e| e.to_string())?;
     println!("{} files, {} bytes of priors -> {}", files.len(), priors.len(), output.display());
