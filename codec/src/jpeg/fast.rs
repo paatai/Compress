@@ -1043,11 +1043,7 @@ static ZERO_BLOCK: [i16; 64] = [0; 64];
 impl Model {
     /// A model with the learned initial distributions (flat ones while training).
     pub fn new() -> Model {
-        static TEMPLATE: std::sync::OnceLock<Model> = std::sync::OnceLock::new();
-        if training() {
-            return Model::build();
-        }
-        TEMPLATE.get_or_init(Model::build).clone()
+        Model::build()
     }
 
     fn build() -> Model {
