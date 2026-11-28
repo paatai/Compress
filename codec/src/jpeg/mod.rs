@@ -26,6 +26,7 @@ pub mod fast;
 pub mod format;
 pub mod huff;
 pub mod model;
+pub mod strong;
 
 use crate::coder::{Decoder, Encoder};
 use format::{Frame, Layout};
@@ -536,22 +537,29 @@ pub fn decompress(b: &[u8], progress: &mut dyn FnMut(f32)) -> Result<Vec<u8>, St
 }
 
 // ---------------------------------------------------------------------------------------------
-// Fast mode
+// Fast and strong modes
 //
-//   "KMLA" | 'J' | version | MODE_FAST | varint original length | CRC-32 of the original file
+//   "KMLA" | 'J' | version | MODE_FAST or MODE_STRONG | varint original length | CRC-32 of the
+//   original file
 //   varint header-blob length | varint coded length | header blob (`encode_blob`)
 //   varint trailer length | trailer kind | varint coded length | coded trailer
 //   varint side-info length | side info (per scan: padding, garbage, end-of-band choices)
 //   varint stripe count | per stripe: varint rANS length, varint raw length | stripe data
 //
 // The side info can be decoded before any scan, so scans and stripes are independent: stripes
-// are coded and decoded in parallel, straight from and into the coefficient planes.
+// are coded and decoded in parallel, straight from and into the coefficient planes. The two
+// modes share the container and differ in the coefficient model (`fast` or `strong`) and in the
+// stripe size.
 
 /// Stripes of the fast mode hold about this many blocks (all components).
-pub const FAST_STRIPE_BLOCKS: usize = 1 << 17;
+pub const FAST_STRIPE_BLOCKS: usize = 1 << 15;
+/// Stripes of the strong mode hold about this many blocks: its larger model needs more data to
+/// adapt.
+pub const STRONG_STRIPE_BLOCKS: usize = 1 << 16;
 pub const MODE_FAST: u8 = 3;
-/// Stored with the fast byte model.
+/// Stored with the byte model.
 pub const MODE_BYTES: u8 = 4;
+pub const MODE_STRONG: u8 = 5;
 const TRAILER_FAST: u8 = 2;
 
 /// Worker threads: KOMLA_THREADS if set, else the machine's parallelism (1 on WebAssembly).
@@ -569,10 +577,11 @@ pub fn threads() -> usize {
     }
 }
 
-/// MCU rows of each fast-mode stripe.
-pub fn fast_stripes(f: &Frame) -> Vec<(usize, usize)> {
+/// MCU rows of each stripe of a `mode` (MODE_FAST or MODE_STRONG) container.
+pub fn fast_stripes(f: &Frame, mode: u8) -> Vec<(usize, usize)> {
     let per_row: usize = f.comps.iter().map(|c| c.pw * c.v).sum();
-    let n = (per_row * f.mcuy).div_ceil(FAST_STRIPE_BLOCKS).clamp(1, f.mcuy.clamp(1, 256));
+    let blocks = if mode == MODE_STRONG { STRONG_STRIPE_BLOCKS } else { FAST_STRIPE_BLOCKS };
+    let n = (per_row * f.mcuy).div_ceil(blocks).clamp(1, f.mcuy.clamp(1, 256));
     let rows = f.mcuy.div_ceil(n);
     (0..n).map(|k| (k * rows, ((k + 1) * rows).min(f.mcuy))).filter(|r| r.0 < r.1).collect()
 }
@@ -614,51 +623,31 @@ impl StripeGeom {
             })
             .collect()
     }
-    fn encode(&self, rows: (usize, usize), planes: &mut [&mut [i16]], start: Option<&fast::Model>) -> (Vec<u8>, Vec<u8>, fast::Model) {
+    /// Codes a stripe with the model of `mode`; returns (rANS bytes, raw bits).
+    fn encode(&self, mode: u8, rows: (usize, usize), planes: &mut [&mut [i16]]) -> (Vec<u8>, Vec<u8>) {
         let ext = self.extents(rows.0);
         let held: Vec<usize> = self.v.iter().map(|&v| v * (rows.1 - rows.0)).collect();
-        fast::encode_stripe(planes, &fast::Geometry { rows: &held, width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 }, start)
+        let g = fast::Geometry { rows: &held, width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 };
+        if mode == MODE_STRONG {
+            strong::encode_stripe(planes, &g)
+        } else {
+            fast::encode_stripe(planes, &g)
+        }
     }
-    fn decode(&self, rows: (usize, usize), rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], start: Option<&fast::Model>) -> Result<fast::Model, String> {
+    fn decode(&self, mode: u8, rows: (usize, usize), rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]]) -> Result<(), String> {
         let ext = self.extents(rows.0);
         let held: Vec<usize> = self.v.iter().map(|&v| v * (rows.1 - rows.0)).collect();
-        fast::decode_stripe(rans, raw, planes, &fast::Geometry { rows: &held, width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 }, start, |_, _| Ok(()))
+        decode_coefs(mode, rans, raw, planes, &fast::Geometry { rows: &held, width: &self.width, v: &self.v, ext: &ext, q: &self.q, mcu_rows: rows.1 - rows.0 }, |_, _| Ok(()))
     }
 }
 
-/// The model every fast-mode stripe after the first starts from: the first stripe's final one
-/// (see `fast::Model::into_seed`), handed from the thread that codes the first stripe to the
-/// others; `None` if the first stripe failed.
-struct Seed(std::sync::Mutex<Option<Option<std::sync::Arc<fast::Model>>>>, std::sync::Condvar);
-
-impl Seed {
-    fn new() -> Seed {
-        Seed(std::sync::Mutex::new(None), std::sync::Condvar::new())
-    }
-    /// The model stripe `k` starts from: none for the first; else the first stripe's, once it
-    /// is there.
-    fn start(&self, k: usize) -> Result<Option<std::sync::Arc<fast::Model>>, String> {
-        if k == 0 {
-            return Ok(None);
-        }
-        let mut g = self.0.lock().unwrap();
-        while g.is_none() {
-            g = self.1.wait(g).unwrap();
-        }
-        g.clone().flatten().map(Some).ok_or_else(damaged)
-    }
-    /// Takes the outcome of coding stripe `k` (its final model); only the first one's is kept.
-    fn offer(&self, k: usize, r: Result<fast::Model, String>) -> Result<(), String> {
-        if k > 0 {
-            return r.map(|_| ());
-        }
-        let (m, r) = match r {
-            Ok(m) => (Some(std::sync::Arc::new(m.into_seed())), Ok(())),
-            Err(e) => (None, Err(e)),
-        };
-        *self.0.lock().unwrap() = Some(m);
-        self.1.notify_all();
-        r
+/// Decodes a stripe with the model of `mode` (see `fast::decode_stripe`,
+/// `strong::decode_stripe`).
+fn decode_coefs(mode: u8, rans: &[u8], raw: &[u8], planes: &mut [&mut [i16]], g: &fast::Geometry, emit: impl FnMut(usize, &[&mut [i16]]) -> Result<(), String>) -> Result<(), String> {
+    if mode == MODE_STRONG {
+        strong::decode_stripe(rans, raw, planes, g, emit)
+    } else {
+        fast::decode_stripe(rans, raw, planes, g, emit)
     }
 }
 
@@ -740,7 +729,7 @@ fn stored_fast(data: &[u8], note: String) -> (Vec<u8>, JpegInfo) {
     h.extend_from_slice(crate::MAGIC);
     h.push(KIND);
     h.push(VERSION);
-    let c = fast::encode_bytes(data);
+    let c = strong::encode_bytes(data);
     let mode = if c[0] == 1 { MODE_BYTES } else { MODE_RAW };
     h.push(mode);
     put_varint(&mut h, data.len() as u64);
@@ -752,31 +741,36 @@ fn stored_fast(data: &[u8], note: String) -> (Vec<u8>, JpegInfo) {
 /// Compresses a JPEG file in the fast mode with up to `threads` threads. Never fails: input
 /// that cannot be recompressed exactly is stored.
 pub fn compress_fast(data: &[u8], threads: usize) -> (Vec<u8>, JpegInfo) {
-    compress_nested(data, threads, 0)
+    compress_nested(data, threads, 0, MODE_FAST)
 }
 
-/// `compress_fast` for a container nested `depth` deep (see `restore`).
-fn compress_nested(data: &[u8], threads: usize, depth: u32) -> (Vec<u8>, JpegInfo) {
-    match analyze_fast(data, threads, depth) {
+/// `compress_fast` in the strong mode: smaller output in under twice the time.
+pub fn compress_strong(data: &[u8], threads: usize) -> (Vec<u8>, JpegInfo) {
+    compress_nested(data, threads, 0, MODE_STRONG)
+}
+
+/// `compress_fast` in `mode` for a container nested `depth` deep (see `restore`).
+fn compress_nested(data: &[u8], threads: usize, depth: u32, mode: u8) -> (Vec<u8>, JpegInfo) {
+    match analyze_fast(data, threads, depth, mode) {
         Ok(r) => r,
         Err(e) => stored_fast(data, e),
     }
 }
 
-/// First byte of a coded header blob in the forms of `encode_blob` (`fast::encode_bytes`
+/// First byte of a coded header blob in the forms of `encode_blob` (`strong::encode_bytes`
 /// starts with 0 or 1).
 const BLOB_PICTURES: u8 = 2;
 const BLOB_LITE: u8 = 3;
 
 /// Codes a header blob: JPEG pictures embedded in it (thumbnails in Exif or Photoshop
-/// segments, often the same one twice) in the fast mode where that is smaller, the rest with
-/// the light context-mixing model, or the byte model where that is not larger. Without
-/// pictures and with the byte model this is `fast::encode_bytes`; otherwise
+/// segments, often the same one twice) in `mode` where that is smaller, the rest with the
+/// light context-mixing model, or the byte model where that is not larger. Without pictures
+/// and with the byte model this is `strong::encode_bytes`; otherwise
 ///   BLOB_PICTURES or BLOB_LITE | varint count | per picture: varint bytes of the rest before
 ///   it, varint length, varint coded length, coded picture (length 0: varint index of an
-///   earlier picture with the same bytes) | rest (`fast::encode_bytes` or
+///   earlier picture with the same bytes) | rest (`strong::encode_bytes` or
 ///   `bytecm::encode_lite`)
-fn encode_blob(blob: &[u8], depth: u32) -> Vec<u8> {
+fn encode_blob(blob: &[u8], depth: u32, mode: u8) -> Vec<u8> {
     // (gap, start, length, coded or earlier index)
     let mut pics: Vec<(usize, usize, usize, Result<Vec<u8>, usize>)> = Vec::new();
     let mut rest = Vec::new();
@@ -792,8 +786,8 @@ fn encode_blob(blob: &[u8], depth: u32) -> Vec<u8> {
         let pic = &blob[s..s + n];
         let coded = match pics.iter().position(|p| &blob[p.1..p.1 + p.2] == pic) {
             Some(j) => Err(j),
-            None => match compress_nested(pic, 1, depth + 1) {
-                (c, info) if info.mode == MODE_FAST && c.len() < n => Ok(c),
+            None => match compress_nested(pic, 1, depth + 1, mode) {
+                (c, info) if info.mode == mode && c.len() < n => Ok(c),
                 _ => continue,
             },
         };
@@ -803,7 +797,7 @@ fn encode_blob(blob: &[u8], depth: u32) -> Vec<u8> {
         i = from;
     }
     rest.extend_from_slice(&blob[from..]);
-    let plain = fast::encode_bytes(&rest);
+    let plain = strong::encode_bytes(&rest);
     let lite = bytecm::encode_lite(&rest);
     if pics.is_empty() && plain.len() <= lite.len() {
         return plain;
@@ -832,7 +826,7 @@ fn encode_blob(blob: &[u8], depth: u32) -> Vec<u8> {
 fn decode_blob(c: &[u8], n: usize, threads: usize, depth: u32) -> Result<Vec<u8>, String> {
     let kind = c.first().copied();
     if kind != Some(BLOB_PICTURES) && kind != Some(BLOB_LITE) {
-        return fast::decode_bytes(c, n);
+        return strong::decode_bytes(c, n);
     }
     let mut pos = 1;
     let count = get_varint(c, &mut pos)?;
@@ -848,7 +842,7 @@ fn decode_blob(c: &[u8], n: usize, threads: usize, depth: u32) -> Result<Vec<u8>
         left = left.checked_sub(len).ok_or("corrupt .komla file")?;
         pics.push((gap, len, if cl == 0 { Err(get_varint(c, &mut pos)?) } else { Ok(take(c, &mut pos, cl)?) }));
     }
-    let rest = if kind == Some(BLOB_LITE) { bytecm::decode_lite(&c[pos..], left as usize)? } else { fast::decode_bytes(&c[pos..], left as usize)? };
+    let rest = if kind == Some(BLOB_LITE) { bytecm::decode_lite(&c[pos..], left as usize)? } else { strong::decode_bytes(&c[pos..], left as usize)? };
     let mut out = Vec::with_capacity(n);
     let mut at = 0usize;
     // where each picture went
@@ -948,21 +942,21 @@ fn verify_scans(l: &Layout, data: &[u8], rows: &[(usize, usize)], next: &mut dyn
     Ok(side)
 }
 
-fn analyze_fast(data: &[u8], threads: usize, depth: u32) -> Result<(Vec<u8>, JpegInfo), String> {
+fn analyze_fast(data: &[u8], threads: usize, depth: u32, mode: u8) -> Result<(Vec<u8>, JpegInfo), String> {
     if data.len() > u32::MAX as usize {
         return Err("file too large".into());
     }
     let l = format::parse(data, true)?;
     let f = &l.frame;
-    let rows = fast_stripes(f);
+    let rows = fast_stripes(f, mode);
     let geom = StripeGeom::new(&l);
     let trailer = &data[l.end..];
     // the header bytes and the trailer (which may be another JPEG)
     let extras = || {
-        let blob = encode_blob(&l.blob, depth);
-        let t = match (is_jpeg(trailer) && depth < MAX_DEPTH).then(|| compress_nested(trailer, threads, depth + 1)) {
-            Some((nested, info)) if info.mode == MODE_FAST && nested.len() < trailer.len() => (TRAILER_FAST, nested),
-            _ => (TRAILER_CM, fast::encode_bytes(trailer)),
+        let blob = encode_blob(&l.blob, depth, mode);
+        let t = match (is_jpeg(trailer) && depth < MAX_DEPTH).then(|| compress_nested(trailer, threads, depth + 1, mode)) {
+            Some((nested, info)) if info.mode == mode && nested.len() < trailer.len() => (TRAILER_FAST, nested),
+            _ => (TRAILER_CM, strong::encode_bytes(trailer)),
         };
         (blob, t)
     };
@@ -981,13 +975,9 @@ fn analyze_fast(data: &[u8], threads: usize, depth: u32) -> Result<(Vec<u8>, Jpe
         let sides = decs.iter_mut().map(|d| std::mem::take(&mut d.side)).collect();
         Ok(Stripe { k, bufs, sides })
     };
-    let seed = Seed::new();
     let encode = |st: &mut Stripe| {
         let mut planes: Vec<&mut [i16]> = st.bufs.iter_mut().map(|b| &mut b[..]).collect();
-        let start = seed.start(st.k).unwrap_or(None);
-        let (r, w, m) = geom.encode(rows[st.k], &mut planes, start.as_deref());
-        let _ = seed.offer(st.k, Ok(m));
-        (r, w)
+        geom.encode(mode, rows[st.k], &mut planes)
     };
     let mut streams: Vec<Option<(Vec<u8>, Vec<u8>)>> = (0..rows.len()).map(|_| None).collect();
     let (side, (blob, (kind, tc))) = if threads > 1 {
@@ -1012,7 +1002,7 @@ fn analyze_fast(data: &[u8], threads: usize, depth: u32) -> Result<(Vec<u8>, Jpe
     h.extend_from_slice(crate::MAGIC);
     h.push(KIND);
     h.push(VERSION);
-    h.push(MODE_FAST);
+    h.push(mode);
     put_varint(&mut h, data.len() as u64);
     h.extend_from_slice(&crate::crc32(data).to_le_bytes());
     put_varint(&mut h, l.blob.len() as u64);
@@ -1040,7 +1030,7 @@ fn analyze_fast(data: &[u8], threads: usize, depth: u32) -> Result<(Vec<u8>, Jpe
         progressive: f.progressive,
         sampling: sampling(f),
         stripes: rows.len() as u32,
-        mode: MODE_FAST,
+        mode,
         note: String::new(),
     };
     Ok((h, info))
@@ -1088,8 +1078,7 @@ fn stream_mt(
                 sc.spawn(move || loop {
                     let st = from_ver.lock().unwrap().recv();
                     let Ok(mut st) = st else { break };
-                    // the first stripe is coded in any case: the others wait for its model
-                    if st.k == 0 || !stop.load(Ordering::Relaxed) {
+                    if !stop.load(Ordering::Relaxed) {
                         let r = encode(&mut st);
                         *out[st.k].lock().unwrap() = Some(r);
                     }
@@ -1500,20 +1489,21 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
         }
         MODE_RAW | MODE_BYTES => {
             let rest = r.bytes(inp.size() - r.pos)?;
-            let out = if head[6] == MODE_RAW { rest } else { fast::decode_bytes(&rest, len as usize)? };
+            let out = if head[6] == MODE_RAW { rest } else { strong::decode_bytes(&rest, len as usize)? };
             if out.len() as u64 != len || crate::crc32(&out) != crc {
                 return Err(damaged());
             }
             sink.put(base, &out)?;
             return Ok((len, crc));
         }
-        MODE_FAST => {}
+        MODE_FAST | MODE_STRONG => {}
         _ => return Err("not a fast-mode Komla JPEG file".into()),
     }
+    let mode = head[6];
     let c = parse_fast(inp, len, r.pos, threads, depth)?;
     let l = format::parse(&c.blob, false)?;
     let f = &l.frame;
-    let rows = fast_stripes(f);
+    let rows = fast_stripes(f, mode);
     if rows.len() != c.stripes.len() {
         return Err("corrupt stripe table".into());
     }
@@ -1563,7 +1553,6 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
         // so the threads that decode the stripes also turn them back into scan data, every MCU
         // row at once from a ring of two per component as with one thread (whole stripes would
         // be large buffers to fault in and fill)
-        let seed = Seed::new();
         let held: Vec<usize> = geom.v.iter().map(|&v| 2 * v).collect();
         pipeline(
             rows.len(),
@@ -1584,23 +1573,20 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
                 }
                 let mut ring: Vec<Vec<i16>> = f.comps.iter().zip(&held).map(|(comp, &h)| vec![0i16; h * comp.pw * 64]).collect();
                 let mut data = Vec::new();
-                let r = seed.start(k).and_then(|start| {
-                    let split = read(k, &mut data)?;
-                    let ext = geom.extents(my0);
-                    let mut planes: Vec<&mut [i16]> = ring.iter_mut().map(|b| &mut b[..]).collect();
-                    let g = fast::Geometry { rows: &held, width: &geom.width, v: &geom.v, ext: &ext, q: &geom.q, mcu_rows: my1 - my0 };
-                    fast::decode_stripe(&data[..split], &data[split..], &mut planes, &g, start.as_deref(), |my, planes| {
-                        for (e, s) in encs.iter_mut().zip(&l.scans) {
-                            e.rows(f, s, my0 + my, my0 + my + 1, |ci, bx, by| {
-                                let comp = &f.comps[ci];
-                                let slot = (by - my0 * comp.v) % held[ci];
-                                planes[ci][(slot * comp.pw + bx) * 64..][..64].try_into().unwrap()
-                            })?;
-                        }
-                        Ok(())
-                    })
-                });
-                seed.offer(k, r)?;
+                let split = read(k, &mut data)?;
+                let ext = geom.extents(my0);
+                let mut planes: Vec<&mut [i16]> = ring.iter_mut().map(|b| &mut b[..]).collect();
+                let g = fast::Geometry { rows: &held, width: &geom.width, v: &geom.v, ext: &ext, q: &geom.q, mcu_rows: my1 - my0 };
+                decode_coefs(mode, &data[..split], &data[split..], &mut planes, &g, |my, planes| {
+                    for (e, s) in encs.iter_mut().zip(&l.scans) {
+                        e.rows(f, s, my0 + my, my0 + my + 1, |ci, bx, by| {
+                            let comp = &f.comps[ci];
+                            let slot = (by - my0 * comp.v) % held[ci];
+                            planes[ci][(slot * comp.pw + bx) * 64..][..64].try_into().unwrap()
+                        })?;
+                    }
+                    Ok(())
+                })?;
                 for e in encs {
                     if k + 1 == rows.len() {
                         e.finish();
@@ -1649,7 +1635,6 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
             Ok(())
         };
         if threads > 1 && rows.len() > 1 {
-            let seed = Seed::new();
             pipeline(
                 rows.len(),
                 threads,
@@ -1665,12 +1650,9 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
                         b
                     }).collect();
                     let mut data = Vec::new();
+                    let split = read(k, &mut data)?;
                     let mut planes: Vec<&mut [i16]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
-                    let r = seed.start(k).and_then(|start| {
-                        let split = read(k, &mut data)?;
-                        geom.decode(rows[k], &data[..split], &data[split..], &mut planes, start.as_deref())
-                    });
-                    seed.offer(k, r)?;
+                    geom.decode(mode, rows[k], &data[..split], &data[split..], &mut planes)?;
                     Ok(bufs)
                 },
                 |k, mut bufs| {
@@ -1686,7 +1668,6 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
             let held: Vec<usize> = geom.v.iter().map(|&v| 2 * v).collect();
             let mut ring: Vec<Vec<i16>> = f.comps.iter().zip(&held).map(|(comp, &h)| vec![0i16; h * comp.pw * 64]).collect();
             let mut data = Vec::new();
-            let mut seed = None;
             for k in 0..rows.len() {
                 let (my0, my1) = rows[k];
                 if k > 0 {
@@ -1698,10 +1679,7 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
                 let ext = geom.extents(my0);
                 let mut planes: Vec<&mut [i16]> = ring.iter_mut().map(|b| &mut b[..]).collect();
                 let g = fast::Geometry { rows: &held, width: &geom.width, v: &geom.v, ext: &ext, q: &geom.q, mcu_rows: my1 - my0 };
-                let m = fast::decode_stripe(&data[..split], &data[split..], &mut planes, &g, seed.as_ref(), |my, planes| feed(my0, my0 + my, my0 + my + 1, &held, planes, &mut *sink))?;
-                if k == 0 {
-                    seed = Some(m.into_seed());
-                }
+                decode_coefs(mode, &data[..split], &data[split..], &mut planes, &g, |my, planes| feed(my0, my0 + my, my0 + my + 1, &held, planes, &mut *sink))?;
             }
         }
         for ((e, s), p) in encs.into_iter().zip(&l.scans).zip(scans.iter_mut()) {
@@ -1735,7 +1713,7 @@ fn restore(inp: &dyn Input, base: u64, sink: &mut dyn Sink, threads: usize, dept
             } else {
                 let mut coded = vec![0u8; cl as usize];
                 inp.read_at(tpos, &mut coded)?;
-                let t = fast::decode_bytes(&coded, tl as usize)?;
+                let t = strong::decode_bytes(&coded, tl as usize)?;
                 drop(coded);
                 trailer.write(sink, &t)?;
             }
@@ -1778,7 +1756,7 @@ pub fn decompress_with(b: &[u8], threads: usize) -> Result<Vec<u8>, String> {
         return Err("not a Komla JPEG file".into());
     }
     match b.get(6) {
-        Some(&MODE_FAST) | Some(&MODE_BYTES) => {
+        Some(&MODE_FAST) | Some(&MODE_STRONG) | Some(&MODE_BYTES) => {
             let mut out = Vec::new();
             restore(&b, 0, &mut out, threads, 0)?;
             Ok(out)
@@ -1787,8 +1765,8 @@ pub fn decompress_with(b: &[u8], threads: usize) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Decompresses a .komla JPEG file into `out` without holding either file in memory (fast
-/// mode; other modes are read whole). On error `out` may hold partial data.
+/// Decompresses a .komla JPEG file into `out` without holding either file in memory (fast and
+/// strong modes; other modes are read whole). On error `out` may hold partial data.
 #[cfg(unix)]
 pub fn decompress_file(inp: &std::fs::File, out: &mut std::fs::File, threads: usize) -> Result<(), String> {
     let size = inp.metadata().map_err(|e| e.to_string())?.len();
@@ -1798,7 +1776,7 @@ pub fn decompress_file(inp: &std::fs::File, out: &mut std::fs::File, threads: us
     if !is_container(&head) {
         return Err("not a Komla JPEG file".into());
     }
-    if head[6] == MODE_FAST {
+    if head[6] == MODE_FAST || head[6] == MODE_STRONG {
         restore(&inp, 0, out, threads, 0)?;
         return Ok(());
     }
@@ -1809,22 +1787,51 @@ pub fn decompress_file(inp: &std::fs::File, out: &mut std::fs::File, threads: us
     out.put(0, &data)
 }
 
-/// Training: the summed symbol statistics of the fast model over `files` and its interior
-/// prediction weights (see `fast::build_priors`). A first pass fits the weights, a second one
-/// collects the statistics of the model that uses them.
-pub fn fast_train(files: &[Vec<u8>]) -> (Vec<(usize, Vec<u64>)>, Vec<i16>) {
+/// Training: the summed symbol statistics of the fast model over `files` (see
+/// `fast::build_priors`).
+pub fn fast_train(files: &[Vec<u8>]) -> Vec<(usize, Vec<u64>)> {
     fast::TRAIN.store(true, std::sync::atomic::Ordering::Relaxed);
-    *fast::TRAIN_LSW.lock().unwrap() = Vec::new();
-    let pass = |each: &mut dyn FnMut(&fast::Model)| {
+    let mut totals: Vec<(usize, Vec<u64>)> = Vec::new();
+    for data in files {
+        let Ok(l) = format::parse(data, true) else { continue };
+        let Ok((mut coefs, _)) = format::decode_scans(&l, data) else { continue };
+        let rows = fast_stripes(&l.frame, MODE_FAST);
+        let geom = StripeGeom::new(&l);
+        for (k, mut p) in split_rows(&l.frame, &rows, &mut coefs).into_iter().enumerate() {
+            let mut e = fast::Enc::<fast::Base>::new();
+            let held: Vec<usize> = geom.v.iter().map(|&v| v * (rows[k].1 - rows[k].0)).collect();
+            let Ok(m) = fast::code_stripe(&mut e, &mut p, &held, &geom.width, &geom.v, &geom.extents(rows[k].0), &geom.q, rows[k].1 - rows[k].0, |_, _| Ok(())) else { continue };
+            let st = m.stats();
+            if totals.is_empty() {
+                totals = st.iter().map(|(n, c)| (*n, vec![0u64; c.len()])).collect();
+            }
+            for (t, (_, c)) in totals.iter_mut().zip(st) {
+                for (a, b) in t.1.iter_mut().zip(c) {
+                    *a += b as u64;
+                }
+            }
+        }
+    }
+    fast::TRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
+    totals
+}
+
+/// Training: the summed symbol statistics of the strong model over `files` and its interior
+/// prediction weights (see `strong::build_priors`). A first pass fits the weights, a second one
+/// collects the statistics of the model that uses them.
+pub fn strong_train(files: &[Vec<u8>]) -> (Vec<(usize, Vec<u64>)>, Vec<i16>) {
+    strong::TRAIN.store(true, std::sync::atomic::Ordering::Relaxed);
+    *strong::TRAIN_LSW.lock().unwrap() = Vec::new();
+    let pass = |each: &mut dyn FnMut(&strong::Model)| {
         for data in files {
             let Ok(l) = format::parse(data, true) else { continue };
             let Ok((mut coefs, _)) = format::decode_scans(&l, data) else { continue };
-            let rows = fast_stripes(&l.frame);
+            let rows = fast_stripes(&l.frame, MODE_STRONG);
             let geom = StripeGeom::new(&l);
             for (k, mut p) in split_rows(&l.frame, &rows, &mut coefs).into_iter().enumerate() {
-                let mut e = fast::Enc::<fast::Base, true>::new();
+                let mut e = strong::Enc::<strong::Base, true>::new();
                 let held: Vec<usize> = geom.v.iter().map(|&v| v * (rows[k].1 - rows[k].0)).collect();
-                let Ok(m) = fast::code_stripe(&mut e, None, &mut p, &held, &geom.width, &geom.v, &geom.extents(rows[k].0), &geom.q, rows[k].1 - rows[k].0, |_, _| Ok(())) else { continue };
+                let Ok(m) = strong::code_stripe(&mut e, &mut p, &held, &geom.width, &geom.v, &geom.extents(rows[k].0), &geom.q, rows[k].1 - rows[k].0, |_, _| Ok(())) else { continue };
                 each(&m);
             }
         }
@@ -1839,8 +1846,8 @@ pub fn fast_train(files: &[Vec<u8>]) -> (Vec<(usize, Vec<u64>)>, Vec<i16>) {
             *a += b;
         }
     });
-    let lsw = fast::solve_weights(&sums);
-    *fast::TRAIN_LSW.lock().unwrap() = lsw.clone();
+    let lsw = strong::solve_weights(&sums);
+    *strong::TRAIN_LSW.lock().unwrap() = lsw.clone();
     let mut totals: Vec<(usize, Vec<u64>)> = Vec::new();
     pass(&mut |m| {
         let st = m.stats();
@@ -1853,7 +1860,7 @@ pub fn fast_train(files: &[Vec<u8>]) -> (Vec<(usize, Vec<u64>)>, Vec<i16>) {
             }
         }
     });
-    fast::TRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
+    strong::TRAIN.store(false, std::sync::atomic::Ordering::Relaxed);
     (totals, lsw)
 }
 
@@ -1861,12 +1868,12 @@ pub fn fast_train(files: &[Vec<u8>]) -> (Vec<(usize, Vec<u64>)>, Vec<i16>) {
 /// the original length and CRC-32.
 pub fn summary(b: &[u8]) -> Result<(JpegInfo, usize, u32), String> {
     match b.get(6) {
-        Some(&MODE_FAST) | Some(&MODE_BYTES) if is_container(b) && b[5] == VERSION => {
+        Some(&MODE_FAST) | Some(&MODE_STRONG) | Some(&MODE_BYTES) if is_container(b) && b[5] == VERSION => {
             let mut pos = 7;
             let len = usize::try_from(get_varint(b, &mut pos)?).map_err(|_| "corrupt .komla file")?;
             let crc = u32::from_le_bytes(take(b, &mut pos, 4)?.try_into().unwrap());
             let mut i = JpegInfo { mode: b[6], ..Default::default() };
-            if b[6] == MODE_FAST {
+            if b[6] != MODE_BYTES {
                 let c = parse_fast(&b, len as u64, pos as u64, 1, 0)?;
                 let l = format::parse(&c.blob, false)?;
                 let f = &l.frame;
